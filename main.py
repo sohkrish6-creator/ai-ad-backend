@@ -570,6 +570,7 @@ class AdCreativeRequest(BaseModel):
     business_type: str
     offer: str
     platform: str = "Instagram"
+    language: str = "Hinglish"
 
 
 @app.post("/ad-creative")
@@ -607,6 +608,7 @@ async def ad_creative(request: AdCreativeRequest):
     prompt = (
         "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
         "HUMAN WRITING: real copywriter ki tarah likho. AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless, discover the magic) BILKUL mat use kar. Chhota, punchy, emotional likho.\n\n"
+        "LANGUAGE: Saara ad content (hook, copy, headline, text on image) is language mein likho: " + request.language + ". Agar Hinglish hai to Roman script mein Hindi-English mix. Agar English hai to clean simple English. Agar Hindi hai to Devanagari script.\n\n"
         "BRAND WEBSITE:\n" + site[:1500] + "\n\n"
         "PROMOTE KARNA HAI: " + request.offer + "\n"
         "PLATFORM: " + request.platform + "\n"
