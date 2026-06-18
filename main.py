@@ -380,6 +380,64 @@ async def competitor(request: CompetitorRequest):
         "success": True,
         "analysis": ai_response.choices[0].message.content
     }
+class AdIntelRequest(BaseModel):
+    business_name: str
+    business_type: str
+    country: str = "IN"
+
+
+@app.post("/ad-intelligence")
+async def ad_intelligence(request: AdIntelRequest):
+    import urllib.parse
+
+    # Meta Ad Library search link banao
+    encoded_name = urllib.parse.quote(request.business_name)
+    meta_link = (
+        f"https://www.facebook.com/ads/library/?active_status=active"
+        f"&ad_type=all&country={request.country}"
+        f"&q={encoded_name}&search_type=keyword_unordered"
+    )
+
+    # Google Ads Transparency link
+    google_link = f"https://adstransparency.google.com/?region={request.country}"
+
+    # AI se analysis guide
+    prompt = (
+        "Tu ek senior competitor ad intelligence analyst hai. "
+        "User ko guide kar raha hai ki competitor ke ads dekhte waqt kya analyze karna hai.\n\n"
+        f"Competitor Business: {request.business_name}\n"
+        f"Industry: {request.business_type}\n\n"
+        "Niche format mein practical guide de. Koi asterisk mat use kar. Seedha likho:\n\n"
+        "WHAT TO LOOK FOR:\n"
+        "[5 specific cheezein jo is industry ke ads mein dekhni chahiye]\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n\n"
+        "WINNING AD SIGNALS:\n"
+        "[Kaise pehchane konsa ad 'kaam kar raha hai'. 4 points]\n"
+        "1. []\n2. []\n3. []\n4. []\n\n"
+        "QUESTIONS TO ANSWER:\n"
+        "[Competitor ke ads dekh ke in sawaalon ke jawab dhoondo. 5 questions]\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n\n"
+        "RED FLAGS (unki kamzori):\n"
+        "[Agar competitor ke ads mein yeh dikhe to opportunity hai. 3 points]\n"
+        "1. []\n2. []\n3. []\n\n"
+        f"YOUR ANGLE:\n"
+        f"[{request.business_type} business ke liye, competitor se alag dikhne ke 3 specific ideas]\n"
+        "1. []\n2. []\n3. []\n"
+    )
+
+    ai_response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500
+    )
+
+    return {
+        "success": True,
+        "business_name": request.business_name,
+        "meta_ad_library_link": meta_link,
+        "google_ads_link": google_link,
+        "guide": ai_response.choices[0].message.content
+    }
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
