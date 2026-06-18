@@ -554,12 +554,41 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     )
     ad_guide = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": ad_prompt}], max_tokens=900).choices[0].message.content
 
+    # SMART CREATIVE — competitor analysis dekh ke alag/new ad
+    creative_prompt = (
+        "Tu ek award-winning ad creative director hai. Tujhe poora competitor analysis mila hai. "
+        "Ab aisा ad creative bana jo competitor se BILKUL ALAG ho aur market gap ko target kare.\n\n"
+        "HUMAN WRITING: real copywriter ki tarah likho. AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless, awaits) BILKUL mat use kar.\n\n"
+        "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\n"
+        "PROMOTE: " + request.goal + "\n\n"
+        "COMPETITOR ANALYSIS (yeh dekh ke alag bano):\n" + (competitor_result or "N/A") + "\n\n"
+        "Upar competitor ki weakness aur market gap dekho. Ab 2 ad creative banao jo woh angle len jo competitor NAHI kar raha. "
+        "Koi asterisk mat use kar. Is format mein:\n\n"
+        "WHY DIFFERENT:\n[1-2 line — yeh ad competitor se kaise alag hai, konsa gap target kar raha]\n\n"
+        "CREATIVE 1: [angle naam]\n"
+        "Hook Line: []\n"
+        "Primary Text: []\n"
+        "Headline: []\n"
+        "CTA Button: []\n"
+        "Image Concept: []\n"
+        "Text On Image: []\n\n"
+        "CREATIVE 2: [angle naam]\n"
+        "Hook Line: []\n"
+        "Primary Text: []\n"
+        "Headline: []\n"
+        "CTA Button: []\n"
+        "Image Concept: []\n"
+        "Text On Image: []\n"
+    )
+    smart_creative = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": creative_prompt}], max_tokens=1400).choices[0].message.content
+
     return {
         "success": True,
         "url": request.url,
         "strategy": strategy,
         "competitor": competitor_result,
         "ad_guide": ad_guide,
+        "smart_creative": smart_creative,
         "meta_ad_library_link": meta_link,
         "google_ads_link": google_link
     }
