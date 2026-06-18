@@ -203,6 +203,13 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     prompt = (
         "Tu ek world-class digital marketing strategist hai jo Google Ads aur Meta Ads expert hai.\n\n"
         "IMPORTANT: Saari recommendations website content ke evidence pe based honi chahiye. Generic advice mat de.\n\n"
+        "HUMAN WRITING RULE (sabse important — HEADLINES, DESCRIPTIONS, META AD COPY ke liye):\n"
+        "Yeh content seedha real ads mein jaayega, isliye yeh ek experienced human copywriter ki tarah likho — AI ki tarah BILKUL nahi.\n"
+        "- Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, in today\'s world, look no further, take it to the next level, revolutionize, seamless, empower, discover the magic, your one-stop, transform your.\n"
+        "- Chhote, punchy, natural lines likho jaise ek insaan bolta hai. Perfect grammar ki zaroorat nahi.\n"
+        "- Real benefit ya emotion pe focus kar, fancy shabdon pe nahi.\n"
+        "- Indian audience ke liye ho to thodi local feel de (jahan suit kare).\n"
+        "- Har headline alag ho — repeat structure mat kar.\n\n"
         f"Business URL: {request.url}\n"
         f"VERIFIED Business Category: {detected}\n"
         f"Detected Services/Products: {services}\n"
