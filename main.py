@@ -682,6 +682,84 @@ async def ad_creative(request: AdCreativeRequest):
     return {"success": True, "creative": ai_response.choices[0].message.content}
 
 
+class AudienceRequest(BaseModel):
+    url: str
+    business_type: str
+    offer: str = ""
+    platform: str = "Both"
+    language: str = "Hinglish"
+
+
+@app.post("/audience-finder")
+async def audience_finder(request: AudienceRequest):
+    import re
+
+    def extract_clean(html):
+        parts = []
+        t = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        if t: parts.append("TITLE: " + t.group(1).strip())
+        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if m: parts.append("DESCRIPTION: " + m.group(1).strip())
+        for tag in ["h1", "h2"]:
+            for h in re.findall(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", html, re.I | re.S):
+                clean = re.sub(r"<[^>]+>", "", h).strip()
+                if clean and len(clean) > 2:
+                    parts.append(tag.upper() + ": " + clean)
+        body = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.I | re.S)
+        body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.I | re.S)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        parts.append("BODY: " + body[:1500])
+        return "\n".join(parts)
+
+    async def fetch(u):
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
+                return extract_clean(r.text)
+        except:
+            return ""
+
+    site = await fetch(request.url)
+    if not site or len(site) < 80:
+        return {"success": False, "scan_failed": True, "message": "Website scan nahi ho payi."}
+
+    prompt = (
+        "IMPORTANT: Poora response sirf is language mein likho: " + request.language + " (English=clean English, Hinglish=Roman Hindi-English mix, Hindi=Devanagari).\n\n"
+        "Tu ek elite media buyer hai jo Meta aur Google Ads dono ka expert hai aur audience targeting + ad policy ka master hai.\n\n"
+        "BUSINESS WEBSITE:\n" + site[:1800] + "\n\n"
+        "PROMOTE: " + (request.offer or "general business") + "\n"
+        "PLATFORM: " + request.platform + "\n"
+        "INDUSTRY: " + request.business_type + "\n\n"
+        "Is business ke liye exact audience aur placements batao. Real, specific bano — generic mat. "
+        "Koi asterisk ya markdown mat use kar. Seedha is format mein:\n\n"
+        "IDEAL AUDIENCE:\n[2-3 line — yeh business kiske liye perfect hai, age, interest, behavior]\n\n"
+        "META ADS TARGETING:\n"
+        "Interests: [5 specific interests jo Meta mein daalo]\n"
+        "Behaviors: [2-3 behavior]\n"
+        "Age/Gender: []\n"
+        "Exclude: [kisko HATAO — paisa bachao]\n\n"
+        "GOOGLE ADS TARGETING:\n"
+        "In-Market Segments: [3 segments jo abhi khareedne wale hain]\n"
+        "Custom Segment Keywords: [5 keywords]\n"
+        "Search Keywords: [5 high-intent keywords]\n\n"
+        "DISPLAY PLACEMENTS (Banner ke liye):\n"
+        "[5 specific apps/websites jaha is business ka banner lagana chahiye — naam ke saath]\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n\n"
+        "REMARKETING:\n[2 line — jo log aaye unhe phir kaise target karo]\n\n"
+        "EXPECTED CTR:\n[is type ke ad ka realistic tap rate, jaise banner 0.5-1%]\n\n"
+        "POLICY SAFETY CHECK:\n"
+        "Risk Level: [Low/Medium/High — yeh business Google pe reject ho sakta?]\n"
+        "Avoid These Words: [konse misleading/trademark words ad mein mat daalo]\n"
+        "Landing Page Tip: [ad aur website match ho, kya dhyan rakho]\n"
+        "Certification Needed: [agar finance/health/gambling hai to certification, warna None]\n"
+    )
+
+    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=1800)
+
+    return {"success": True, "url": request.url, "audience": ai_response.choices[0].message.content}
+
+
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
