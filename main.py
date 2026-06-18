@@ -565,6 +565,88 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     }
 
 
+class AdCreativeRequest(BaseModel):
+    url: str
+    business_type: str
+    offer: str
+    platform: str = "Instagram"
+
+
+@app.post("/ad-creative")
+async def ad_creative(request: AdCreativeRequest):
+    import re
+
+    def extract_clean(html):
+        parts = []
+        t = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        if t: parts.append("TITLE: " + t.group(1).strip())
+        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if m: parts.append("DESCRIPTION: " + m.group(1).strip())
+        for tag in ["h1", "h2"]:
+            for h in re.findall(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", html, re.I | re.S):
+                clean = re.sub(r"<[^>]+>", "", h).strip()
+                if clean and len(clean) > 2:
+                    parts.append(tag.upper() + ": " + clean)
+        body = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.I | re.S)
+        body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.I | re.S)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        parts.append("BODY: " + body[:1200])
+        return "\n".join(parts)
+
+    async def fetch(u):
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
+                return extract_clean(r.text)
+        except:
+            return ""
+
+    site = await fetch(request.url)
+
+    prompt = (
+        "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
+        "HUMAN WRITING: real copywriter ki tarah likho. AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless, discover the magic) BILKUL mat use kar. Chhota, punchy, emotional likho.\n\n"
+        "BRAND WEBSITE:\n" + site[:1500] + "\n\n"
+        "PROMOTE KARNA HAI: " + request.offer + "\n"
+        "PLATFORM: " + request.platform + "\n"
+        "INDUSTRY: " + request.business_type + "\n\n"
+        "3 alag-alag ad creative banao — har ek alag angle se (jaise emotional, offer-driven, problem-solution). "
+        "Koi asterisk ya markdown mat use kar. Bilkul is format mein de:\n\n"
+        "CREATIVE 1: [angle ka naam]\n"
+        "Hook Line: [scroll rokne wali pehli line]\n"
+        "Primary Text: [2-3 lines ad caption]\n"
+        "Headline: [chhota punchy headline]\n"
+        "CTA Button: [jaise Shop Now, Book Now]\n"
+        "Image Concept: [image mein kya dikhe — scene, mood]\n"
+        "Text On Image: [image ke upar kya likha ho — bada bold text]\n"
+        "Color Palette: [2-3 colors]\n"
+        "Layout: [top mein kya, center mein kya, bottom mein kya]\n\n"
+        "CREATIVE 2: [angle ka naam]\n"
+        "Hook Line: []\n"
+        "Primary Text: []\n"
+        "Headline: []\n"
+        "CTA Button: []\n"
+        "Image Concept: []\n"
+        "Text On Image: []\n"
+        "Color Palette: []\n"
+        "Layout: []\n\n"
+        "CREATIVE 3: [angle ka naam]\n"
+        "Hook Line: []\n"
+        "Primary Text: []\n"
+        "Headline: []\n"
+        "CTA Button: []\n"
+        "Image Concept: []\n"
+        "Text On Image: []\n"
+        "Color Palette: []\n"
+        "Layout: []\n"
+    )
+
+    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
+
+    return {"success": True, "creative": ai_response.choices[0].message.content}
+
+
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
