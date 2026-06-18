@@ -289,7 +289,97 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
         "confidence": confidence,
         "analysis": result
     }
+class CompetitorRequest(BaseModel):
+    my_url: str
+    competitor_urls: list[str]
+    business_type: str
 
+
+@app.post("/competitor")
+async def competitor(request: CompetitorRequest):
+    import re
+
+    def extract_clean(html):
+        parts = []
+        t = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+        if t: parts.append("TITLE: " + t.group(1).strip())
+        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if m: parts.append("DESCRIPTION: " + m.group(1).strip())
+        for tag in ['h1', 'h2']:
+            for h in re.findall(r'<' + tag + r'[^>]*>(.*?)</' + tag + r'>', html, re.I | re.S):
+                clean = re.sub(r'<[^>]+>', '', h).strip()
+                if clean and len(clean) > 2:
+                    parts.append(f"{tag.upper()}: {clean}")
+        body = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.I | re.S)
+        body = re.sub(r'<style[^>]*>.*?</style>', '', body, flags=re.I | re.S)
+        body = re.sub(r'<[^>]+>', ' ', body)
+        body = re.sub(r'\s+', ' ', body).strip()
+        parts.append("BODY: " + body[:1200])
+        return "\n".join(parts)
+
+    async def fetch(u):
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
+                return extract_clean(r.text)
+        except:
+            return ""
+
+    # My website
+    my_content = await fetch(request.my_url)
+
+    # Competitors
+    comp_blocks = []
+    for i, cu in enumerate(request.competitor_urls):
+        if not cu.strip():
+            continue
+        content = await fetch(cu)
+        comp_blocks.append(f"COMPETITOR {i+1} ({cu}):\n{content[:1500]}\n")
+
+    competitors_text = "\n".join(comp_blocks)
+
+    prompt = (
+        "Tu ek world-class competitor intelligence analyst hai. "
+        "Sab kuch website content ke evidence pe based karo. Generic mat bano.\n\n"
+        f"Business Type: {request.business_type}\n\n"
+        f"MY BUSINESS ({request.my_url}):\n{my_content[:1500]}\n\n"
+        f"COMPETITORS:\n{competitors_text}\n\n"
+        "Niche format mein analysis de. Koi asterisk mat use kar. Seedha likho:\n\n"
+        "MY POSITIONING:\n[2-3 lines - mera business kaise position hai]\n\n"
+        "COMPETITOR ANALYSIS:\n"
+        "[Har competitor ke liye alag block:]\n"
+        "Competitor 1: [naam/url]\n"
+        "Positioning: []\n"
+        "Strengths: []\n"
+        "Weaknesses: []\n"
+        "Messaging Style: []\n\n"
+        "[agar aur competitors hain to same format repeat karo]\n\n"
+        "MARKET GAPS:\n"
+        "1. [konsi cheez koi nahi kar raha - opportunity]\n"
+        "2. [underserved audience]\n"
+        "3. [overused messaging jahan tum alag ho sakte ho]\n\n"
+        "WHERE YOU CAN WIN:\n"
+        "1. [specific advantage 1]\n"
+        "2. [specific advantage 2]\n"
+        "3. [specific advantage 3]\n\n"
+        "RECOMMENDED MESSAGING:\n"
+        "[Tumhare liye unique messaging jo competitors se alag ho]\n\n"
+        "QUICK WINS:\n"
+        "1. [abhi kar sakte ho]\n"
+        "2. [abhi kar sakte ho]\n"
+        "3. [abhi kar sakte ho]\n"
+    )
+
+    ai_response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2500
+    )
+
+    return {
+        "success": True,
+        "analysis": ai_response.choices[0].message.content
+    }
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
