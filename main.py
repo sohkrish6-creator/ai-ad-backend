@@ -473,6 +473,7 @@ class FullReportRequest(BaseModel):
     goal: str
     competitor_name: str = ""
     competitor_website: str = ""
+    language: str = "Hinglish"
 
 
 @app.post("/full-report")
@@ -511,7 +512,8 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
 
     strategy_prompt = (
         "Tu ek senior digital marketing strategist hai. Website evidence pe based, generic nahi.\n\n"
-        "HUMAN WRITING: headlines/ad copy ek real copywriter ki tarah likho, AI buzzwords (unleash, elevate, game-changer, unlock, dive in) BILKUL mat use kar.\n\n"
+        "HUMAN WRITING: headlines/ad copy ek real copywriter ki tarah likho, AI buzzwords (unleash, elevate, game-changer, unlock, dive in) BILKUL mat use kar.\n"
+        "LANGUAGE: saara content is language mein likho: " + request.language + " (Hinglish=Roman Hindi-English mix, English=clean English, Hindi=Devanagari).\n\n"
         "URL: " + request.url + "\nBusiness: " + request.business_type + "\nBudget: Rs " + str(request.budget) + "\nGoal: " + request.goal + "\nWebsite:\n" + my_content[:2000] + "\n\n"
         "Koi asterisk mat use kar. Seedha likho:\n\n"
         "BUSINESS SUMMARY:\n[2 lines]\n\nTARGET AUDIENCE:\n[2 lines]\n\n"
@@ -556,9 +558,11 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
 
     # SMART CREATIVE — competitor analysis dekh ke alag/new ad
     creative_prompt = (
+        "IMPORTANT: Poora response sirf is language mein likho: " + request.language + ". (English=clean English only, Hinglish=Roman Hindi-English, Hindi=Devanagari). Yeh rule sabse upar hai.\n\n"
         "Tu ek award-winning ad creative director hai. Tujhe poora competitor analysis mila hai. "
-        "Ab aisा ad creative bana jo competitor se BILKUL ALAG ho aur market gap ko target kare.\n\n"
-        "HUMAN WRITING: real copywriter ki tarah likho. AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless, awaits) BILKUL mat use kar.\n\n"
+        "Ab aisa ad creative bana jo competitor se BILKUL ALAG ho aur market gap ko target kare.\n\n"
+        "HUMAN WRITING: real copywriter ki tarah likho. AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless, awaits) BILKUL mat use kar.\n"
+        "LANGUAGE: saara ad content is language mein: " + request.language + ".\n\n"
         "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\n"
         "PROMOTE: " + request.goal + "\n\n"
         "COMPETITOR ANALYSIS (yeh dekh ke alag bano):\n" + (competitor_result or "N/A") + "\n\n"
