@@ -74,6 +74,7 @@ class AnalyzeRequest(BaseModel):
     business_type: str
     budget: int
     goal: str
+    force: bool = False
 
 class LeadCreate(BaseModel):
     name: str
@@ -94,36 +95,127 @@ def home():
 
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
+    import json
+
+    # STEP 1 — Website crawl + clean
+    import re
     try:
-        async with httpx.AsyncClient(timeout=10) as client_http:
-            response = await client_http.get(request.url)
-            website_text = response.text[:2000]
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client_http:
+            response = await client_http.get(request.url, headers={"User-Agent": "Mozilla/5.0"})
+            raw = response.text
     except:
-        website_text = "Website content load nahi hua"
+        raw = ""
+
+    def extract_clean(html):
+        parts = []
+        # Title
+        t = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+        if t: parts.append("TITLE: " + t.group(1).strip())
+        # Meta description
+        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if m: parts.append("DESCRIPTION: " + m.group(1).strip())
+        # OG title + description
+        ogt = re.search(r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if ogt: parts.append("OG_TITLE: " + ogt.group(1).strip())
+        ogd = re.search(r'<meta[^>]*property=["\']og:description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if ogd: parts.append("OG_DESC: " + ogd.group(1).strip())
+        # Keywords meta
+        kw = re.search(r'<meta[^>]*name=["\']keywords["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if kw: parts.append("KEYWORDS: " + kw.group(1).strip())
+        # Headings
+        for tag in ['h1', 'h2', 'h3']:
+            for h in re.findall(r'<' + tag + r'[^>]*>(.*?)</' + tag + r'>', html, re.I | re.S):
+                clean = re.sub(r'<[^>]+>', '', h).strip()
+                if clean and len(clean) > 2:
+                    parts.append(f"{tag.upper()}: {clean}")
+        # Body text (scripts/styles hata ke)
+        body = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.I | re.S)
+        body = re.sub(r'<style[^>]*>.*?</style>', '', body, flags=re.I | re.S)
+        body = re.sub(r'<[^>]+>', ' ', body)
+        body = re.sub(r'\s+', ' ', body).strip()
+        parts.append("BODY: " + body[:2000])
+        return "\n".join(parts)
+
+    website_text = extract_clean(raw) if raw else ""
+
+    if not website_text or len(website_text) < 100:
+        return {
+            "success": False,
+            "scan_failed": True,
+            "message": "Website scan nahi ho payi. URL check karo ya doosra try karo."
+        }
+
+    # STEP 2 — Business Classification
+    classify_prompt = (
+        "You are a strict Business Classification Engine.\n"
+        "RULE: Website content (especially TITLE, DESCRIPTION, headings) is the ONLY source of truth.\n"
+        "The user-selected category is almost always wrong — IGNORE it unless the website clearly confirms it.\n"
+        "If the website TITLE or DESCRIPTION mentions specific products/services that contradict the "
+        "selected category, you MUST set category_mismatch to true.\n\n"
+        f"User-selected category (likely wrong, treat with suspicion): {request.business_type}\n"
+        f"Website URL: {request.url}\n"
+        f"Website content:\n{website_text}\n\n"
+        "Example: If TITLE says 'Caps, Streetwear & Accessories' but user selected 'Wedding & Events', "
+        "then detected = 'Fashion / Apparel / Accessories', category_mismatch = true.\n\n"
+        "Return STRICT JSON only:\n"
+        "{\n"
+        '  "detected_industry": "",\n'
+        '  "detected_sub_industry": "",\n'
+        '  "primary_products_or_services": [],\n'
+        '  "confidence_score": 0,\n'
+        '  "evidence": ["quote exact words from TITLE or DESCRIPTION"],\n'
+        '  "selected_category": "' + request.business_type + '",\n'
+        '  "recommended_category": "",\n'
+        '  "category_mismatch": false\n'
+        "}\n\n"
+        "confidence_score = how sure about YOUR detected category (based on website), 0-100.\n"
+        "category_mismatch = true if selected category does NOT match what the website actually sells/offers.\n"
+        "Base everything on the TITLE and DESCRIPTION first."
+    )
+
+    classification = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": classify_prompt}],
+        max_tokens=600,
+        response_format={"type": "json_object"}
+    )
+
+    try:
+        class_data = json.loads(classification.choices[0].message.content)
+    except:
+        class_data = {"category_mismatch": False, "confidence_score": 0, "recommended_category": request.business_type}
+
+    mismatch = class_data.get("category_mismatch", False)
+    confidence = class_data.get("confidence_score", 0)
+
+    # STEP 3 — Mismatch ya low confidence pe rok do
+    if not request.force and (mismatch or confidence < 85):
+        return {
+            "success": False,
+            "needs_confirmation": True,
+            "classification": class_data
+        }
+
+    # STEP 4 — Confirmed, ab strategy banao
+    detected = class_data.get("recommended_category") or request.business_type
+    services = ", ".join(class_data.get("primary_products_or_services", []))
 
     prompt = (
         "Tu ek world-class digital marketing strategist hai jo Google Ads aur Meta Ads expert hai.\n\n"
+        "IMPORTANT: Saari recommendations website content ke evidence pe based honi chahiye. Generic advice mat de.\n\n"
         f"Business URL: {request.url}\n"
-        f"Business Type: {request.business_type}\n"
+        f"VERIFIED Business Category: {detected}\n"
+        f"Detected Services/Products: {services}\n"
         f"Monthly Budget: Rs {request.budget}\n"
         f"Marketing Goal: {request.goal}\n"
-        f"Website Content: {website_text}\n\n"
+        f"Website Content (source of truth):\n{website_text[:3000]}\n\n"
         "Niche format mein poora analysis de. Koi asterisk mat use kar. Seedha likho:\n\n"
-        "BUSINESS SUMMARY:\n[2-3 lines]\n\n"
-        "TARGET AUDIENCE:\n[2-3 lines]\n\n"
+        "BUSINESS SUMMARY:\n[2-3 lines, website evidence ke saath]\n\n"
+        "TARGET AUDIENCE:\n[2-3 lines, website ke products/services ke based]\n\n"
         "DEMOGRAPHICS:\n"
-        "Age Range: [e.g. 25-44]\n"
-        "Gender: [e.g. 65% Female, 35% Male]\n"
-        "Income Level: [Low/Middle/Upper-Middle/High]\n"
-        "Education: [e.g. Graduate+]\n"
-        "Location: [Top cities]\n"
-        "Language: [Hindi/English/Both]\n"
-        "Marital Status: [Single/Married/Both]\n\n"
+        "Age Range: []\nGender: []\nIncome Level: []\nEducation: []\nLocation: []\nLanguage: []\nMarital Status: []\n\n"
         "DEVICE TARGETING:\n"
-        "Mobile: [%] - [reason]\n"
-        "Desktop: [%] - [reason]\n"
-        "Tablet: [%] - [reason]\n"
-        "Best Device: [konsa convert karta hai]\n\n"
+        "Mobile: [%] - [reason]\nDesktop: [%] - [reason]\nTablet: [%] - [reason]\nBest Device: []\n\n"
         "AD PLACEMENTS:\n"
         "1. Instagram Feed: [suitable/not + reason]\n"
         "2. Instagram Reels: [suitable/not + reason]\n"
@@ -135,78 +227,40 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
         "8. Google Display: [suitable/not + reason]\n"
         "9. Gmail Ads: [suitable/not + reason]\n\n"
         "TIME TARGETING:\n"
-        "Best Days: [days]\n"
-        "Peak Hours: [hours]\n"
-        "Avoid: [time]\n"
-        "Reason: [kyun]\n\n"
+        "Best Days: []\nPeak Hours: []\nAvoid: []\nReason: []\n\n"
         f"BUDGET SPLIT (Total Rs {request.budget}/month):\n"
         "1. [Platform]: Rs [amount] ([%]) - [reason]\n"
         "2. [Platform]: Rs [amount] ([%]) - [reason]\n"
         "3. [Platform]: Rs [amount] ([%]) - [reason]\n\n"
         "CAMPAIGN STRUCTURE:\n"
-        "Campaign Name: [naam]\n"
-        "Campaign Type: [Search/Display]\n"
-        "Bid Strategy: [strategy]\n"
+        "Campaign Name: []\nCampaign Type: []\nBid Strategy: []\n"
         f"Daily Budget: Rs {request.budget // 30}\n"
-        "Target CPA: Rs [amount]\n"
-        "Max CPC: Rs [amount]\n"
-        "Expected ROAS: [Xx]\n\n"
+        "Target CPA: Rs []\nMax CPC: Rs []\nExpected ROAS: []\n\n"
         "AD GROUPS:\n"
-        "1. Group: [naam] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n"
-        "2. Group: [naam] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n"
-        "3. Group: [naam] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n\n"
+        "1. Group: [] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n"
+        "2. Group: [] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n"
+        "3. Group: [] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n\n"
         "HEADLINES (20, max 30 chars each):\n"
-        "1. [h]\n2. [h]\n3. [h]\n4. [h]\n5. [h]\n"
-        "6. [h]\n7. [h]\n8. [h]\n9. [h]\n10. [h]\n"
-        "11. [h]\n12. [h]\n13. [h]\n14. [h]\n15. [h]\n"
-        "16. [h]\n17. [h]\n18. [h]\n19. [h]\n20. [h]\n\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n9. []\n10. []\n"
+        "11. []\n12. []\n13. []\n14. []\n15. []\n16. []\n17. []\n18. []\n19. []\n20. []\n\n"
         "DESCRIPTIONS (20, max 90 chars each):\n"
-        "1. [d]\n2. [d]\n3. [d]\n4. [d]\n5. [d]\n"
-        "6. [d]\n7. [d]\n8. [d]\n9. [d]\n10. [d]\n"
-        "11. [d]\n12. [d]\n13. [d]\n14. [d]\n15. [d]\n"
-        "16. [d]\n17. [d]\n18. [d]\n19. [d]\n20. [d]\n\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n9. []\n10. []\n"
+        "11. []\n12. []\n13. []\n14. []\n15. []\n16. []\n17. []\n18. []\n19. []\n20. []\n\n"
         "META AD COPY:\n"
-        "Primary Text: [125 chars]\n"
-        "Headline: [40 chars]\n"
-        "Description: [30 chars]\n"
-        "CTA Button: [Learn More/Shop Now/Get Quote]\n\n"
-        "INTEREST TARGETING:\n"
-        "1. [interest]\n2. [interest]\n3. [interest]\n"
-        "4. [interest]\n5. [interest]\n6. [interest]\n\n"
-        "REMARKETING STRATEGY:\n"
-        "1. [audience 1]\n2. [audience 2]\n3. [audience 3]\n\n"
+        "Primary Text: []\nHeadline: []\nDescription: []\nCTA Button: []\n\n"
+        "INTEREST TARGETING:\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n\n"
+        "REMARKETING STRATEGY:\n1. []\n2. []\n3. []\n\n"
         "KPI TARGETS:\n"
-        "Expected CTR: [X%]\n"
-        "Expected CPL: Rs [amount]\n"
-        "Expected CPC: Rs [amount]\n"
-        "Expected ROAS: [Xx]\n"
-        "Expected Conversion Rate: [X%]\n\n"
+        "Expected CTR: []\nExpected CPL: Rs []\nExpected CPC: Rs []\nExpected ROAS: []\nExpected Conversion Rate: []\n\n"
         "CREATIVE BRIEF:\n"
-        "Image Concept: [detailed description]\n"
-        "Color Palette: [colors + reason]\n"
-        "Video Script (15 sec): [hook, body, CTA]\n"
-        "Carousel Slide 1: [kya dikhao]\n"
-        "Carousel Slide 2: [kya dikhao]\n"
-        "Carousel Slide 3: [kya dikhao]\n\n"
-        "AB TESTING PLAN:\n"
-        "Test 1: [A] vs [B] - [reason]\n"
-        "Test 2: [A] vs [B] - [reason]\n"
-        "Test 3: [A] vs [B] - [reason]\n\n"
+        "Image Concept: []\nColor Palette: []\nVideo Script (15 sec): []\n"
+        "Carousel Slide 1: []\nCarousel Slide 2: []\nCarousel Slide 3: []\n\n"
+        "AB TESTING PLAN:\n1. Test 1: [A] vs [B] - [reason]\n2. Test 2: [A] vs [B] - [reason]\n3. Test 3: [A] vs [B] - [reason]\n\n"
         "LANDING PAGE SUGGESTIONS:\n"
-        "Hero Headline: [headline]\n"
-        "Sub Headline: [text]\n"
-        "CTA Button: [text]\n"
-        "Trust Signals: [what to show]\n\n"
-        "NEGATIVE KEYWORDS:\n"
-        "1. [kw]\n2. [kw]\n3. [kw]\n4. [kw]\n5. [kw]\n\n"
-        "COMMON MISTAKES:\n"
-        "1. [mistake + solution]\n"
-        "2. [mistake + solution]\n"
-        "3. [mistake + solution]\n\n"
-        "OPPORTUNITIES:\n"
-        "1. [high priority]\n"
-        "2. [medium priority]\n"
-        "3. [quick win]\n"
+        "Hero Headline: []\nSub Headline: []\nCTA Button: []\nTrust Signals: []\n\n"
+        "NEGATIVE KEYWORDS:\n1. []\n2. []\n3. []\n4. []\n5. []\n\n"
+        "COMMON MISTAKES:\n1. []\n2. []\n3. []\n\n"
+        "OPPORTUNITIES:\n1. []\n2. []\n3. []\n"
     )
 
     ai_response = client.chat.completions.create(
@@ -217,10 +271,9 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
 
     result = ai_response.choices[0].message.content
 
-    # Database mein save karo
     analysis = AnalysisModel(
         url=request.url,
-        business_type=request.business_type,
+        business_type=detected,
         budget=request.budget,
         goal=request.goal,
         result=result,
@@ -229,8 +282,13 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     db.add(analysis)
     db.commit()
 
-    return {"success": True, "url": request.url, "analysis": result}
-
+    return {
+        "success": True,
+        "url": request.url,
+        "detected_category": detected,
+        "confidence": confidence,
+        "analysis": result
+    }
 
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
