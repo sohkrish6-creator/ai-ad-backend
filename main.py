@@ -383,6 +383,7 @@ async def competitor(request: CompetitorRequest):
 class AdIntelRequest(BaseModel):
     business_name: str
     business_type: str
+    website: str = ""
     country: str = "IN"
 
 
@@ -398,8 +399,12 @@ async def ad_intelligence(request: AdIntelRequest):
         f"&q={encoded_name}&search_type=keyword_unordered"
     )
 
-    # Google Ads Transparency link
-    google_link = f"https://adstransparency.google.com/?region={request.country}"
+    # Google Ads Transparency link (domain-based)
+    if request.website:
+        domain = request.website.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/").split("/")[0]
+        google_link = f"https://adstransparency.google.com/?region={request.country}&domain={domain}"
+    else:
+        google_link = f"https://adstransparency.google.com/?region={request.country}"
 
     # AI se analysis guide
     prompt = (
