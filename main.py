@@ -466,6 +466,105 @@ async def ad_intelligence(request: AdIntelRequest):
         "google_ads_link": google_link,
         "guide": ai_response.choices[0].message.content
     }
+class FullReportRequest(BaseModel):
+    url: str
+    business_type: str
+    budget: int
+    goal: str
+    competitor_name: str = ""
+    competitor_website: str = ""
+
+
+@app.post("/full-report")
+async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
+    import re, urllib.parse
+
+    def extract_clean(html):
+        parts = []
+        t = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        if t: parts.append("TITLE: " + t.group(1).strip())
+        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if m: parts.append("DESCRIPTION: " + m.group(1).strip())
+        for tag in ["h1", "h2", "h3"]:
+            for h in re.findall(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", html, re.I | re.S):
+                clean = re.sub(r"<[^>]+>", "", h).strip()
+                if clean and len(clean) > 2:
+                    parts.append(tag.upper() + ": " + clean)
+        body = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.I | re.S)
+        body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.I | re.S)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        parts.append("BODY: " + body[:1500])
+        return "\n".join(parts)
+
+    async def fetch(u):
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
+                return extract_clean(r.text)
+        except:
+            return ""
+
+    my_content = await fetch(request.url)
+    if not my_content or len(my_content) < 100:
+        return {"success": False, "scan_failed": True, "message": "Website scan nahi ho payi."}
+
+    strategy_prompt = (
+        "Tu ek senior digital marketing strategist hai. Website evidence pe based, generic nahi.\n\n"
+        "HUMAN WRITING: headlines/ad copy ek real copywriter ki tarah likho, AI buzzwords (unleash, elevate, game-changer, unlock, dive in) BILKUL mat use kar.\n\n"
+        "URL: " + request.url + "\nBusiness: " + request.business_type + "\nBudget: Rs " + str(request.budget) + "\nGoal: " + request.goal + "\nWebsite:\n" + my_content[:2000] + "\n\n"
+        "Koi asterisk mat use kar. Seedha likho:\n\n"
+        "BUSINESS SUMMARY:\n[2 lines]\n\nTARGET AUDIENCE:\n[2 lines]\n\n"
+        "BUDGET SPLIT:\n1. [Platform]: Rs [amt] - [reason]\n2. [Platform]: Rs [amt] - [reason]\n3. [Platform]: Rs [amt] - [reason]\n\n"
+        "TOP HEADLINES (human-like, 8):\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n\n"
+        "META AD COPY:\nPrimary Text: []\nHeadline: []\nCTA: []\n\n"
+        "KPI TARGETS:\nExpected CTR: []\nExpected CPL: Rs []\nExpected ROAS: []\n"
+    )
+    strategy = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": strategy_prompt}], max_tokens=1800).choices[0].message.content
+
+    competitor_result = ""
+    if request.competitor_website:
+        comp_content = await fetch(request.competitor_website)
+        comp_prompt = (
+            "Tu competitor intelligence analyst hai. Evidence pe based.\n\n"
+            "MERA BUSINESS (" + request.url + "):\n" + my_content[:1200] + "\n\n"
+            "COMPETITOR (" + request.competitor_website + "):\n" + comp_content[:1200] + "\n\n"
+            "Koi asterisk mat use kar. Seedha likho:\n\n"
+            "COMPETITOR POSITIONING:\n[2 lines]\n\nUNKI STRENGTHS:\n1. []\n2. []\n\nUNKI WEAKNESS:\n1. []\n2. []\n\n"
+            "MARKET GAPS:\n1. []\n2. []\n3. []\n\nTUM KAHAN JEET SAKTE HO:\n1. []\n2. []\n3. []\n"
+        )
+        competitor_result = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": comp_prompt}], max_tokens=1200).choices[0].message.content
+
+    ad_name = request.competitor_name or request.competitor_website or request.business_type
+    encoded = urllib.parse.quote(ad_name)
+    meta_link = "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=IN&q=" + encoded + "&search_type=keyword_unordered"
+    if request.competitor_website:
+        dom = request.competitor_website.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/").split("/")[0]
+        google_link = "https://adstransparency.google.com/?region=IN&domain=" + dom
+    else:
+        google_link = "https://adstransparency.google.com/?region=IN"
+
+    ad_prompt = (
+        "Tu elite ad intelligence strategist hai. Ad Library mein dikhta hai: creative, run-date, ad count, versions, platforms. NAHI dikhta: likes, CTR, budget. User ko woh dekhne mat bol.\n\n"
+        "Competitor: " + ad_name + "\nIndustry: " + request.business_type + "\n\n"
+        "Koi asterisk mat use kar. Seedha likho:\n\n"
+        "AD LIBRARY MEIN KYA DEKHO:\n1. []\n2. []\n3. []\n\n"
+        "WINNING AD KAISE PEHCHANE:\n1. [3+ mahine se chal raha = paisa kama raha]\n2. []\n3. []\n\n"
+        "TUMHARA WINNING ANGLE:\n1. []\n2. []\n3. []\n"
+    )
+    ad_guide = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": ad_prompt}], max_tokens=900).choices[0].message.content
+
+    return {
+        "success": True,
+        "url": request.url,
+        "strategy": strategy,
+        "competitor": competitor_result,
+        "ad_guide": ad_guide,
+        "meta_ad_library_link": meta_link,
+        "google_ads_link": google_link
+    }
+
+
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
