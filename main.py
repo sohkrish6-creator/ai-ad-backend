@@ -669,7 +669,7 @@ async def intelligence(request: IntelligenceRequest):
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
                 r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code == 200:
+                if r.status_code < 400:
                     return extract_evidence(r.text, page_type)
         except:
             pass
