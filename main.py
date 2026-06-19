@@ -511,7 +511,7 @@ async def audience_finder(request: AudienceRequest):
         + niche_context
         + "PROMOTE: " + (request.offer or "general business") + "\n"
         + "PLATFORM: " + request.platform + "\n"
-        + "INDUSTRY: " + request.business_type + "\n\n"
+        + "INDUSTRY: " + request.business_type + "\n" + "IMPORTANT: Yeh Indian market ke liye hai. Indian apps, Indian communities, Indian influencers, aur Indian search behavior ke hisaab se sab kuch do. Dream11, MPL, My11Circle jaise Indian context use karo jahan relevant ho.\n\n"
         + "Is business ke liye exact audience aur placements batao. Real, specific bano — generic mat."
         + " Koi asterisk ya markdown mat use kar. HAR SECTION EXACTLY is format mein likho — skip mat karna:\n\n"
         + "IDEAL AUDIENCE:\n[2-3 line — yeh business kiske liye perfect hai]\n\n"
