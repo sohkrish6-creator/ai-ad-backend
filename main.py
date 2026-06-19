@@ -677,20 +677,57 @@ async def intelligence(request: IntelligenceRequest):
             evidence.append({"type": "pricing_signal", "value": price.strip(), "confidence": 0.80, "page": page_type})
 
         # ── SPA / Next.js fallbacks ─────────────────────────────────────────
-        # __NEXT_DATA__
+        # __NEXT_DATA__ — deep extraction
         nd = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.I | re.S)
         if nd:
             try:
                 next_data = json.loads(nd.group(1).strip())
                 props = next_data.get("props", {}).get("pageProps", {})
-                evidence.append({"type": "next_data", "value": json.dumps(props)[:1500], "confidence": 0.85, "page": page_type})
+
+                def flatten_next(obj, depth=0):
+                    """Recursively pull key=value strings from __NEXT_DATA__ pageProps."""
+                    out = []
+                    if depth > 4:
+                        return out
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            if isinstance(v, str) and 3 < len(v) < 500:
+                                out.append(f"{k}: {v}")
+                            elif isinstance(v, (int, float)) and str(k).lower() in ('price', 'mrp', 'saleprice', 'discount', 'rating', 'reviewcount', 'count', 'stock'):
+                                out.append(f"{k}: {v}")
+                            elif isinstance(v, (dict, list)):
+                                out.extend(flatten_next(v, depth + 1))
+                    elif isinstance(obj, list):
+                        for item in obj[:6]:
+                            out.extend(flatten_next(item, depth + 1))
+                    return out
+
+                flat = flatten_next(props)
+                value = " | ".join(flat[:40]) if flat else json.dumps(props)[:1500]
+                if value:
+                    evidence.append({"type": "next_data", "value": value[:1500], "confidence": 0.85, "page": page_type})
             except:
                 pass
 
-        # JSON-LD structured data
+        # JSON-LD structured data — field-aware extraction
         for jld_raw in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
             try:
-                evidence.append({"type": "json_ld", "value": json.dumps(json.loads(jld_raw.strip()))[:800], "confidence": 0.88, "page": page_type})
+                jld = json.loads(jld_raw.strip())
+                fields = []
+                for key in ('name', 'description', 'brand', 'telephone', 'priceRange', 'addressLocality', 'url'):
+                    val = jld.get(key)
+                    if not val and key == 'brand':
+                        val = (jld.get('brand') or {}).get('name') if isinstance(jld.get('brand'), dict) else None
+                    if val and isinstance(val, str):
+                        fields.append(f"{key}: {val}")
+                offers = jld.get('offers') or {}
+                if isinstance(offers, dict) and offers.get('price'):
+                    fields.append(f"price: {offers['price']} {offers.get('priceCurrency', '')}")
+                for item in (jld.get('itemListElement') or [])[:5]:
+                    if isinstance(item, dict) and item.get('name'):
+                        fields.append(f"breadcrumb: {item['name']}")
+                value = " | ".join(fields) if fields else json.dumps(jld)[:800]
+                evidence.append({"type": "json_ld", "value": value[:800], "confidence": 0.88, "page": page_type})
             except:
                 pass
 
@@ -728,8 +765,8 @@ async def intelligence(request: IntelligenceRequest):
             logger.info(f"[CRAWL] {url} → EXCEPTION: {e}")
         return (False, [])
 
-    async def fetch_sitemap_evidence(base):
-        """Try robots.txt → sitemap.xml, extract URLs as evidence. Returns (fetched: bool, evidence: list)"""
+    async def fetch_sitemap_urls(base):
+        """Fetch robots.txt → sitemap.xml, return scored list of crawlable URLs. Returns List[str]."""
         async def try_get(u):
             try:
                 async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
@@ -738,21 +775,46 @@ async def intelligence(request: IntelligenceRequest):
             except:
                 return None
 
+        skip_ext = ('.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.pdf', '.xml', '.css', '.js', '.woff', '.ico', '.mp4')
+
+        def score_url(u):
+            p = u.lower().replace(base.lower(), '')
+            if any(k in p for k in ('/product', '/item', '/collection', '/category', '/shop', '/store', '/catalogue')):
+                return 3
+            if any(k in p for k in ('/about', '/contact', '/service', '/who-we-are', '/our-story', '/brand')):
+                return 2
+            if p in ('', '/', '/home', '/index'):
+                return -1  # skip homepage, fetched separately
+            return 1
+
         sitemap_url = base + "/sitemap.xml"
         robots = await try_get(base + "/robots.txt")
         if robots:
             sm = re.search(r'Sitemap:\s*(https?://\S+)', robots, re.I)
             if sm:
                 sitemap_url = sm.group(1).strip()
-                logger.info(f"[CRAWL] Sitemap found in robots.txt: {sitemap_url}")
+                logger.info(f"[SITEMAP] Found in robots.txt: {sitemap_url}")
 
-        sitemap = await try_get(sitemap_url)
-        if sitemap:
-            urls = re.findall(r'<loc>(https?://[^<]+)</loc>', sitemap, re.I)[:20]
-            if urls:
-                logger.info(f"[CRAWL] Sitemap: {len(urls)} URLs found")
-                return (True, [{"type": "sitemap_urls", "value": " | ".join(urls), "confidence": 0.75, "page": "sitemap"}])
-        return (False, [])
+        sitemap_xml = await try_get(sitemap_url)
+        if not sitemap_xml:
+            logger.info(f"[SITEMAP] Not found at {sitemap_url}")
+            return []
+
+        # Handle sitemap index → fetch first sub-sitemap
+        sub_sitemaps = re.findall(r'<loc>(https?://[^<]*sitemap[^<]*\.xml[^<]*)</loc>', sitemap_xml, re.I)
+        if sub_sitemaps:
+            logger.info(f"[SITEMAP] Index found, fetching sub-sitemap: {sub_sitemaps[0]}")
+            sub = await try_get(sub_sitemaps[0])
+            if sub:
+                sitemap_xml = sub
+
+        all_urls = re.findall(r'<loc>(https?://[^<]+)</loc>', sitemap_xml, re.I)
+        crawlable = [u for u in all_urls if not any(u.lower().endswith(e) for e in skip_ext)]
+        selected = sorted(crawlable, key=score_url, reverse=True)
+        # Remove homepage, dedupe, take top 6
+        selected = list(dict.fromkeys(u for u in selected if u.rstrip('/') != base))[:6]
+        logger.info(f"[SITEMAP] {len(all_urls)} total, {len(crawlable)} crawlable, {len(selected)} selected for crawl")
+        return selected
 
     async def run_ai_json(prompt, max_tokens):
         resp = await asyncio.to_thread(
@@ -770,47 +832,64 @@ async def intelligence(request: IntelligenceRequest):
 
     # ── PHASE 1: Evidence Collection Engine ─────────────────────────────────
 
+    def classify_page_type(url):
+        p = url.lower()
+        if any(k in p for k in ('/product', '/item', '/collection', '/catalogue')):
+            return 'products'
+        if any(k in p for k in ('/category', '/shop', '/store')):
+            return 'shop'
+        if '/about' in p or '/who' in p or '/our-story' in p or '/brand' in p:
+            return 'about'
+        if '/contact' in p:
+            return 'contact'
+        if '/service' in p or '/solution' in p:
+            return 'services'
+        return 'page'
+
     base = request.url.rstrip('/')
-    crawl_targets = [
-        (base,                  "homepage"),
-        (base + "/about",       "about"),
-        (base + "/about-us",    "about"),
-        (base + "/products",    "products"),
-        (base + "/shop",        "shop"),
-        (base + "/contact",     "contact"),
-    ]
 
-    logger.info(f"[CRAWL] Attempting {len(crawl_targets)} pages for: {base}")
-    for u, pt in crawl_targets:
-        logger.info(f"[CRAWL]   → {u} ({pt})")
-
-    gather_results = await asyncio.gather(
-        *[fetch_page(u, pt) for u, pt in crawl_targets],
-        fetch_sitemap_evidence(base)
+    # Phase 1a: homepage + sitemap discovery in parallel
+    logger.info(f"[CRAWL] Phase 1a: homepage + sitemap discovery for {base}")
+    (hp_fetched, hp_ev), sitemap_urls = await asyncio.gather(
+        fetch_page(base, "homepage"),
+        fetch_sitemap_urls(base)
     )
 
-    # Last result is sitemap, rest are page results
-    sitemap_fetched, sitemap_ev = gather_results[-1]
-    page_results = gather_results[:-1]
+    # Phase 1b: crawl real sitemap URLs or fall back to guesses
+    if sitemap_urls:
+        extra_targets = [(u, classify_page_type(u)) for u in sitemap_urls]
+        logger.info(f"[CRAWL] Phase 1b: crawling {len(extra_targets)} sitemap URLs")
+    else:
+        extra_targets = [
+            (base + "/about",    "about"),
+            (base + "/about-us", "about"),
+            (base + "/products", "products"),
+            (base + "/shop",     "shop"),
+            (base + "/contact",  "contact"),
+        ]
+        logger.info(f"[CRAWL] Phase 1b: no sitemap, using {len(extra_targets)} fallback guesses")
 
-    pages_fetched = sum(1 for (fetched, _) in page_results if fetched)
-    pages_with_evidence = sum(1 for (fetched, ev) in page_results if fetched and ev)
+    for u, pt in extra_targets:
+        logger.info(f"[CRAWL]   → {u} ({pt})")
 
-    logger.info(f"[CRAWL] pages_attempted={len(crawl_targets)} pages_fetched={pages_fetched} pages_with_evidence={pages_with_evidence} sitemap_crawled={sitemap_fetched}")
+    extra_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in extra_targets])
+
+    all_page_results = [(hp_fetched, hp_ev)] + list(extra_results)
+    pages_attempted = 1 + len(extra_targets)
+    pages_fetched = sum(1 for (fetched, _) in all_page_results if fetched)
+    pages_with_evidence = sum(1 for (fetched, ev) in all_page_results if fetched and ev)
+    sitemap_crawled = bool(sitemap_urls)
+
+    logger.info(f"[CRAWL] pages_attempted={pages_attempted} pages_fetched={pages_fetched} pages_with_evidence={pages_with_evidence} sitemap_crawled={sitemap_crawled}")
 
     all_evidence = []
     seen = set()
-    for (fetched, page_ev) in page_results:
+    for (fetched, page_ev) in all_page_results:
         for e in page_ev:
             key = (e["type"], e["value"][:60])
             if key not in seen:
                 seen.add(key)
                 all_evidence.append(e)
-    for e in sitemap_ev:
-        key = (e["type"], e["value"][:60])
-        if key not in seen:
-            seen.add(key)
-            all_evidence.append(e)
 
     if not all_evidence:
         return {"success": False, "scan_failed": True, "message": "Website unreachable. Check URL and try again."}
@@ -818,10 +897,10 @@ async def intelligence(request: IntelligenceRequest):
     avg_confidence = round(sum(e["confidence"] for e in all_evidence) / len(all_evidence), 2)
 
     evidence_collection = {
-        "pages_attempted": len(crawl_targets),
+        "pages_attempted": pages_attempted,
         "pages_fetched": pages_fetched,
         "pages_with_evidence": pages_with_evidence,
-        "sitemap_crawled": sitemap_fetched,
+        "sitemap_crawled": sitemap_crawled,
         "evidence_points": len(all_evidence),
         "avg_confidence": avg_confidence,
         "evidence": [e for e in all_evidence if e["type"] != "body_text"][:30],
