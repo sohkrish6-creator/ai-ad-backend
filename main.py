@@ -529,7 +529,7 @@ async def audience_finder(request: AudienceRequest):
         + "Behaviors: [2-3 behavior]\n"
         + "Age/Gender: []\n"
         + "Exclude: [kisko hatao]\n\n"
-        + "GOOGLE ADS TARGETING:\n"
+        + "GOOGLE ADS TARGETING (IMPORTANT: In-Market Segments sirf woh do jo Google Ads mein actually exist karte hain aur is niche se directly related hain — jaise Sports & Fitness, Mobile Games, Online Games. Kabhi bhi irrelevant segments mat do jaise Sports Equipment Buyers agar business fantasy app hai):\n"
         + "In-Market Segments: [3 segments]\n"
         + "Custom Segment Keywords: [5 keywords]\n"
         + "Search Keywords: [5 high-intent keywords]\n\n"
