@@ -511,7 +511,7 @@ async def audience_finder(request: AudienceRequest):
         + niche_context
         + "PROMOTE: " + (request.offer or "general business") + "\n"
         + "PLATFORM: " + request.platform + "\n"
-        + "INDUSTRY: " + request.business_type + "\n" + "IMPORTANT: Yeh Indian market ke liye hai. Indian apps, Indian communities, Indian influencers, aur Indian search behavior ke hisaab se sab kuch do. Dream11, MPL, My11Circle jaise Indian context use karo jahan relevant ho.\n\n"
+        + "INDUSTRY: " + request.business_type + "\n" + "IMPORTANT RULES (sabse upar):\n1. Yeh Indian market ke liye hai — Dream11, MPL, My11Circle, Paytm First Games jaise Indian apps use karo.\n2. Age exclude sirf 45+ karo, 35+ kabhi mat karo — 35-45 bhi active fantasy users hain.\n3. Audience Segments mein KABHI betting, gambling, wagering, investment jaise words mat use karo — sirf entertainment, gaming, competition likho.\n4. Display Placements mein gambling ya betting apps (PokerBaazi, RummyCircle) KABHI mat do — sirf sports news sites, cricket sites, gaming blogs do.\n5. Influencer Type mein ex-cricketers, sports analysts, fantasy experts suggest karo.\n\n"
         + "Is business ke liye exact audience aur placements batao. Real, specific bano — generic mat."
         + " Koi asterisk ya markdown mat use kar. HAR SECTION EXACTLY is format mein likho — skip mat karna:\n\n"
         + "IDEAL AUDIENCE:\n[2-3 line — yeh business kiske liye perfect hai]\n\n"
