@@ -614,6 +614,298 @@ async def audience_finder(request: AudienceRequest):
     ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
     return {"success": True, "url": request.url, "niche": request.niche, "audience": ai_response.choices[0].message.content}
 
+class IntelligenceRequest(BaseModel):
+    url: str
+    business_type: str = ""
+    competitor_urls: list[str] = []
+
+@app.post("/intelligence")
+async def intelligence(request: IntelligenceRequest):
+    import re, asyncio, json
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    def extract_evidence(html, page_type="homepage"):
+        evidence = []
+        t = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+        if t:
+            evidence.append({"type": "title", "value": t.group(1).strip(), "confidence": 0.95, "page": page_type})
+        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if m:
+            evidence.append({"type": "meta_description", "value": m.group(1).strip(), "confidence": 0.90, "page": page_type})
+        for prop, label in [("og:title", "og_title"), ("og:description", "og_description")]:
+            og = re.search(r'<meta[^>]*property=["\']' + prop + r'["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+            if og:
+                evidence.append({"type": label, "value": og.group(1).strip(), "confidence": 0.85, "page": page_type})
+        kw = re.search(r'<meta[^>]*name=["\']keywords["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+        if kw:
+            evidence.append({"type": "keywords", "value": kw.group(1).strip(), "confidence": 0.70, "page": page_type})
+        for tag in ['h1', 'h2', 'h3']:
+            conf = 0.85 if tag == 'h1' else (0.75 if tag == 'h2' else 0.65)
+            for h in re.findall(r'<' + tag + r'[^>]*>(.*?)</' + tag + r'>', html, re.I | re.S):
+                clean = re.sub(r'<[^>]+>', '', h).strip()
+                if clean and len(clean) > 3:
+                    evidence.append({"type": tag, "value": clean, "confidence": conf, "page": page_type})
+        for pattern, trust_type in [
+            (r'(\d+\+?\s*(?:years?|yr)\s*(?:of\s*)?(?:experience|expertise))', "years_experience"),
+            (r'(\d[\d,]*\+?\s*(?:customers?|clients?|users?))', "customer_count"),
+            (r'(ISO\s*\d+[:\-]\d+)', "certification"),
+            (r'(rated\s*[\d.]+\s*(?:out\s*of\s*5|\/\s*5|stars?))', "rating"),
+            (r'(\d+\+?\s*(?:projects?|orders?|deliveries?))', "project_count"),
+        ]:
+            for match in re.findall(pattern, html, re.I)[:2]:
+                evidence.append({"type": f"trust_{trust_type}", "value": match.strip(), "confidence": 0.85, "page": page_type})
+        for price in re.findall(r'(?:Rs\.?|INR|₹|\$)\s*[\d,]+(?:\.\d+)?', html)[:5]:
+            evidence.append({"type": "pricing_signal", "value": price.strip(), "confidence": 0.80, "page": page_type})
+        body = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.I | re.S)
+        body = re.sub(r'<style[^>]*>.*?</style>', '', body, flags=re.I | re.S)
+        body = re.sub(r'<[^>]+>', ' ', body)
+        body = re.sub(r'\s+', ' ', body).strip()
+        if body:
+            evidence.append({"type": "body_text", "value": body[:2000], "confidence": 0.60, "page": page_type})
+        return evidence
+
+    async def fetch_page(url, page_type="homepage"):
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+                r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200:
+                    return extract_evidence(r.text, page_type)
+        except:
+            pass
+        return []
+
+    async def run_ai_json(prompt, max_tokens):
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"}
+            )
+        )
+        try:
+            return json.loads(resp.choices[0].message.content)
+        except:
+            return {}
+
+    # ── PHASE 1: Evidence Collection Engine ─────────────────────────────────
+
+    base = request.url.rstrip('/')
+    crawl_targets = [
+        (base,                  "homepage"),
+        (base + "/about",       "about"),
+        (base + "/about-us",    "about"),
+        (base + "/services",    "services"),
+        (base + "/products",    "products"),
+        (base + "/pricing",     "pricing"),
+    ]
+
+    page_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in crawl_targets])
+
+    all_evidence = []
+    seen = set()
+    for page_ev in page_results:
+        for e in page_ev:
+            key = (e["type"], e["value"][:60])
+            if key not in seen:
+                seen.add(key)
+                all_evidence.append(e)
+
+    if not all_evidence:
+        return {"success": False, "scan_failed": True, "message": "Website unreachable. Check URL and try again."}
+
+    pages_crawled = sum(1 for pr in page_results if pr)
+    avg_confidence = round(sum(e["confidence"] for e in all_evidence) / len(all_evidence), 2)
+
+    evidence_collection = {
+        "pages_crawled": pages_crawled,
+        "evidence_points": len(all_evidence),
+        "avg_confidence": avg_confidence,
+        "evidence": [e for e in all_evidence if e["type"] != "body_text"][:30],
+    }
+
+    evidence_text = "\n".join(
+        f"[{e['page'].upper()}][{e['type']}](conf:{e['confidence']}) {e['value'][:200]}"
+        for e in all_evidence if e["type"] != "body_text"
+    )[:3000]
+
+    body_text = " | ".join(
+        e["value"] for e in all_evidence if e["type"] == "body_text"
+    )[:3000]
+
+    # ── PHASE 2: Business DNA Engine ────────────────────────────────────────
+
+    dna_prompt = (
+        "You are a Business Intelligence DNA engine. Classify this business using ONLY the evidence below.\n"
+        "Do NOT hallucinate. If evidence is missing for a field, use \"Unknown\".\n\n"
+        f"EVIDENCE:\n{evidence_text}\n\n"
+        f"BODY TEXT:\n{body_text[:1500]}\n\n"
+        f"USER-STATED CATEGORY (verify against evidence, may be wrong): {request.business_type or 'Not provided'}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "detected_industry": "",\n'
+        '  "detected_sub_industry": "",\n'
+        '  "business_model": "B2B or B2C or D2C or Marketplace or SaaS or Service or Hybrid",\n'
+        '  "revenue_model": "One-time or Subscription or Freemium or Commission or Project-based or Mixed",\n'
+        '  "core_products": ["product 1", "product 2", "product 3"],\n'
+        '  "price_range": "Budget or Mid-market or Premium or Enterprise or Unknown",\n'
+        '  "target_geography": "Local or Regional or National or International",\n'
+        '  "trust_signals": ["signal 1", "signal 2"],\n'
+        '  "unique_value_prop": "one sentence from evidence only",\n'
+        '  "evidence_used": ["exact quote from evidence proving this classification"],\n'
+        '  "dna_score": 0,\n'
+        '  "dna_score_reason": "why this score"\n'
+        "}\n\n"
+        "dna_score 0-100: score 90+ only if pricing signals, trust signals, and a clear UVP are all found in evidence."
+    )
+
+    dna = await run_ai_json(dna_prompt, 800)
+
+    # ── PHASE 3: Opportunity + Threat + Audience in parallel ─────────────────
+
+    dna_text = json.dumps(dna, indent=2)
+
+    opportunity_prompt = (
+        "You are a Market Opportunity Scoring engine. Score this business's digital advertising opportunity.\n\n"
+        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"EVIDENCE:\n{evidence_text[:1200]}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "market_size": "Niche or Small or Medium or Large or Mass",\n'
+        '  "market_opportunity_score": 0,\n'
+        '  "market_opportunity_reason": "",\n'
+        '  "competition_difficulty_score": 0,\n'
+        '  "competition_difficulty_reason": "",\n'
+        '  "conversion_potential_score": 0,\n'
+        '  "conversion_potential_reason": "",\n'
+        '  "overall_opportunity_score": 0,\n'
+        '  "best_platform": "Google or Meta or Both or LinkedIn or YouTube",\n'
+        '  "best_platform_reason": "",\n'
+        '  "budget_efficiency": "Low or Medium or High",\n'
+        '  "seasonal_factors": []\n'
+        "}\n\n"
+        "All scores 0-100. overall_opportunity_score = (market_opportunity_score * 0.4) + (conversion_potential_score * 0.4) + ((100 - competition_difficulty_score) * 0.2). "
+        "High competition_difficulty_score = harder market = penalizes overall score."
+    )
+
+    threat_prompt = (
+        "You are a Competitive Threat Intelligence engine. Assess the threat landscape for this business.\n\n"
+        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"COMPETITOR URLS: {request.competitor_urls if request.competitor_urls else 'None provided'}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "competitor_threat_score": 0,\n'
+        '  "competitor_threat_reason": "",\n'
+        '  "estimated_competitors": "Few (<5) or Moderate (5-20) or Many (20-50) or Saturated (50+)",\n'
+        '  "audience_overlap_pct": 0,\n'
+        '  "pricing_overlap_pct": 0,\n'
+        '  "key_threats": ["threat 1", "threat 2", "threat 3"],\n'
+        '  "differentiators": ["differentiator 1", "differentiator 2"],\n'
+        '  "moat_strength": "Weak or Moderate or Strong",\n'
+        '  "moat_reason": "",\n'
+        '  "threat_level": "Low or Medium or High or Critical"\n'
+        "}\n\n"
+        "competitor_threat_score 0-100: 0=no threat, 100=extreme competition. Base on industry DNA and market saturation signals."
+    )
+
+    audience_prompt = (
+        "You are an Audience Intelligence 2.0 engine. Generate audience segments ONLY from Business DNA evidence.\n"
+        "RULE: Every segment MUST cite specific evidence. Reject any segment you cannot prove from the DNA.\n\n"
+        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"EVIDENCE:\n{evidence_text[:1200]}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "validated_segments": [\n'
+        '    {\n'
+        '      "segment_name": "",\n'
+        '      "age_range": "",\n'
+        '      "gender": "Male or Female or All",\n'
+        '      "income_level": "Low or Middle or Upper-Middle or High",\n'
+        '      "interests": [],\n'
+        '      "behaviors": [],\n'
+        '      "evidence_backing": "exact evidence quote that proves this segment",\n'
+        '      "confidence_score": 0,\n'
+        '      "meta_interests": [],\n'
+        '      "google_in_market": [],\n'
+        '      "estimated_reach": "Narrow or Moderate or Broad"\n'
+        '    }\n'
+        '  ],\n'
+        '  "rejected_segments": [\n'
+        '    { "segment": "", "rejection_reason": "no evidence found" }\n'
+        '  ],\n'
+        '  "primary_segment_index": 0,\n'
+        '  "audience_quality_score": 0,\n'
+        '  "audience_quality_reason": ""\n'
+        "}\n\n"
+        "Generate exactly 3 validated_segments and at least 1 rejected_segment to show the filter is working. confidence_score per segment: 0-100."
+    )
+
+    opportunity, threat, audience_intel = await asyncio.gather(
+        run_ai_json(opportunity_prompt, 600),
+        run_ai_json(threat_prompt, 600),
+        run_ai_json(audience_prompt, 900),
+    )
+
+    # ── PHASE 4: Executive Decision Engine ───────────────────────────────────
+
+    exec_prompt = (
+        "You are a CMO-level Executive Decision Engine. Based on all intelligence below, output the 5 highest-impact actions.\n\n"
+        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"OPPORTUNITY SCORES:\n{json.dumps(opportunity, indent=2)}\n\n"
+        f"THREAT INTELLIGENCE:\n{json.dumps(threat, indent=2)}\n\n"
+        f"AUDIENCE INTELLIGENCE:\n{json.dumps({'validated_segments': audience_intel.get('validated_segments', []), 'audience_quality_score': audience_intel.get('audience_quality_score', 0)}, indent=2)}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "top_5_actions": [\n'
+        '    {\n'
+        '      "rank": 1,\n'
+        '      "action": "",\n'
+        '      "why": "",\n'
+        '      "expected_impact": "Low or Medium or High or Critical",\n'
+        '      "effort": "Low or Medium or High",\n'
+        '      "timeline": "This week or This month or 30 days or 60 days or 90 days"\n'
+        '    }\n'
+        '  ],\n'
+        '  "highest_roi_action": "",\n'
+        '  "highest_roi_reason": "",\n'
+        '  "quick_wins": ["win 1", "win 2", "win 3"],\n'
+        '  "plan_30_day": "",\n'
+        '  "plan_60_day": "",\n'
+        '  "plan_90_day": "",\n'
+        '  "overall_readiness_score": 0,\n'
+        '  "readiness_verdict": "Not Ready or Needs Work or Good to Go or Highly Optimized",\n'
+        '  "biggest_risk": "",\n'
+        '  "biggest_opportunity": ""\n'
+        "}\n\n"
+        "overall_readiness_score 0-100: weighted from DNA score, opportunity score, and inverse of threat score."
+    )
+
+    executive = await run_ai_json(exec_prompt, 700)
+
+    # ── Response ─────────────────────────────────────────────────────────────
+
+    return {
+        "success": True,
+        "url": request.url,
+        "intelligence": {
+            "evidence_collection": evidence_collection,
+            "business_dna": dna,
+            "opportunity_score": opportunity,
+            "threat_intelligence": threat,
+            "audience_intelligence": audience_intel,
+            "executive_decisions": executive,
+        },
+        "scores": {
+            "dna_score": dna.get("dna_score", 0),
+            "opportunity_score": opportunity.get("overall_opportunity_score", 0),
+            "threat_score": threat.get("competitor_threat_score", 0),
+            "audience_quality_score": audience_intel.get("audience_quality_score", 0),
+            "readiness_score": executive.get("overall_readiness_score", 0),
+        },
+    }
+
+
 @app.get("/analyses")
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
