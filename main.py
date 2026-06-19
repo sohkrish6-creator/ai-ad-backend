@@ -416,7 +416,7 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "Segment 2 — [naam]: [age, gender, interests, behavior]\n"
         "Segment 3 — [naam]: [age, gender, interests, behavior]\n\n"
         "WHERE TO FIND THEM:\n"
-        "Apps: [5 specific Indian apps]\n"
+        "Apps: [5 RELEVANT apps jahan is specific business ki audience time spend karti hai. Fashion=Instagram/Myntra/Pinterest. Food=Zomato/Swiggy. Fitness=HealthifyMe/Cult.fit. KABHI irrelevant apps mat do jaise Zomato fashion ke liye ya UrbanClap food ke liye]\n"
         "Pages/Communities: [3 Facebook pages ya groups]\n"
         "YouTube Channels: [2-3 channels]\n"
         "Influencer Type: [kis type ke influencer]\n\n"
