@@ -10,6 +10,10 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -669,15 +673,15 @@ async def intelligence(request: IntelligenceRequest):
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
                 r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                print(f"[CRAWL] {url} → status={r.status_code} final_url={r.url}")
+                logger.info(f"[CRAWL] {url} → status={r.status_code} final_url={r.url}")
                 if r.status_code < 400:
                     ev = extract_evidence(r.text, page_type)
-                    print(f"[CRAWL] {url} → {len(ev)} evidence points extracted")
+                    logger.info(f"[CRAWL] {url} → {len(ev)} evidence points extracted")
                     return ev
                 else:
-                    print(f"[CRAWL] {url} → SKIPPED (status {r.status_code})")
+                    logger.info(f"[CRAWL] {url} → SKIPPED (status {r.status_code})")
         except Exception as e:
-            print(f"[CRAWL] {url} → EXCEPTION: {e}")
+            logger.info(f"[CRAWL] {url} → EXCEPTION: {e}")
         return []
 
     async def run_ai_json(prompt, max_tokens):
@@ -706,14 +710,14 @@ async def intelligence(request: IntelligenceRequest):
         (base + "/contact",     "contact"),
     ]
 
-    print(f"[CRAWL] Attempting {len(crawl_targets)} pages for: {base}")
+    logger.info(f"[CRAWL] Attempting {len(crawl_targets)} pages for: {base}")
     for u, pt in crawl_targets:
-        print(f"[CRAWL]   → {u} ({pt})")
+        logger.info(f"[CRAWL]   → {u} ({pt})")
 
     page_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in crawl_targets])
 
-    print(f"[CRAWL] Results: {[len(pr) for pr in page_results]} evidence points per page")
-    print(f"[CRAWL] Pages with data: {sum(1 for pr in page_results if pr)} / {len(crawl_targets)}")
+    logger.info(f"[CRAWL] Results: {[len(pr) for pr in page_results]} evidence points per page")
+    logger.info(f"[CRAWL] Pages with data: {sum(1 for pr in page_results if pr)} / {len(crawl_targets)}")
 
     all_evidence = []
     seen = set()
