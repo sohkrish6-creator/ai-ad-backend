@@ -766,6 +766,31 @@ async def intelligence(request: IntelligenceRequest):
 
     dna_text = json.dumps(dna, indent=2)
 
+    positioning_prompt = (
+        "You are a Brand Positioning Strategist. Analyze where this business currently stands and where it should position itself.\n\n"
+        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"EVIDENCE:\n{evidence_text[:1500]}\n\n"
+        f"COMPETITOR URLS: {request.competitor_urls if request.competitor_urls else 'None provided — use industry knowledge'}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "current_positioning": "what this business currently stands for, based ONLY on evidence",\n'
+        '  "competitor_positioning": [\n'
+        '    { "name": "Competitor 1 name or URL", "position": "what they stand for", "owned_category": "the space they own" },\n'
+        '    { "name": "Competitor 2 name or URL", "position": "what they stand for", "owned_category": "the space they own" },\n'
+        '    { "name": "Competitor 3 name or URL", "position": "what they stand for", "owned_category": "the space they own" }\n'
+        '  ],\n'
+        '  "positioning_gap": "the unoccupied space no competitor currently owns in this market",\n'
+        '  "winning_position": "the single best position this business should own — 1 punchy sentence",\n'
+        '  "category_ownership_opportunity": "the category name they could OWN, e.g. Indias Most Trusted Home Fitness Brand",\n'
+        '  "messaging_shift": "what the business currently says vs what it SHOULD say",\n'
+        '  "reasoning": "why this positioning works for this business specifically",\n'
+        '  "supporting_evidence": ["exact quote from evidence that supports this positioning"],\n'
+        '  "confidence_score": 0\n'
+        "}\n\n"
+        "confidence_score 0-100: based on how much website evidence exists to support the positioning analysis. "
+        "If competitor URLs were provided, base competitor positioning on them. Otherwise, use top industry players."
+    )
+
     opportunity_prompt = (
         "You are a Market Opportunity Scoring engine. Score this business's digital advertising opportunity.\n\n"
         f"BUSINESS DNA:\n{dna_text}\n\n"
@@ -841,10 +866,11 @@ async def intelligence(request: IntelligenceRequest):
         "Generate exactly 3 validated_segments and at least 1 rejected_segment to show the filter is working. confidence_score per segment: 0-100."
     )
 
-    opportunity, threat, audience_intel = await asyncio.gather(
+    opportunity, threat, audience_intel, positioning = await asyncio.gather(
         run_ai_json(opportunity_prompt, 600),
         run_ai_json(threat_prompt, 600),
         run_ai_json(audience_prompt, 900),
+        run_ai_json(positioning_prompt, 700),
     )
 
     # ── PHASE 4: Executive Decision Engine ───────────────────────────────────
@@ -894,6 +920,7 @@ async def intelligence(request: IntelligenceRequest):
             "opportunity_score": opportunity,
             "threat_intelligence": threat,
             "audience_intelligence": audience_intel,
+            "positioning": positioning,
             "executive_decisions": executive,
         },
         "scores": {
@@ -901,6 +928,7 @@ async def intelligence(request: IntelligenceRequest):
             "opportunity_score": opportunity.get("overall_opportunity_score", 0),
             "threat_score": threat.get("competitor_threat_score", 0),
             "audience_quality_score": audience_intel.get("audience_quality_score", 0),
+            "positioning_score": positioning.get("confidence_score", 0),
             "readiness_score": executive.get("overall_readiness_score", 0),
         },
     }
