@@ -669,10 +669,15 @@ async def intelligence(request: IntelligenceRequest):
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
                 r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                print(f"[CRAWL] {url} → status={r.status_code} final_url={r.url}")
                 if r.status_code < 400:
-                    return extract_evidence(r.text, page_type)
-        except:
-            pass
+                    ev = extract_evidence(r.text, page_type)
+                    print(f"[CRAWL] {url} → {len(ev)} evidence points extracted")
+                    return ev
+                else:
+                    print(f"[CRAWL] {url} → SKIPPED (status {r.status_code})")
+        except Exception as e:
+            print(f"[CRAWL] {url} → EXCEPTION: {e}")
         return []
 
     async def run_ai_json(prompt, max_tokens):
@@ -701,7 +706,14 @@ async def intelligence(request: IntelligenceRequest):
         (base + "/contact",     "contact"),
     ]
 
+    print(f"[CRAWL] Attempting {len(crawl_targets)} pages for: {base}")
+    for u, pt in crawl_targets:
+        print(f"[CRAWL]   → {u} ({pt})")
+
     page_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in crawl_targets])
+
+    print(f"[CRAWL] Results: {[len(pr) for pr in page_results]} evidence points per page")
+    print(f"[CRAWL] Pages with data: {sum(1 for pr in page_results if pr)} / {len(crawl_targets)}")
 
     all_evidence = []
     seen = set()
