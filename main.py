@@ -965,15 +965,17 @@ async def intelligence(request: IntelligenceRequest):
         '  "audience_quality_score": 0,\n'
         '  "audience_quality_reason": ""\n'
         "}\n\n"
-        "Generate exactly 3 validated_segments and at least 1 rejected_segment to show the filter is working. confidence_score per segment: 0-100."
+        "Generate exactly 3 validated_segments and at least 1 rejected_segment to show the filter is working. confidence_score per segment: 0-100. "
+        "audience_quality_score 0-100: average confidence of validated segments, penalised if fewer than 2 segments have strong evidence."
     )
 
     opportunity, threat, audience_intel, positioning = await asyncio.gather(
         run_ai_json(opportunity_prompt, 600),
         run_ai_json(threat_prompt, 600),
-        run_ai_json(audience_prompt, 900),
+        run_ai_json(audience_prompt, 1400),
         run_ai_json(positioning_prompt, 700),
     )
+    logger.info(f"[AUDIENCE] audience_quality_score={audience_intel.get('audience_quality_score')} segments={len(audience_intel.get('validated_segments', []))}")
 
     # ── PHASE 4: Executive Decision Engine ───────────────────────────────────
 
