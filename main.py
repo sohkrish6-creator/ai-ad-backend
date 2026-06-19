@@ -449,7 +449,7 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     creative_prompt = (
         "LANGUAGE: " + request.language + "\n\n"
         "Tu ek award-winning ad creative director hai. Competitor analysis dekh ke alag creative bana.\n"
-        "HUMAN WRITING: AI buzzwords mat use kar.\n\n"
+        "HUMAN WRITING: Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform your.\n\n"
         "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\nPROMOTE: " + request.goal + "\n\nCOMPETITOR ANALYSIS:\n" + (competitor_result or "N/A") + "\n\n"
         "2 ad creative banao jo competitor se alag hon. Koi asterisk mat use kar.\n\n"
         "WHY DIFFERENT:\n[1-2 line]\n\n"
@@ -501,7 +501,7 @@ async def ad_creative(request: AdCreativeRequest):
 
     prompt = (
         "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
-        "HUMAN WRITING: AI buzzwords mat use kar.\n"
+        "HUMAN WRITING: Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform your.\n"
         "LANGUAGE: " + request.language + "\n\n"
         "BRAND WEBSITE:\n" + site[:1500] + "\n\nPROMOTE: " + request.offer + "\nPLATFORM: " + request.platform + "\nINDUSTRY: " + request.business_type + "\n\n"
         "3 alag ad creative banao. Koi asterisk mat use kar.\n\n"
@@ -696,9 +696,9 @@ async def intelligence(request: IntelligenceRequest):
         (base,                  "homepage"),
         (base + "/about",       "about"),
         (base + "/about-us",    "about"),
-        (base + "/services",    "services"),
         (base + "/products",    "products"),
-        (base + "/pricing",     "pricing"),
+        (base + "/shop",        "shop"),
+        (base + "/contact",     "contact"),
     ]
 
     page_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in crawl_targets])
