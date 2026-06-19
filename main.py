@@ -126,7 +126,6 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
         f"User-selected category (likely wrong, treat with suspicion): {request.business_type}\n"
         f"Website URL: {request.url}\n"
         f"Website content:\n{website_text}\n\n"
-        "Example: If TITLE says 'Caps, Streetwear & Accessories' but user selected 'Wedding & Events', then detected = 'Fashion / Apparel / Accessories', category_mismatch = true.\n\n"
         "Return STRICT JSON only:\n"
         "{\n"
         '  "detected_industry": "",\n'
@@ -166,11 +165,8 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
 
     prompt = (
         "Tu ek world-class digital marketing strategist hai jo Google Ads aur Meta Ads expert hai.\n\n"
-        "IMPORTANT: Saari recommendations website content ke evidence pe based honi chahiye. Generic advice mat de.\n\n"
-        "HUMAN WRITING RULE:\n"
-        "Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, in today's world, look no further, take it to the next level, revolutionize, seamless, empower, discover the magic, your one-stop, transform your.\n"
-        "Chhote, punchy, natural lines likho. Real benefit ya emotion pe focus kar.\n"
-        "Indian audience ke liye thodi local feel de.\n\n"
+        "HUMAN WRITING RULE: Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform your.\n"
+        "Chhote, punchy, natural lines likho. Indian audience ke liye thodi local feel de.\n\n"
         f"Business URL: {request.url}\n"
         f"VERIFIED Business Category: {detected}\n"
         f"Detected Services/Products: {services}\n"
@@ -179,23 +175,18 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
         f"Website Content:\n{website_text[:3000]}\n\n"
         "Koi asterisk mat use kar. Seedha likho:\n\n"
         "BUSINESS SUMMARY:\n[2-3 lines]\n\nTARGET AUDIENCE:\n[2-3 lines]\n\n"
-        "DEMOGRAPHICS:\nAge Range: []\nGender: []\nIncome Level: []\nEducation: []\nLocation: []\nLanguage: []\nMarital Status: []\n\n"
-        "DEVICE TARGETING:\nMobile: [%]\nDesktop: [%]\nTablet: [%]\nBest Device: []\n\n"
-        "AD PLACEMENTS:\n1. Instagram Feed: []\n2. Instagram Reels: []\n3. Instagram Stories: []\n4. Facebook Feed: []\n5. Facebook Reels: []\n6. YouTube Pre-roll: []\n7. Google Search: []\n8. Google Display: []\n9. Gmail Ads: []\n\n"
-        "TIME TARGETING:\nBest Days: []\nPeak Hours: []\nAvoid: []\nReason: []\n\n"
-        f"BUDGET SPLIT (Total Rs {request.budget}/month):\n1. [Platform]: Rs [amount] ([%]) - [reason]\n2. [Platform]: Rs [amount] ([%]) - [reason]\n3. [Platform]: Rs [amount] ([%]) - [reason]\n\n"
-        "CAMPAIGN STRUCTURE:\nCampaign Name: []\nCampaign Type: []\nBid Strategy: []\n"
-        f"Daily Budget: Rs {request.budget // 30}\nTarget CPA: Rs []\nMax CPC: Rs []\nExpected ROAS: []\n\n"
+        "DEMOGRAPHICS:\nAge Range: []\nGender: []\nIncome Level: []\nLocation: []\nLanguage: []\n\n"
+        "DEVICE TARGETING:\nMobile: [%]\nDesktop: [%]\nBest Device: []\n\n"
+        "AD PLACEMENTS:\n1. Instagram Feed: []\n2. Instagram Reels: []\n3. Facebook Feed: []\n4. Google Search: []\n5. Google Display: []\n\n"
+        "TIME TARGETING:\nBest Days: []\nPeak Hours: []\nAvoid: []\n\n"
+        f"BUDGET SPLIT (Total Rs {request.budget}/month):\n1. Google Search Ads: Rs [] ([%]) - [reason]\n2. Meta Ads (FB+IG): Rs [] ([%]) - [reason]\n3. [Platform]: Rs [] ([%]) - [reason]\n\n"
+        "GOOGLE ADS HEADLINES (8, STRICT max 30 characters each):\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n\n"
+        "GOOGLE ADS DESCRIPTIONS (4, max 90 characters each):\n1. []\n2. []\n3. []\n4. []\n\n"
         "AD GROUPS:\n1. Group: [] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n2. Group: [] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n3. Group: [] | Keywords: [kw1, kw2, kw3, kw4, kw5]\n\n"
-        "HEADLINES (20, max 30 chars each):\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n9. []\n10. []\n11. []\n12. []\n13. []\n14. []\n15. []\n16. []\n17. []\n18. []\n19. []\n20. []\n\n"
-        "DESCRIPTIONS (20, max 90 chars each):\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n9. []\n10. []\n11. []\n12. []\n13. []\n14. []\n15. []\n16. []\n17. []\n18. []\n19. []\n20. []\n\n"
-        "META AD COPY:\nPrimary Text: []\nHeadline: []\nDescription: []\nCTA Button: []\n\n"
-        "INTEREST TARGETING:\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n\n"
+        "META AD COPY:\nPrimary Text: []\nHeadline: [max 40 chars]\nCTA Button: []\n\n"
+        "INTEREST TARGETING:\n1. []\n2. []\n3. []\n4. []\n5. []\n\n"
         "REMARKETING STRATEGY:\n1. []\n2. []\n3. []\n\n"
-        "KPI TARGETS:\nExpected CTR: []\nExpected CPL: Rs []\nExpected CPC: Rs []\nExpected ROAS: []\nExpected Conversion Rate: []\n\n"
-        "CREATIVE BRIEF:\nImage Concept: []\nColor Palette: []\nVideo Script (15 sec): []\nCarousel Slide 1: []\nCarousel Slide 2: []\nCarousel Slide 3: []\n\n"
-        "AB TESTING PLAN:\n1. Test 1: [A] vs [B] - [reason]\n2. Test 2: [A] vs [B] - [reason]\n3. Test 3: [A] vs [B] - [reason]\n\n"
-        "LANDING PAGE SUGGESTIONS:\nHero Headline: []\nSub Headline: []\nCTA Button: []\nTrust Signals: []\n\n"
+        "KPI TARGETS:\nGoogle Search CTR: [3-6%]\nMeta CTR: [1-3%]\nExpected CPL: Rs []\nExpected ROAS: []\n\n"
         "NEGATIVE KEYWORDS:\n1. []\n2. []\n3. []\n4. []\n5. []\n\n"
         "COMMON MISTAKES:\n1. []\n2. []\n3. []\n\n"
         "OPPORTUNITIES:\n1. []\n2. []\n3. []\n"
@@ -251,11 +242,10 @@ async def competitor(request: CompetitorRequest):
         if not cu.strip(): continue
         content = await fetch(cu)
         comp_blocks.append(f"COMPETITOR {i+1} ({cu}):\n{content[:1500]}\n")
-
     competitors_text = "\n".join(comp_blocks)
 
     prompt = (
-        "Tu ek world-class competitor intelligence analyst hai. Sab kuch website content ke evidence pe based karo.\n\n"
+        "Tu ek world-class competitor intelligence analyst hai.\n\n"
         f"Business Type: {request.business_type}\n\nMY BUSINESS ({request.my_url}):\n{my_content[:1500]}\n\nCOMPETITORS:\n{competitors_text}\n\n"
         "Koi asterisk mat use kar. Seedha likho:\n\n"
         "MY POSITIONING:\n[2-3 lines]\n\nCOMPETITOR ANALYSIS:\nCompetitor 1: [naam/url]\nPositioning: []\nStrengths: []\nWeaknesses: []\nMessaging Style: []\n\n"
@@ -276,7 +266,6 @@ async def ad_intelligence(request: AdIntelRequest):
     import urllib.parse
     encoded_name = urllib.parse.quote(request.business_name)
     meta_link = f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country={request.country}&q={encoded_name}&search_type=keyword_unordered"
-
     if request.website:
         domain = request.website.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/").split("/")[0]
         google_link = f"https://adstransparency.google.com/?region={request.country}&domain={domain}"
@@ -284,8 +273,8 @@ async def ad_intelligence(request: AdIntelRequest):
         google_link = f"https://adstransparency.google.com/?region={request.country}"
 
     prompt = (
-        "Tu ek elite competitor ad intelligence strategist hai. Tu sirf woh advice deta hai jo PUBLIC ad tools se actually possible ho.\n\n"
-        "Meta Ad Library aur Google Ads Transparency mein DIKHTA hai: creative, start date, ad count, versions, platforms.\n"
+        "Tu ek elite competitor ad intelligence strategist hai.\n\n"
+        "Meta Ad Library mein DIKHTA hai: creative, start date, ad count, versions, platforms.\n"
         "NAHI dikhta: likes, CTR, conversions, ROAS, budget, spend.\n\n"
         f"COMPETITOR: {request.business_name}\nWEBSITE: {request.website or 'N/A'}\nINDUSTRY: {request.business_type}\n\n"
         "Koi asterisk mat use kar. Seedha likho:\n\n"
@@ -342,16 +331,30 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         return {"success": False, "scan_failed": True, "message": "Website scan nahi ho payi."}
 
     strategy_prompt = (
-        "Tu ek senior digital marketing strategist hai.\n"
-        "HUMAN WRITING: AI buzzwords (unleash, elevate, game-changer, unlock, dive in) mat use kar.\n"
+        "Tu ek senior digital marketing strategist hai jo Google Ads aur Meta Ads dono ka expert hai.\n"
+        "HUMAN WRITING: AI buzzwords (unleash, elevate, game-changer, unlock, dive in) mat use kar. Chhote punchy lines likho.\n"
         "LANGUAGE: " + request.language + "\n\n"
         "URL: " + request.url + "\nBusiness: " + request.business_type + "\nBudget: Rs " + str(request.budget) + "\nGoal: " + request.goal + "\nWebsite:\n" + my_content[:2000] + "\n\n"
         "Koi asterisk mat use kar. Seedha likho:\n\n"
-        "BUSINESS SUMMARY:\n[2 lines]\n\nTARGET AUDIENCE:\n[2 lines]\n\n"
-        "BUDGET SPLIT:\n1. [Platform]: Rs [amt] - [reason]\n2. [Platform]: Rs [amt] - [reason]\n3. [Platform]: Rs [amt] - [reason]\n\n"
-        "TOP HEADLINES (8):\n1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n\n"
-        "META AD COPY:\nPrimary Text: []\nHeadline: []\nCTA: []\n\n"
-        "KPI TARGETS:\nExpected CTR: []\nExpected CPL: Rs []\nExpected ROAS: []\n"
+        "BUSINESS SUMMARY:\n[2 lines — website evidence pe based]\n\n"
+        "TARGET AUDIENCE:\n[2 lines — specific, generic nahi]\n\n"
+        "BUDGET SPLIT:\n"
+        "1. Google Search Ads: Rs [amt] ([%]) - [reason]\n"
+        "2. Meta Ads (FB+IG): Rs [amt] ([%]) - [reason]\n"
+        "3. [Ek aur relevant platform]: Rs [amt] ([%]) - [reason]\n\n"
+        "GOOGLE ADS HEADLINES (8, STRICT max 30 characters each — count karke likho):\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n\n"
+        "GOOGLE ADS DESCRIPTIONS (4, max 90 characters each):\n"
+        "1. []\n2. []\n3. []\n4. []\n\n"
+        "META AD COPY:\n"
+        "Primary Text: [2-3 lines, conversational, Indian audience ke liye]\n"
+        "Headline: [max 40 chars, punchy]\n"
+        "CTA Button: [Shop Now / Book Now / Learn More / Get Quote]\n\n"
+        "KPI TARGETS:\n"
+        "Google Search CTR: [realistic 3-6%]\n"
+        "Meta CTR: [realistic 1-3%]\n"
+        "Expected CPL: Rs []\n"
+        "Expected ROAS: []\n"
     )
     strategy = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": strategy_prompt}], max_tokens=1800).choices[0].message.content
 
@@ -386,7 +389,7 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     creative_prompt = (
         "LANGUAGE: " + request.language + "\n\n"
         "Tu ek award-winning ad creative director hai. Competitor analysis dekh ke alag creative bana.\n"
-        "HUMAN WRITING: AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless) mat use kar.\n\n"
+        "HUMAN WRITING: AI buzzwords mat use kar.\n\n"
         "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\nPROMOTE: " + request.goal + "\n\nCOMPETITOR ANALYSIS:\n" + (competitor_result or "N/A") + "\n\n"
         "2 ad creative banao jo competitor se alag hon. Koi asterisk mat use kar.\n\n"
         "WHY DIFFERENT:\n[1-2 line]\n\n"
@@ -395,94 +398,43 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     )
     smart_creative = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": creative_prompt}], max_tokens=1400).choices[0].message.content
 
-    # SECTION 5 — Audience Finder
     audience_prompt = (
-        "IMPORTANT RULES:
-"
-        "1. Yeh Indian market ke liye hai — Dream11, MPL, My11Circle jaise Indian context use karo.
-"
-        "2. Age exclude sirf 45+ karo.
-"
-        "3. KABHI betting, gambling, wagering, investment words mat use karo — sirf entertainment, gaming, competition likho.
-"
-        "4. Display Placements mein gambling apps KABHI mat do.
-
-"
-        "Tu ek elite media buyer hai jo Meta aur Google Ads ka expert hai.
-
-"
-        "BUSINESS: " + request.url + "
-"
-        "INDUSTRY: " + request.business_type + "
-"
-        "WEBSITE CONTENT:
-" + my_content[:1500] + "
-
-"
-        "Is business ke liye exact audience batao. Koi asterisk mat use kar. Seedha likho:
-
-"
-        "IDEAL AUDIENCE:
-[2-3 line — entertainment, competition, passion pe focus, KABHI paise kamaana mat likho]
-
-"
-        "AUDIENCE SEGMENTS:
-"
-        "Segment 1 — [naam]: [age, gender, interests, behavior]
-"
-        "Segment 2 — [naam]: [age, gender, interests, behavior]
-"
-        "Segment 3 — [naam]: [age, gender, interests, behavior]
-
-"
-        "WHERE TO FIND THEM:
-"
-        "Apps: [5 specific Indian apps]
-"
-        "Pages/Communities: [3 Facebook pages ya groups]
-"
-        "YouTube Channels: [2-3 channels]
-"
-        "Influencer Type: [kis type ke influencer]
-
-"
-        "META ADS TARGETING:
-"
-        "Interests: [5 specific interests]
-"
-        "Behaviors: [2-3 behavior]
-"
-        "Age/Gender: []
-"
-        "Exclude: [sirf 45+]
-
-"
-        "GOOGLE ADS TARGETING:
-"
-        "In-Market Segments: [Sports & Fitness, Online Games, Mobile Games & Apps jaise actual segments]
-"
-        "Custom Segment Keywords: [5 keywords]
-"
-        "Search Keywords: [5 high-intent keywords]
-
-"
-        "DISPLAY PLACEMENTS:
-"
-        "1. []
-2. []
-3. []
-4. []
-5. []
-
-"
-        "POLICY SAFETY CHECK:
-"
-        "Risk Level: [Low/Medium/High]
-"
-        "Avoid These Words: []
-"
-        "Certification Needed: []
-"
+        "Tu ek elite media buyer hai jo Meta aur Google Ads ka expert hai.\n\n"
+        "IMPORTANT RULES:\n"
+        "1. Yeh Indian market ke liye hai — Indian apps, communities, channels suggest karo.\n"
+        "2. Age exclude sirf 45+ karo.\n"
+        "3. KABHI betting, gambling, wagering, investment words mat use karo.\n"
+        "4. Display Placements mein gambling apps KABHI mat do.\n"
+        "5. IDEAL AUDIENCE mein paise kamaana, earn money, win cash KABHI mat likho.\n\n"
+        "BUSINESS: " + request.url + "\n"
+        "INDUSTRY: " + request.business_type + "\n"
+        "WEBSITE CONTENT:\n" + my_content[:1500] + "\n\n"
+        "Is business ke liye exact audience batao. Koi asterisk mat use kar. Seedha likho:\n\n"
+        "IDEAL AUDIENCE:\n[2-3 line — entertainment, competition, passion pe focus]\n\n"
+        "AUDIENCE SEGMENTS:\n"
+        "Segment 1 — [naam]: [age, gender, interests, behavior]\n"
+        "Segment 2 — [naam]: [age, gender, interests, behavior]\n"
+        "Segment 3 — [naam]: [age, gender, interests, behavior]\n\n"
+        "WHERE TO FIND THEM:\n"
+        "Apps: [5 specific Indian apps]\n"
+        "Pages/Communities: [3 Facebook pages ya groups]\n"
+        "YouTube Channels: [2-3 channels]\n"
+        "Influencer Type: [kis type ke influencer]\n\n"
+        "META ADS TARGETING:\n"
+        "Interests: [5 specific interests]\n"
+        "Behaviors: [2-3 behavior]\n"
+        "Age/Gender: []\n"
+        "Exclude: [sirf 45+]\n\n"
+        "GOOGLE ADS TARGETING:\n"
+        "In-Market Segments: [Sports & Fitness, Online Games, Mobile Games & Apps jaise actual segments — irrelevant mat do]\n"
+        "Custom Segment Keywords: [5 keywords]\n"
+        "Search Keywords: [5 high-intent keywords]\n\n"
+        "DISPLAY PLACEMENTS:\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n\n"
+        "POLICY SAFETY CHECK:\n"
+        "Risk Level: [Low/Medium/High]\n"
+        "Avoid These Words: []\n"
+        "Certification Needed: []\n"
     )
     audience_result = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": audience_prompt}], max_tokens=1500).choices[0].message.content
 
@@ -529,7 +481,7 @@ async def ad_creative(request: AdCreativeRequest):
 
     prompt = (
         "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
-        "HUMAN WRITING: AI buzzwords (unleash, elevate, game-changer, unlock, dive in, transform, seamless, discover the magic) mat use kar.\n"
+        "HUMAN WRITING: AI buzzwords mat use kar.\n"
         "LANGUAGE: " + request.language + "\n\n"
         "BRAND WEBSITE:\n" + site[:1500] + "\n\nPROMOTE: " + request.offer + "\nPLATFORM: " + request.platform + "\nINDUSTRY: " + request.business_type + "\n\n"
         "3 alag ad creative banao. Koi asterisk mat use kar.\n\n"
@@ -579,7 +531,6 @@ async def audience_finder(request: AudienceRequest):
         except:
             return ""
 
-    # URL ya Niche — dono se kaam chalega
     site = ""
     if request.url and request.url.strip():
         site = await fetch(request.url)
@@ -597,31 +548,36 @@ async def audience_finder(request: AudienceRequest):
 
     prompt = (
         "IMPORTANT: Poora response sirf is language mein likho: " + request.language + "\n\n"
-        "Tu ek elite media buyer hai jo Meta aur Google Ads dono ka expert hai aur audience targeting + ad policy ka master hai.\n\n"
+        "Tu ek elite media buyer hai jo Meta aur Google Ads dono ka expert hai.\n\n"
         + business_info
         + niche_context
         + "PROMOTE: " + (request.offer or "general business") + "\n"
         + "PLATFORM: " + request.platform + "\n"
-        + "INDUSTRY: " + request.business_type + "\n" + "IMPORTANT RULES (sabse upar):\n1. Yeh Indian market ke liye hai — Dream11, MPL, My11Circle, Paytm First Games jaise Indian apps use karo.\n2. Age exclude sirf 45+ karo, 35+ kabhi mat karo — 35-45 bhi active fantasy users hain.\n3. Audience Segments mein KABHI betting, gambling, wagering, investment jaise words mat use karo — sirf entertainment, gaming, competition likho.\n4. Display Placements mein gambling ya betting apps (PokerBaazi, RummyCircle) KABHI mat do — sirf sports news sites, cricket sites, gaming blogs do.\n5. Influencer Type mein ex-cricketers, sports analysts, fantasy experts suggest karo.\n\n"
-        + "Is business ke liye exact audience aur placements batao. Real, specific bano — generic mat."
-        + " Koi asterisk ya markdown mat use kar. HAR SECTION EXACTLY is format mein likho — skip mat karna:\n\n"
-        + "IDEAL AUDIENCE:\n[2-3 line — yeh business kiske liye perfect hai. KABHI mat likho: paise kamaana, earn money, win cash — sirf entertainment, competition, sports passion likho]\n\n"
+        + "INDUSTRY: " + request.business_type + "\n"
+        + "IMPORTANT RULES:\n"
+        + "1. Indian market ke liye — Dream11, MPL, My11Circle, Paytm First Games jaise Indian apps use karo.\n"
+        + "2. Age exclude sirf 45+ karo.\n"
+        + "3. KABHI betting, gambling, wagering, investment words mat use karo.\n"
+        + "4. Display Placements mein gambling apps KABHI mat do.\n"
+        + "5. IDEAL AUDIENCE mein paise kamaana, earn money KABHI mat likho.\n\n"
+        + "Is business ke liye exact audience batao. Koi asterisk mat use kar. HAR SECTION likho:\n\n"
+        + "IDEAL AUDIENCE:\n[2-3 line]\n\n"
         + "AUDIENCE SEGMENTS:\n"
-        + "Segment 1 — [naam]: [age, gender, interests, behavior — 2 lines]\n"
-        + "Segment 2 — [naam]: [age, gender, interests, behavior — 2 lines]\n"
-        + "Segment 3 — [naam]: [age, gender, interests, behavior — 2 lines]\n\n"
+        + "Segment 1 — [naam]: [age, gender, interests, behavior]\n"
+        + "Segment 2 — [naam]: [age, gender, interests, behavior]\n"
+        + "Segment 3 — [naam]: [age, gender, interests, behavior]\n\n"
         + "WHERE TO FIND THEM:\n"
-        + "Apps: [5 specific apps — naam likho]\n"
-        + "Pages/Communities: [3 Facebook pages ya groups — naam likho]\n"
-        + "YouTube Channels: [2-3 channel names]\n"
-        + "Influencer Type: [1-2 line — kis type ke influencer]\n\n"
+        + "Apps: [5 specific apps]\n"
+        + "Pages/Communities: [3 Facebook pages ya groups]\n"
+        + "YouTube Channels: [2-3 channels]\n"
+        + "Influencer Type: [kis type ke influencer]\n\n"
         + "META ADS TARGETING:\n"
         + "Interests: [5 specific interests]\n"
         + "Behaviors: [2-3 behavior]\n"
         + "Age/Gender: []\n"
-        + "Exclude: [kisko hatao]\n\n"
-        + "GOOGLE ADS TARGETING (CRITICAL: In-Market Segments ke liye SIRF yeh actual Google segments use karo jahan fit ho: Sports & Fitness, Sports Memorabilia, Online Games, Mobile Games & Apps, Entertainment, Casual Games. Sports Equipment, Online Gambling, jaise segments KABHI mat do — yeh ya toh irrelevant hain ya policy violation hain):\n"
-        + "In-Market Segments: [3 segments]\n"
+        + "Exclude: [sirf 45+]\n\n"
+        + "GOOGLE ADS TARGETING:\n"
+        + "In-Market Segments: [actual Google segments — Sports & Fitness, Online Games, Mobile Games & Apps]\n"
         + "Custom Segment Keywords: [5 keywords]\n"
         + "Search Keywords: [5 high-intent keywords]\n\n"
         + "DISPLAY PLACEMENTS:\n"
