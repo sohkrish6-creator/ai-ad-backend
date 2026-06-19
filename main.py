@@ -631,45 +631,88 @@ async def intelligence(request: IntelligenceRequest):
 
     def extract_evidence(html, page_type="homepage"):
         evidence = []
+
+        # ── Standard meta tags ──────────────────────────────────────────────
         t = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
         if t:
             evidence.append({"type": "title", "value": t.group(1).strip(), "confidence": 0.95, "page": page_type})
-        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
-        if m:
-            evidence.append({"type": "meta_description", "value": m.group(1).strip(), "confidence": 0.90, "page": page_type})
-        for prop, label in [("og:title", "og_title"), ("og:description", "og_description")]:
-            og = re.search(r'<meta[^>]*property=["\']' + prop + r'["\'][^>]*content=["\'](.*?)["\']', html, re.I)
-            if og:
-                evidence.append({"type": label, "value": og.group(1).strip(), "confidence": 0.85, "page": page_type})
-        kw = re.search(r'<meta[^>]*name=["\']keywords["\'][^>]*content=["\'](.*?)["\']', html, re.I)
-        if kw:
-            evidence.append({"type": "keywords", "value": kw.group(1).strip(), "confidence": 0.70, "page": page_type})
+        for name, label, conf in [
+            ("description",        "meta_description",    0.90),
+            ("keywords",           "keywords",            0.70),
+            ("twitter:title",      "twitter_title",       0.82),
+            ("twitter:description","twitter_description", 0.80),
+        ]:
+            m = re.search(r'<meta[^>]*name=["\']' + re.escape(name) + r'["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+            if m and m.group(1).strip():
+                evidence.append({"type": label, "value": m.group(1).strip(), "confidence": conf, "page": page_type})
+        for prop, label, conf in [
+            ("og:title",       "og_title",       0.85),
+            ("og:description", "og_description", 0.85),
+            ("og:site_name",   "og_site_name",   0.80),
+            ("og:type",        "og_type",        0.70),
+        ]:
+            og = re.search(r'<meta[^>]*property=["\']' + re.escape(prop) + r'["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+            if og and og.group(1).strip():
+                evidence.append({"type": label, "value": og.group(1).strip(), "confidence": conf, "page": page_type})
+
+        # ── Headings ────────────────────────────────────────────────────────
         for tag in ['h1', 'h2', 'h3']:
             conf = 0.85 if tag == 'h1' else (0.75 if tag == 'h2' else 0.65)
             for h in re.findall(r'<' + tag + r'[^>]*>(.*?)</' + tag + r'>', html, re.I | re.S):
                 clean = re.sub(r'<[^>]+>', '', h).strip()
                 if clean and len(clean) > 3:
                     evidence.append({"type": tag, "value": clean, "confidence": conf, "page": page_type})
+
+        # ── Trust + pricing signals ─────────────────────────────────────────
         for pattern, trust_type in [
             (r'(\d+\+?\s*(?:years?|yr)\s*(?:of\s*)?(?:experience|expertise))', "years_experience"),
-            (r'(\d[\d,]*\+?\s*(?:customers?|clients?|users?))', "customer_count"),
-            (r'(ISO\s*\d+[:\-]\d+)', "certification"),
-            (r'(rated\s*[\d.]+\s*(?:out\s*of\s*5|\/\s*5|stars?))', "rating"),
-            (r'(\d+\+?\s*(?:projects?|orders?|deliveries?))', "project_count"),
+            (r'(\d[\d,]*\+?\s*(?:customers?|clients?|users?))',                 "customer_count"),
+            (r'(ISO\s*\d+[:\-]\d+)',                                            "certification"),
+            (r'(rated\s*[\d.]+\s*(?:out\s*of\s*5|\/\s*5|stars?))',             "rating"),
+            (r'(\d+\+?\s*(?:projects?|orders?|deliveries?))',                   "project_count"),
         ]:
             for match in re.findall(pattern, html, re.I)[:2]:
                 evidence.append({"type": f"trust_{trust_type}", "value": match.strip(), "confidence": 0.85, "page": page_type})
         for price in re.findall(r'(?:Rs\.?|INR|₹|\$)\s*[\d,]+(?:\.\d+)?', html)[:5]:
             evidence.append({"type": "pricing_signal", "value": price.strip(), "confidence": 0.80, "page": page_type})
+
+        # ── SPA / Next.js fallbacks ─────────────────────────────────────────
+        # __NEXT_DATA__
+        nd = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.I | re.S)
+        if nd:
+            try:
+                next_data = json.loads(nd.group(1).strip())
+                props = next_data.get("props", {}).get("pageProps", {})
+                evidence.append({"type": "next_data", "value": json.dumps(props)[:1500], "confidence": 0.85, "page": page_type})
+            except:
+                pass
+
+        # JSON-LD structured data
+        for jld_raw in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
+            try:
+                evidence.append({"type": "json_ld", "value": json.dumps(json.loads(jld_raw.strip()))[:800], "confidence": 0.88, "page": page_type})
+            except:
+                pass
+
+        # noscript text
+        for ns in re.findall(r'<noscript[^>]*>(.*?)</noscript>', html, re.I | re.S):
+            clean = re.sub(r'<[^>]+>', ' ', ns)
+            clean = re.sub(r'\s+', ' ', clean).strip()
+            if clean and len(clean) > 10:
+                evidence.append({"type": "noscript_text", "value": clean[:400], "confidence": 0.65, "page": page_type})
+
+        # ── Body text ───────────────────────────────────────────────────────
         body = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.I | re.S)
         body = re.sub(r'<style[^>]*>.*?</style>', '', body, flags=re.I | re.S)
         body = re.sub(r'<[^>]+>', ' ', body)
         body = re.sub(r'\s+', ' ', body).strip()
-        if body:
+        if body and len(body) > 50:
             evidence.append({"type": "body_text", "value": body[:2000], "confidence": 0.60, "page": page_type})
+
         return evidence
 
     async def fetch_page(url, page_type="homepage"):
+        """Returns (fetched: bool, evidence: list)"""
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
                 r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -677,12 +720,39 @@ async def intelligence(request: IntelligenceRequest):
                 if r.status_code < 400:
                     ev = extract_evidence(r.text, page_type)
                     logger.info(f"[CRAWL] {url} → {len(ev)} evidence points extracted")
-                    return ev
+                    return (True, ev)
                 else:
                     logger.info(f"[CRAWL] {url} → SKIPPED (status {r.status_code})")
+                    return (False, [])
         except Exception as e:
             logger.info(f"[CRAWL] {url} → EXCEPTION: {e}")
-        return []
+        return (False, [])
+
+    async def fetch_sitemap_evidence(base):
+        """Try robots.txt → sitemap.xml, extract URLs as evidence. Returns (fetched: bool, evidence: list)"""
+        async def try_get(u):
+            try:
+                async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+                    r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
+                    return r.text if r.status_code < 400 else None
+            except:
+                return None
+
+        sitemap_url = base + "/sitemap.xml"
+        robots = await try_get(base + "/robots.txt")
+        if robots:
+            sm = re.search(r'Sitemap:\s*(https?://\S+)', robots, re.I)
+            if sm:
+                sitemap_url = sm.group(1).strip()
+                logger.info(f"[CRAWL] Sitemap found in robots.txt: {sitemap_url}")
+
+        sitemap = await try_get(sitemap_url)
+        if sitemap:
+            urls = re.findall(r'<loc>(https?://[^<]+)</loc>', sitemap, re.I)[:20]
+            if urls:
+                logger.info(f"[CRAWL] Sitemap: {len(urls)} URLs found")
+                return (True, [{"type": "sitemap_urls", "value": " | ".join(urls), "confidence": 0.75, "page": "sitemap"}])
+        return (False, [])
 
     async def run_ai_json(prompt, max_tokens):
         resp = await asyncio.to_thread(
@@ -714,28 +784,44 @@ async def intelligence(request: IntelligenceRequest):
     for u, pt in crawl_targets:
         logger.info(f"[CRAWL]   → {u} ({pt})")
 
-    page_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in crawl_targets])
+    gather_results = await asyncio.gather(
+        *[fetch_page(u, pt) for u, pt in crawl_targets],
+        fetch_sitemap_evidence(base)
+    )
 
-    logger.info(f"[CRAWL] Results: {[len(pr) for pr in page_results]} evidence points per page")
-    logger.info(f"[CRAWL] Pages with data: {sum(1 for pr in page_results if pr)} / {len(crawl_targets)}")
+    # Last result is sitemap, rest are page results
+    sitemap_fetched, sitemap_ev = gather_results[-1]
+    page_results = gather_results[:-1]
+
+    pages_fetched = sum(1 for (fetched, _) in page_results if fetched)
+    pages_with_evidence = sum(1 for (fetched, ev) in page_results if fetched and ev)
+
+    logger.info(f"[CRAWL] pages_attempted={len(crawl_targets)} pages_fetched={pages_fetched} pages_with_evidence={pages_with_evidence} sitemap_crawled={sitemap_fetched}")
 
     all_evidence = []
     seen = set()
-    for page_ev in page_results:
+    for (fetched, page_ev) in page_results:
         for e in page_ev:
             key = (e["type"], e["value"][:60])
             if key not in seen:
                 seen.add(key)
                 all_evidence.append(e)
+    for e in sitemap_ev:
+        key = (e["type"], e["value"][:60])
+        if key not in seen:
+            seen.add(key)
+            all_evidence.append(e)
 
     if not all_evidence:
         return {"success": False, "scan_failed": True, "message": "Website unreachable. Check URL and try again."}
 
-    pages_crawled = sum(1 for pr in page_results if pr)
     avg_confidence = round(sum(e["confidence"] for e in all_evidence) / len(all_evidence), 2)
 
     evidence_collection = {
-        "pages_crawled": pages_crawled,
+        "pages_attempted": len(crawl_targets),
+        "pages_fetched": pages_fetched,
+        "pages_with_evidence": pages_with_evidence,
+        "sitemap_crawled": sitemap_fetched,
         "evidence_points": len(all_evidence),
         "avg_confidence": avg_confidence,
         "evidence": [e for e in all_evidence if e["type"] != "body_text"][:30],
