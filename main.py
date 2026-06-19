@@ -395,7 +395,98 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     )
     smart_creative = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": creative_prompt}], max_tokens=1400).choices[0].message.content
 
-    return {"success": True, "url": request.url, "strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "meta_ad_library_link": meta_link, "google_ads_link": google_link}
+    # SECTION 5 — Audience Finder
+    audience_prompt = (
+        "IMPORTANT RULES:
+"
+        "1. Yeh Indian market ke liye hai — Dream11, MPL, My11Circle jaise Indian context use karo.
+"
+        "2. Age exclude sirf 45+ karo.
+"
+        "3. KABHI betting, gambling, wagering, investment words mat use karo — sirf entertainment, gaming, competition likho.
+"
+        "4. Display Placements mein gambling apps KABHI mat do.
+
+"
+        "Tu ek elite media buyer hai jo Meta aur Google Ads ka expert hai.
+
+"
+        "BUSINESS: " + request.url + "
+"
+        "INDUSTRY: " + request.business_type + "
+"
+        "WEBSITE CONTENT:
+" + my_content[:1500] + "
+
+"
+        "Is business ke liye exact audience batao. Koi asterisk mat use kar. Seedha likho:
+
+"
+        "IDEAL AUDIENCE:
+[2-3 line — entertainment, competition, passion pe focus, KABHI paise kamaana mat likho]
+
+"
+        "AUDIENCE SEGMENTS:
+"
+        "Segment 1 — [naam]: [age, gender, interests, behavior]
+"
+        "Segment 2 — [naam]: [age, gender, interests, behavior]
+"
+        "Segment 3 — [naam]: [age, gender, interests, behavior]
+
+"
+        "WHERE TO FIND THEM:
+"
+        "Apps: [5 specific Indian apps]
+"
+        "Pages/Communities: [3 Facebook pages ya groups]
+"
+        "YouTube Channels: [2-3 channels]
+"
+        "Influencer Type: [kis type ke influencer]
+
+"
+        "META ADS TARGETING:
+"
+        "Interests: [5 specific interests]
+"
+        "Behaviors: [2-3 behavior]
+"
+        "Age/Gender: []
+"
+        "Exclude: [sirf 45+]
+
+"
+        "GOOGLE ADS TARGETING:
+"
+        "In-Market Segments: [Sports & Fitness, Online Games, Mobile Games & Apps jaise actual segments]
+"
+        "Custom Segment Keywords: [5 keywords]
+"
+        "Search Keywords: [5 high-intent keywords]
+
+"
+        "DISPLAY PLACEMENTS:
+"
+        "1. []
+2. []
+3. []
+4. []
+5. []
+
+"
+        "POLICY SAFETY CHECK:
+"
+        "Risk Level: [Low/Medium/High]
+"
+        "Avoid These Words: []
+"
+        "Certification Needed: []
+"
+    )
+    audience_result = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": audience_prompt}], max_tokens=1500).choices[0].message.content
+
+    return {"success": True, "url": request.url, "strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "audience": audience_result, "meta_ad_library_link": meta_link, "google_ads_link": google_link}
 
 class AdCreativeRequest(BaseModel):
     url: str
