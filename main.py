@@ -429,7 +429,7 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "In-Market Segments: [Sports & Fitness, Online Games, Mobile Games & Apps jaise actual segments — irrelevant mat do]\n"
         "Custom Segment Keywords: [5 keywords]\n"
         "Search Keywords: [5 high-intent keywords]\n\n"
-        "DISPLAY PLACEMENTS:\n"
+        "DISPLAY PLACEMENTS (IMPORTANT: specific website/app names do — jaise Vogue India, Femina, LBB, Hauterfly, Sportskeeda, Cricbuzz. Generic categories KABHI mat do):\n"
         "1. []\n2. []\n3. []\n4. []\n5. []\n\n"
         "POLICY SAFETY CHECK:\n"
         "Risk Level: [Low/Medium/High]\n"
