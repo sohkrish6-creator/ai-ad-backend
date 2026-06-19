@@ -1108,7 +1108,7 @@ async def intelligence(request: IntelligenceRequest):
         },
         "scores": {
             "dna_score": dna.get("dna_score", 0),
-            "opportunity_score": opportunity.get("overall_opportunity_score", 0),
+            "opportunity_score": round(opportunity.get("overall_opportunity_score", 0)),
             "threat_score": threat.get("competitor_threat_score", 0),
             "audience_quality_score": audience_intel.get("audience_quality_score", 0),
             "positioning_score": positioning.get("confidence_score", 0),
