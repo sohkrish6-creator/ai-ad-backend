@@ -298,7 +298,7 @@ class FullReportRequest(BaseModel):
 
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
-    import re, urllib.parse
+    import re, urllib.parse, asyncio
 
     def extract_clean(html):
         parts = []
@@ -326,9 +326,23 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         except:
             return ""
 
+    async def run_ai(prompt, max_tokens):
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens
+            )
+        )
+        return resp.choices[0].message.content
+
     my_content = await fetch(request.url)
     if not my_content or len(my_content) < 100:
         return {"success": False, "scan_failed": True, "message": "Website scan nahi ho payi."}
+
+    comp_content = ""
+    if request.competitor_website:
+        comp_content = await fetch(request.competitor_website)
 
     strategy_prompt = (
         "Tu ek senior digital marketing strategist hai jo Google Ads aur Meta Ads dono ka expert hai.\n"
@@ -356,18 +370,6 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "Expected CPL: Rs []\n"
         "Expected ROAS: []\n"
     )
-    strategy = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": strategy_prompt}], max_tokens=1800).choices[0].message.content
-
-    competitor_result = ""
-    if request.competitor_website:
-        comp_content = await fetch(request.competitor_website)
-        comp_prompt = (
-            "Tu competitor intelligence analyst hai.\n\n"
-            "MERA BUSINESS (" + request.url + "):\n" + my_content[:1200] + "\n\nCOMPETITOR (" + request.competitor_website + "):\n" + comp_content[:1200] + "\n\n"
-            "Koi asterisk mat use kar. Seedha likho:\n\n"
-            "COMPETITOR POSITIONING:\n[2 lines]\n\nUNKI STRENGTHS:\n1. []\n2. []\n\nUNKI WEAKNESS:\n1. []\n2. []\n\nMARKET GAPS:\n1. []\n2. []\n3. []\n\nTUM KAHAN JEET SAKTE HO:\n1. []\n2. []\n3. []\n"
-        )
-        competitor_result = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": comp_prompt}], max_tokens=1200).choices[0].message.content
 
     ad_name = request.competitor_name or request.competitor_website or request.business_type
     encoded = urllib.parse.quote(ad_name)
@@ -384,19 +386,6 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "Koi asterisk mat use kar. Seedha likho:\n\n"
         "AD LIBRARY MEIN KYA DEKHO:\n1. []\n2. []\n3. []\n\nWINNING AD KAISE PEHCHANE:\n1. []\n2. []\n3. []\n\nTUMHARA WINNING ANGLE:\n1. []\n2. []\n3. []\n"
     )
-    ad_guide = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": ad_prompt}], max_tokens=900).choices[0].message.content
-
-    creative_prompt = (
-        "LANGUAGE: " + request.language + "\n\n"
-        "Tu ek award-winning ad creative director hai. Competitor analysis dekh ke alag creative bana.\n"
-        "HUMAN WRITING: AI buzzwords mat use kar.\n\n"
-        "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\nPROMOTE: " + request.goal + "\n\nCOMPETITOR ANALYSIS:\n" + (competitor_result or "N/A") + "\n\n"
-        "2 ad creative banao jo competitor se alag hon. Koi asterisk mat use kar.\n\n"
-        "WHY DIFFERENT:\n[1-2 line]\n\n"
-        "CREATIVE 1: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\n\n"
-        "CREATIVE 2: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\n"
-    )
-    smart_creative = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": creative_prompt}], max_tokens=1400).choices[0].message.content
 
     audience_prompt = (
         "Tu ek elite media buyer hai jo Meta aur Google Ads ka expert hai.\n\n"
@@ -436,7 +425,38 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "Avoid These Words: []\n"
         "Certification Needed: []\n"
     )
-    audience_result = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": audience_prompt}], max_tokens=1500).choices[0].message.content
+
+    async def get_competitor():
+        if not request.competitor_website:
+            return ""
+        comp_prompt = (
+            "Tu competitor intelligence analyst hai.\n\n"
+            "MERA BUSINESS (" + request.url + "):\n" + my_content[:1200] + "\n\nCOMPETITOR (" + request.competitor_website + "):\n" + comp_content[:1200] + "\n\n"
+            "Koi asterisk mat use kar. Seedha likho:\n\n"
+            "COMPETITOR POSITIONING:\n[2 lines]\n\nUNKI STRENGTHS:\n1. []\n2. []\n\nUNKI WEAKNESS:\n1. []\n2. []\n\nMARKET GAPS:\n1. []\n2. []\n3. []\n\nTUM KAHAN JEET SAKTE HO:\n1. []\n2. []\n3. []\n"
+        )
+        return await run_ai(comp_prompt, 1200)
+
+    # Phase 1: strategy, competitor, ad_guide, audience all run in parallel
+    strategy, competitor_result, ad_guide, audience_result = await asyncio.gather(
+        run_ai(strategy_prompt, 1800),
+        get_competitor(),
+        run_ai(ad_prompt, 900),
+        run_ai(audience_prompt, 1500),
+    )
+
+    # Phase 2: smart_creative depends on competitor_result from Phase 1
+    creative_prompt = (
+        "LANGUAGE: " + request.language + "\n\n"
+        "Tu ek award-winning ad creative director hai. Competitor analysis dekh ke alag creative bana.\n"
+        "HUMAN WRITING: AI buzzwords mat use kar.\n\n"
+        "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\nPROMOTE: " + request.goal + "\n\nCOMPETITOR ANALYSIS:\n" + (competitor_result or "N/A") + "\n\n"
+        "2 ad creative banao jo competitor se alag hon. Koi asterisk mat use kar.\n\n"
+        "WHY DIFFERENT:\n[1-2 line]\n\n"
+        "CREATIVE 1: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\n\n"
+        "CREATIVE 2: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\n"
+    )
+    smart_creative = await run_ai(creative_prompt, 1400)
 
     return {"success": True, "url": request.url, "strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "audience": audience_result, "meta_ad_library_link": meta_link, "google_ads_link": google_link}
 
