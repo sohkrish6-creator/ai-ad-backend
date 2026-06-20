@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 from typing import Optional
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
+from google.oauth2.credentials import Credentials
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -1155,14 +1156,19 @@ def update_lead(lead_id: int, status: str, db: Session = Depends(get_db)):
 # ── Google Ads Performance ────────────────────────────────────────────────────
 
 def get_google_ads_client():
-    return GoogleAdsClient.load_from_dict({
-        "developer_token":   os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-        "client_id":         os.getenv("GOOGLE_ADS_CLIENT_ID"),
-        "client_secret":     os.getenv("GOOGLE_ADS_CLIENT_SECRET"),
-        "refresh_token":     os.getenv("GOOGLE_ADS_REFRESH_TOKEN"),
-        "use_proto_plus":    True,
-        "login_customer_id": os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
-    })
+    creds = Credentials(
+        token=None,
+        refresh_token=os.getenv("GOOGLE_ADS_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.getenv("GOOGLE_ADS_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_ADS_CLIENT_SECRET"),
+    )
+    return GoogleAdsClient(
+        credentials=creds,
+        developer_token=os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        login_customer_id=os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+        use_proto_plus=True,
+    )
 
 @app.get("/google-ads/performance")
 async def google_ads_performance(days: int = 30):
