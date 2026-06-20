@@ -1155,20 +1155,38 @@ def update_lead(lead_id: int, status: str, db: Session = Depends(get_db)):
 
 # ── Google Ads Performance ────────────────────────────────────────────────────
 
+def _genv(key: str) -> str:
+    """Get env var, stripping whitespace/quotes that Render sometimes adds."""
+    val = os.getenv(key, "")
+    return val.strip().strip('"').strip("'")
+
 def get_google_ads_client():
     creds = Credentials(
         token=None,
-        refresh_token=os.getenv("GOOGLE_ADS_REFRESH_TOKEN"),
+        refresh_token=_genv("GOOGLE_ADS_REFRESH_TOKEN"),
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.getenv("GOOGLE_ADS_CLIENT_ID"),
-        client_secret=os.getenv("GOOGLE_ADS_CLIENT_SECRET"),
+        client_id=_genv("GOOGLE_ADS_CLIENT_ID"),
+        client_secret=_genv("GOOGLE_ADS_CLIENT_SECRET"),
     )
     return GoogleAdsClient(
         credentials=creds,
-        developer_token=os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-        login_customer_id=os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+        developer_token=_genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        login_customer_id=_genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
         use_proto_plus=True,
     )
+
+@app.get("/google-ads/debug")
+async def google_ads_debug():
+    """Check which Google Ads env vars are set (values hidden)."""
+    keys = [
+        "GOOGLE_ADS_CLIENT_ID",
+        "GOOGLE_ADS_CLIENT_SECRET",
+        "GOOGLE_ADS_REFRESH_TOKEN",
+        "GOOGLE_ADS_DEVELOPER_TOKEN",
+        "GOOGLE_ADS_CUSTOMER_ID",
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID",
+    ]
+    return {k: bool(_genv(k)) for k in keys}
 
 @app.get("/google-ads/performance")
 async def google_ads_performance(days: int = 30):
