@@ -1188,9 +1188,34 @@ async def google_ads_debug():
     ]
     return {k: bool(_genv(k)) for k in keys}
 
+@app.get("/google-ads/list-accounts")
+async def google_ads_list_accounts():
+    """List all accessible customer accounts under the login_customer_id."""
+    try:
+        client = get_google_ads_client()
+        customer_service = client.get_service("CustomerService")
+        response = customer_service.list_accessible_customers()
+        resource_names = list(response.resource_names)
+        # Extract numeric IDs from "customers/1234567890"
+        account_ids = [r.split("/")[-1] for r in resource_names]
+        logger.info(f"[GOOGLE ADS] Accessible accounts: {account_ids}")
+        return {"success": True, "accessible_accounts": account_ids, "resource_names": resource_names}
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GOOGLE ADS] list-accounts error: {errors}")
+        return {"success": False, "error": errors}
+    except Exception as ex:
+        logger.error(f"[GOOGLE ADS] list-accounts unexpected error: {ex}")
+        return {"success": False, "error": str(ex)}
+
 @app.get("/google-ads/performance")
 async def google_ads_performance(days: int = 30):
     customer_id = os.getenv("GOOGLE_ADS_CUSTOMER_ID")
+    login_customer_id = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
+    # Mask last 4 digits for logging
+    masked_cid   = customer_id[:-4] + "XXXX" if customer_id and len(customer_id) > 4 else customer_id
+    masked_login = login_customer_id[:-4] + "XXXX" if login_customer_id and len(login_customer_id) > 4 else login_customer_id
+    logger.info(f"[GOOGLE ADS] Using customer_id={masked_cid} login_customer_id={masked_login}")
     try:
         client = get_google_ads_client()
         service = client.get_service("GoogleAdsService")
