@@ -30,8 +30,14 @@ app.add_middleware(
 )
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-DATABASE_URL = "sqlite:///./ai_ad_manager.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+_raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
+# SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
+DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
+_is_sqlite = DATABASE_URL.startswith("sqlite")
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
