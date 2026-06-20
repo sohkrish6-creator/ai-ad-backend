@@ -1322,3 +1322,93 @@ async def google_ads_performance(days: int = 30, customer_id: Optional[str] = No
     except Exception as ex:
         logger.error(f"[GOOGLE ADS] Unexpected error: {ex}")
         return {"success": False, "error": str(ex)}
+
+@app.get("/google-ads/campaigns")
+async def google_ads_campaigns(days: int = 30):
+    """Per-campaign breakdown sorted by cost descending."""
+    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    end   = date.today()
+    start = end - timedelta(days=days)
+    try:
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        query = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                campaign.status,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr,
+                metrics.average_cpc
+            FROM campaign
+            WHERE segments.date BETWEEN '{start}' AND '{end}'
+              AND metrics.impressions > 0
+            ORDER BY metrics.cost_micros DESC
+        """
+        rows = list(service.search(customer_id=customer_id, query=query))
+        campaigns = []
+        for row in rows:
+            cost = row.metrics.cost_micros / 1_000_000
+            imp  = row.metrics.impressions
+            clk  = row.metrics.clicks
+            campaigns.append({
+                "campaign_id":  str(row.campaign.id),
+                "name":         row.campaign.name,
+                "status":       row.campaign.status.name,
+                "impressions":  imp,
+                "clicks":       clk,
+                "cost_inr":     round(cost, 2),
+                "conversions":  round(row.metrics.conversions, 2),
+                "ctr_pct":      round(clk / imp * 100, 2) if imp else 0,
+                "avg_cpc_inr":  round(cost / clk, 2)      if clk else 0,
+            })
+        logger.info(f"[GOOGLE ADS] campaigns: {len(campaigns)} rows for last {days} days")
+        return {"success": True, "period_days": days, "start_date": str(start), "end_date": str(end), "campaigns": campaigns}
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GOOGLE ADS] campaigns error: {errors}")
+        return {"success": False, "error": errors}
+    except Exception as ex:
+        logger.error(f"[GOOGLE ADS] campaigns unexpected: {ex}")
+        return {"success": False, "error": str(ex)}
+
+@app.get("/google-ads/daily")
+async def google_ads_daily(days: int = 30):
+    """Daily time-series: date, impressions, clicks, cost_inr."""
+    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    end   = date.today()
+    start = end - timedelta(days=days)
+    try:
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        query = f"""
+            SELECT
+                segments.date,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros
+            FROM customer
+            WHERE segments.date BETWEEN '{start}' AND '{end}'
+            ORDER BY segments.date ASC
+        """
+        rows = list(service.search(customer_id=customer_id, query=query))
+        daily = []
+        for row in rows:
+            daily.append({
+                "date":        row.segments.date,
+                "impressions": row.metrics.impressions,
+                "clicks":      row.metrics.clicks,
+                "cost_inr":    round(row.metrics.cost_micros / 1_000_000, 2),
+            })
+        logger.info(f"[GOOGLE ADS] daily: {len(daily)} data points for last {days} days")
+        return {"success": True, "period_days": days, "start_date": str(start), "end_date": str(end), "daily": daily}
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GOOGLE ADS] daily error: {errors}")
+        return {"success": False, "error": errors}
+    except Exception as ex:
+        logger.error(f"[GOOGLE ADS] daily unexpected: {ex}")
+        return {"success": False, "error": str(ex)}
