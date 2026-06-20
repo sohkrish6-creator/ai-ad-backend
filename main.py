@@ -1161,19 +1161,24 @@ def _genv(key: str) -> str:
     return val.strip().strip('"').strip("'")
 
 def get_google_ads_client():
-    creds = Credentials(
-        token=None,
-        refresh_token=_genv("GOOGLE_ADS_REFRESH_TOKEN"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=_genv("GOOGLE_ADS_CLIENT_ID"),
-        client_secret=_genv("GOOGLE_ADS_CLIENT_SECRET"),
+    config = {
+        "developer_token":   _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "client_id":         _genv("GOOGLE_ADS_CLIENT_ID"),
+        "client_secret":     _genv("GOOGLE_ADS_CLIENT_SECRET"),
+        "refresh_token":     _genv("GOOGLE_ADS_REFRESH_TOKEN"),
+        "login_customer_id": _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+        "use_proto_plus":    True,
+    }
+    # Log config shape so we can verify login_customer_id is present (secrets masked)
+    logger.info(
+        f"[GOOGLE ADS] Building client — "
+        f"login_customer_id={config['login_customer_id']} "
+        f"developer_token=****{config['developer_token'][-4:]} "
+        f"client_id_set={bool(config['client_id'])} "
+        f"secret_set={bool(config['client_secret'])} "
+        f"refresh_token_set={bool(config['refresh_token'])}"
     )
-    return GoogleAdsClient(
-        credentials=creds,
-        developer_token=_genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-        login_customer_id=_genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),  # manager account
-        use_proto_plus=True,
-    )
+    return GoogleAdsClient.load_from_dict(config)
 
 @app.get("/google-ads/debug")
 async def google_ads_debug():
@@ -1200,19 +1205,14 @@ async def google_ads_account_info():
 
     for cid in account_ids:
         try:
-            creds = Credentials(
-                token=None,
-                refresh_token=_genv("GOOGLE_ADS_REFRESH_TOKEN"),
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=_genv("GOOGLE_ADS_CLIENT_ID"),
-                client_secret=_genv("GOOGLE_ADS_CLIENT_SECRET"),
-            )
-            client = GoogleAdsClient(
-                credentials=creds,
-                developer_token=_genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-                login_customer_id=cid,
-                use_proto_plus=True,
-            )
+            client = GoogleAdsClient.load_from_dict({
+                "developer_token":   _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+                "client_id":         _genv("GOOGLE_ADS_CLIENT_ID"),
+                "client_secret":     _genv("GOOGLE_ADS_CLIENT_SECRET"),
+                "refresh_token":     _genv("GOOGLE_ADS_REFRESH_TOKEN"),
+                "login_customer_id": cid,
+                "use_proto_plus":    True,
+            })
             service = client.get_service("GoogleAdsService")
             query = """
                 SELECT customer.id, customer.descriptive_name,
