@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 import httpx
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional
+from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -1148,3 +1150,76 @@ def update_lead(lead_id: int, status: str, db: Session = Depends(get_db)):
         db.commit()
         return {"success": True}
     return {"success": False, "message": "Lead nahi mila"}
+
+
+# ── Google Ads Performance ────────────────────────────────────────────────────
+
+def get_google_ads_client():
+    return GoogleAdsClient.load_from_dict({
+        "developer_token":   os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "client_id":         os.getenv("GOOGLE_ADS_CLIENT_ID"),
+        "client_secret":     os.getenv("GOOGLE_ADS_CLIENT_SECRET"),
+        "refresh_token":     os.getenv("GOOGLE_ADS_REFRESH_TOKEN"),
+        "use_proto_plus":    True,
+        "login_customer_id": os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+    })
+
+@app.get("/google-ads/performance")
+async def google_ads_performance(days: int = 30):
+    customer_id = os.getenv("GOOGLE_ADS_CUSTOMER_ID")
+    try:
+        client = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+
+        end   = date.today()
+        start = end - timedelta(days=days)
+
+        query = f"""
+            SELECT
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr,
+                metrics.average_cpc
+            FROM customer
+            WHERE segments.date BETWEEN '{start}' AND '{end}'
+        """
+
+        response = service.search(customer_id=customer_id, query=query)
+
+        total_impressions  = 0
+        total_clicks       = 0
+        total_cost_micros  = 0
+        total_conversions  = 0
+
+        for row in response:
+            total_impressions  += row.metrics.impressions
+            total_clicks       += row.metrics.clicks
+            total_cost_micros  += row.metrics.cost_micros
+            total_conversions  += row.metrics.conversions
+
+        total_cost = total_cost_micros / 1_000_000
+        ctr        = (total_clicks / total_impressions * 100) if total_impressions else 0
+        avg_cpc    = (total_cost / total_clicks) if total_clicks else 0
+
+        return {
+            "success":     True,
+            "period_days": days,
+            "start_date":  str(start),
+            "end_date":    str(end),
+            "impressions": total_impressions,
+            "clicks":      total_clicks,
+            "cost_inr":    round(total_cost, 2),
+            "conversions": round(total_conversions, 2),
+            "ctr_pct":     round(ctr, 2),
+            "avg_cpc_inr": round(avg_cpc, 2),
+        }
+
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GOOGLE ADS] API error: {errors}")
+        return {"success": False, "error": errors}
+    except Exception as ex:
+        logger.error(f"[GOOGLE ADS] Unexpected error: {ex}")
+        return {"success": False, "error": str(ex)}
