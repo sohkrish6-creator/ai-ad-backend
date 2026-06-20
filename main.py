@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 import os
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -61,6 +62,15 @@ class AnalysisModel(Base):
     budget = Column(Integer)
     goal = Column(String(100))
     result = Column(Text)
+    created_at = Column(String(100))
+
+class ReportModel(Base):
+    __tablename__ = "reports"
+    id = Column(Integer, primary_key=True, index=True)
+    report_type = Column(String(100))
+    title = Column(String(500))
+    input_data = Column(Text)
+    result_data = Column(Text)
     created_at = Column(String(100))
 
 Base.metadata.create_all(bind=engine)
@@ -212,6 +222,10 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     db.add(analysis)
     db.commit()
 
+    report = ReportModel(report_type="analyze", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "budget": request.budget, "goal": request.goal}), result_data=json.dumps({"analysis": result, "detected_category": detected, "confidence": confidence}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
+
     return {"success": True, "url": request.url, "detected_category": detected, "confidence": confidence, "analysis": result}
 
 class CompetitorRequest(BaseModel):
@@ -220,7 +234,7 @@ class CompetitorRequest(BaseModel):
     business_type: str
 
 @app.post("/competitor")
-async def competitor(request: CompetitorRequest):
+async def competitor(request: CompetitorRequest, db: Session = Depends(get_db)):
     import re
 
     def extract_clean(html):
@@ -266,7 +280,11 @@ async def competitor(request: CompetitorRequest):
     )
 
     ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2500)
-    return {"success": True, "analysis": ai_response.choices[0].message.content}
+    analysis_text = ai_response.choices[0].message.content
+    report = ReportModel(report_type="competitor", title=request.my_url, input_data=json.dumps({"my_url": request.my_url, "competitor_urls": request.competitor_urls, "business_type": request.business_type}), result_data=json.dumps({"analysis": analysis_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
+    return {"success": True, "analysis": analysis_text}
 
 class AdIntelRequest(BaseModel):
     business_name: str
@@ -275,7 +293,7 @@ class AdIntelRequest(BaseModel):
     country: str = "IN"
 
 @app.post("/ad-intelligence")
-async def ad_intelligence(request: AdIntelRequest):
+async def ad_intelligence(request: AdIntelRequest, db: Session = Depends(get_db)):
     import urllib.parse
     encoded_name = urllib.parse.quote(request.business_name)
     meta_link = f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country={request.country}&q={encoded_name}&search_type=keyword_unordered"
@@ -298,7 +316,11 @@ async def ad_intelligence(request: AdIntelRequest):
     )
 
     ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=1500)
-    return {"success": True, "business_name": request.business_name, "meta_ad_library_link": meta_link, "google_ads_link": google_link, "guide": ai_response.choices[0].message.content}
+    guide_text = ai_response.choices[0].message.content
+    report = ReportModel(report_type="ad-intelligence", title=request.business_name, input_data=json.dumps({"business_name": request.business_name, "business_type": request.business_type, "website": request.website}), result_data=json.dumps({"guide": guide_text, "meta_ad_library_link": meta_link, "google_ads_link": google_link}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
+    return {"success": True, "business_name": request.business_name, "meta_ad_library_link": meta_link, "google_ads_link": google_link, "guide": guide_text}
 
 class FullReportRequest(BaseModel):
     url: str
@@ -471,6 +493,9 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     )
     smart_creative = await run_ai(creative_prompt, 1400)
 
+    report = ReportModel(report_type="full-report", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "budget": request.budget, "goal": request.goal, "competitor_name": request.competitor_name, "competitor_website": request.competitor_website}), result_data=json.dumps({"strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "audience": audience_result}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
     return {"success": True, "url": request.url, "strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "audience": audience_result, "meta_ad_library_link": meta_link, "google_ads_link": google_link}
 
 class AdCreativeRequest(BaseModel):
@@ -481,7 +506,7 @@ class AdCreativeRequest(BaseModel):
     language: str = "Hinglish"
 
 @app.post("/ad-creative")
-async def ad_creative(request: AdCreativeRequest):
+async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db)):
     import re
 
     def extract_clean(html):
@@ -524,7 +549,11 @@ async def ad_creative(request: AdCreativeRequest):
     )
 
     ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
-    return {"success": True, "creative": ai_response.choices[0].message.content}
+    creative_text = ai_response.choices[0].message.content
+    report = ReportModel(report_type="ad-creative", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "offer": request.offer, "platform": request.platform}), result_data=json.dumps({"creative": creative_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
+    return {"success": True, "creative": creative_text}
 
 class AudienceRequest(BaseModel):
     url: str = ""
@@ -535,7 +564,7 @@ class AudienceRequest(BaseModel):
     language: str = "Hinglish"
 
 @app.post("/audience-finder")
-async def audience_finder(request: AudienceRequest):
+async def audience_finder(request: AudienceRequest, db: Session = Depends(get_db)):
     import re
 
     def extract_clean(html):
@@ -625,7 +654,11 @@ async def audience_finder(request: AudienceRequest):
     )
 
     ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
-    return {"success": True, "url": request.url, "niche": request.niche, "audience": ai_response.choices[0].message.content}
+    audience_text = ai_response.choices[0].message.content
+    report = ReportModel(report_type="audience-finder", title=request.url or request.niche, input_data=json.dumps({"url": request.url, "niche": request.niche, "business_type": request.business_type, "offer": request.offer, "platform": request.platform}), result_data=json.dumps({"audience": audience_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
+    return {"success": True, "url": request.url, "niche": request.niche, "audience": audience_text}
 
 class IntelligenceRequest(BaseModel):
     url: str
@@ -633,7 +666,7 @@ class IntelligenceRequest(BaseModel):
     competitor_urls: list[str] = []
 
 @app.post("/intelligence")
-async def intelligence(request: IntelligenceRequest):
+async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_db)):
     import re, asyncio, json
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -1103,6 +1136,17 @@ async def intelligence(request: IntelligenceRequest):
 
     # ── Response ─────────────────────────────────────────────────────────────
 
+    scores = {
+        "dna_score": dna.get("dna_score", 0),
+        "opportunity_score": round(opportunity.get("overall_opportunity_score", 0)),
+        "threat_score": threat.get("competitor_threat_score", 0),
+        "audience_quality_score": audience_intel.get("audience_quality_score", 0),
+        "positioning_score": positioning.get("confidence_score", 0),
+        "readiness_score": executive.get("overall_readiness_score", 0),
+    }
+    report = ReportModel(report_type="intelligence", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "competitor_urls": request.competitor_urls}), result_data=json.dumps({"business_dna": dna, "opportunity_score": opportunity, "threat_intelligence": threat, "audience_intelligence": audience_intel, "positioning": positioning, "executive_decisions": executive, "scores": scores}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+    db.add(report)
+    db.commit()
     return {
         "success": True,
         "url": request.url,
@@ -1115,14 +1159,7 @@ async def intelligence(request: IntelligenceRequest):
             "positioning": positioning,
             "executive_decisions": executive,
         },
-        "scores": {
-            "dna_score": dna.get("dna_score", 0),
-            "opportunity_score": round(opportunity.get("overall_opportunity_score", 0)),
-            "threat_score": threat.get("competitor_threat_score", 0),
-            "audience_quality_score": audience_intel.get("audience_quality_score", 0),
-            "positioning_score": positioning.get("confidence_score", 0),
-            "readiness_score": executive.get("overall_readiness_score", 0),
-        },
+        "scores": scores,
     }
 
 
@@ -1130,6 +1167,21 @@ async def intelligence(request: IntelligenceRequest):
 def get_analyses(db: Session = Depends(get_db)):
     analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
     return {"analyses": [{"id": a.id, "url": a.url, "business_type": a.business_type, "created_at": a.created_at} for a in analyses]}
+
+@app.get("/reports")
+def get_reports(report_type: Optional[str] = None, db: Session = Depends(get_db)):
+    q = db.query(ReportModel).order_by(ReportModel.id.desc())
+    if report_type:
+        q = q.filter(ReportModel.report_type == report_type)
+    reports = q.all()
+    return {"reports": [{"id": r.id, "report_type": r.report_type, "title": r.title, "created_at": r.created_at} for r in reports]}
+
+@app.get("/reports/{report_id}")
+def get_report(report_id: int, db: Session = Depends(get_db)):
+    report = db.query(ReportModel).filter(ReportModel.id == report_id).first()
+    if not report:
+        return {"success": False, "message": "Report nahi mila"}
+    return {"id": report.id, "report_type": report.report_type, "title": report.title, "input_data": json.loads(report.input_data or "{}"), "result_data": json.loads(report.result_data or "{}"), "created_at": report.created_at}
 
 @app.post("/leads")
 def add_lead(lead: LeadCreate, db: Session = Depends(get_db)):
