@@ -1168,10 +1168,10 @@ def get_google_ads_client():
         client_id=_genv("GOOGLE_ADS_CLIENT_ID"),
         client_secret=_genv("GOOGLE_ADS_CLIENT_SECRET"),
     )
+    # No login_customer_id — both accounts are standalone (not MCC-linked)
     return GoogleAdsClient(
         credentials=creds,
         developer_token=_genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-        login_customer_id=_genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
         use_proto_plus=True,
     )
 
@@ -1209,13 +1209,10 @@ async def google_ads_list_accounts():
         return {"success": False, "error": str(ex)}
 
 @app.get("/google-ads/performance")
-async def google_ads_performance(days: int = 30):
-    customer_id = os.getenv("GOOGLE_ADS_CUSTOMER_ID")
-    login_customer_id = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
-    # Mask last 4 digits for logging
-    masked_cid   = customer_id[:-4] + "XXXX" if customer_id and len(customer_id) > 4 else customer_id
-    masked_login = login_customer_id[:-4] + "XXXX" if login_customer_id and len(login_customer_id) > 4 else login_customer_id
-    logger.info(f"[GOOGLE ADS] Using customer_id={masked_cid} login_customer_id={masked_login}")
+async def google_ads_performance(days: int = 30, customer_id: Optional[str] = None):
+    customer_id = customer_id or _genv("GOOGLE_ADS_CUSTOMER_ID")
+    masked_cid = customer_id[:-4] + "XXXX" if customer_id and len(customer_id) > 4 else customer_id
+    logger.info(f"[GOOGLE ADS] Using customer_id={masked_cid} (no login_customer_id)")
     try:
         client = get_google_ads_client()
         service = client.get_service("GoogleAdsService")
