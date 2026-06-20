@@ -1188,6 +1188,53 @@ async def google_ads_debug():
     ]
     return {k: bool(_genv(k)) for k in keys}
 
+@app.get("/google-ads/account-info")
+async def google_ads_account_info():
+    """Fetch customer metadata for each accessible account to identify manager vs real."""
+    account_ids = ["2715637188", "3879422819"]
+    results = []
+
+    for cid in account_ids:
+        try:
+            creds = Credentials(
+                token=None,
+                refresh_token=_genv("GOOGLE_ADS_REFRESH_TOKEN"),
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=_genv("GOOGLE_ADS_CLIENT_ID"),
+                client_secret=_genv("GOOGLE_ADS_CLIENT_SECRET"),
+            )
+            client = GoogleAdsClient(
+                credentials=creds,
+                developer_token=_genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+                login_customer_id=cid,
+                use_proto_plus=True,
+            )
+            service = client.get_service("GoogleAdsService")
+            query = """
+                SELECT customer.id, customer.descriptive_name,
+                       customer.manager, customer.test_account, customer.status
+                FROM customer
+                LIMIT 1
+            """
+            response = service.search(customer_id=cid, query=query)
+            for row in response:
+                c = row.customer
+                results.append({
+                    "customer_id":      str(c.id),
+                    "name":             c.descriptive_name,
+                    "is_manager":       c.manager,
+                    "is_test_account":  c.test_account,
+                    "status":           c.status.name,
+                })
+                break
+        except GoogleAdsException as ex:
+            errors = [e.message for e in ex.failure.errors]
+            results.append({"customer_id": cid, "error": errors})
+        except Exception as ex:
+            results.append({"customer_id": cid, "error": str(ex)})
+
+    return {"accounts": results}
+
 @app.get("/google-ads/list-accounts")
 async def google_ads_list_accounts():
     """List all accessible customer accounts under the login_customer_id."""
