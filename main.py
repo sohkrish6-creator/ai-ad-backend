@@ -1168,10 +1168,10 @@ def get_google_ads_client():
         client_id=_genv("GOOGLE_ADS_CLIENT_ID"),
         client_secret=_genv("GOOGLE_ADS_CLIENT_SECRET"),
     )
-    # No login_customer_id — both accounts are standalone (not MCC-linked)
     return GoogleAdsClient(
         credentials=creds,
         developer_token=_genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        login_customer_id=_genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),  # manager account
         use_proto_plus=True,
     )
 
