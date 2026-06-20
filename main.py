@@ -1177,16 +1177,20 @@ def get_google_ads_client():
 
 @app.get("/google-ads/debug")
 async def google_ads_debug():
-    """Check which Google Ads env vars are set (values hidden)."""
-    keys = [
-        "GOOGLE_ADS_CLIENT_ID",
-        "GOOGLE_ADS_CLIENT_SECRET",
-        "GOOGLE_ADS_REFRESH_TOKEN",
-        "GOOGLE_ADS_DEVELOPER_TOKEN",
-        "GOOGLE_ADS_CUSTOMER_ID",
-        "GOOGLE_ADS_LOGIN_CUSTOMER_ID",
-    ]
-    return {k: bool(_genv(k)) for k in keys}
+    """Check Google Ads env vars — sensitive values hidden, IDs masked to last 4 digits."""
+    def mask(key, show_last=4):
+        v = _genv(key)
+        if not v: return None
+        return f"****{v[-show_last:]}" if len(v) >= show_last else "****"
+
+    return {
+        "GOOGLE_ADS_CLIENT_ID":        bool(_genv("GOOGLE_ADS_CLIENT_ID")),
+        "GOOGLE_ADS_CLIENT_SECRET":    bool(_genv("GOOGLE_ADS_CLIENT_SECRET")),
+        "GOOGLE_ADS_REFRESH_TOKEN":    bool(_genv("GOOGLE_ADS_REFRESH_TOKEN")),
+        "GOOGLE_ADS_DEVELOPER_TOKEN":  bool(_genv("GOOGLE_ADS_DEVELOPER_TOKEN")),
+        "GOOGLE_ADS_CUSTOMER_ID":      mask("GOOGLE_ADS_CUSTOMER_ID"),
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": mask("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+    }
 
 @app.get("/google-ads/account-info")
 async def google_ads_account_info():
