@@ -486,7 +486,8 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "Generate the complete marketing plan and ad assets. All recommendations must reference BI evidence.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
-        "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11:\n\n"
+        "CRITICAL: Do NOT repeat Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy — those are already covered in sections 1-4. Start DIRECTLY with FULL MARKETING PLAN.\n"
+        "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
         "FULL MARKETING PLAN:\n"
         "Google Ads: [strategy, keywords, budget allocation, bidding]\n"
         "Meta Ads: [audience targeting, creative direction, placement]\n"
@@ -560,6 +561,18 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     c_parts = split_by_headers(section_c, [
         "FULL MARKETING PLAN:", "AD ASSETS:", "REVENUE RECOMMENDATIONS:",
     ])
+    # Strip any repeated sections 1-4 content from section_c in case AI ignored the instruction
+    _dupe_headers = ["BUSINESS UNDERSTANDING:", "MARKET UNDERSTANDING:", "COMPETITOR INSIGHTS:", "POSITIONING STRATEGY:"]
+    for _dh in _dupe_headers:
+        _m = re.search(re.escape(_dh), section_c, re.I)
+        _plan_m = re.search(re.escape("FULL MARKETING PLAN:"), section_c, re.I)
+        if _m and _plan_m and _m.start() < _plan_m.start():
+            # AI put dupe content before the real section — trim it off at FULL MARKETING PLAN
+            section_c = section_c[_plan_m.start():]
+            c_parts = split_by_headers(section_c, [
+                "FULL MARKETING PLAN:", "AD ASSETS:", "REVENUE RECOMMENDATIONS:",
+            ])
+            break
 
     try:
         report = ReportModel(
