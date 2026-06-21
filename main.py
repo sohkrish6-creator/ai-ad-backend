@@ -512,19 +512,54 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
 
     prompt_guide = (
         "Tu elite ad intelligence strategist hai.\n\n"
+        "Meta Ad Library mein DIKHTA hai: creative, start date, ad count, versions, platforms.\n"
+        "NAHI dikhta: likes, CTR, conversions, ROAS, budget, spend.\n\n"
         f"Competitor: {ad_name}\nIndustry: {request.business_type}\n\n"
+        f"THREAT INTELLIGENCE (BI scan se):\n{thr_txt}\n\n"
+        f"POSITIONING DATA (BI scan se):\n{pos_txt}\n\n"
         "Koi asterisk mat use kar. Seedha likho:\n\n"
-        "AD LIBRARY MEIN KYA DEKHO:\n1. []\n2. []\n3. []\n\n"
-        "WINNING AD KAISE PEHCHANE:\n1. []\n2. []\n3. []\n\n"
-        "TUMHARA WINNING ANGLE:\n1. []\n2. []\n3. []"
+        "AD LIBRARY MEIN KYA DEKHO (is competitor ke liye specific):\n1. []\n2. []\n3. []\n4. []\n\n"
+        "COMPETITOR KI KAMZORI (threat data se — unke ads kya NAHI bolenge):\n1. []\n2. []\n3. []\n\n"
+        "TUMHARA WINNING ANGLE (positioning gap pe based):\n1. []\n2. []\n3. []\n\n"
+        "ABHI YEH KARO:\n1. []\n2. []\n3. []"
     )
 
     section_a, section_b, section_c, ad_guide = await asyncio.gather(
         run_ai(prompt_a, 2000),
         run_ai(prompt_b, 2000),
         run_ai(prompt_c, 2500),
-        run_ai(prompt_guide, 900),
+        run_ai(prompt_guide, 1000),
     )
+
+    # ── Split each grouped output into individual sections ────────────────
+    def split_by_headers(text, headers):
+        result = {}
+        for i, header in enumerate(headers):
+            next_header = headers[i + 1] if i + 1 < len(headers) else None
+            start_match = re.search(re.escape(header), text, re.I)
+            if not start_match:
+                result[header] = ""
+                continue
+            content_start = start_match.end()
+            if next_header:
+                end_match = re.search(re.escape(next_header), text[content_start:], re.I)
+                content = text[content_start:content_start + end_match.start()].strip() if end_match else text[content_start:].strip()
+            else:
+                content = text[content_start:].strip()
+            result[header] = content
+        return result
+
+    a_parts = split_by_headers(section_a, [
+        "BUSINESS UNDERSTANDING:", "MARKET UNDERSTANDING:",
+        "COMPETITOR INSIGHTS:", "POSITIONING STRATEGY:",
+    ])
+    b_parts = split_by_headers(section_b, [
+        "AUDIENCE STRATEGY:", "SAFE INDUSTRY STRATEGY:",
+        "COMPETITIVE ADVANTAGE STRATEGY:", "CATEGORY DOMINATING STRATEGY:",
+    ])
+    c_parts = split_by_headers(section_c, [
+        "FULL MARKETING PLAN:", "AD ASSETS:", "REVENUE RECOMMENDATIONS:",
+    ])
 
     try:
         report = ReportModel(
@@ -545,15 +580,23 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "url": request.url,
         # Backward-compatible keys (existing frontend reads these)
         "strategy":       section_a,
-        "competitor":     section_a,
+        "competitor":     a_parts.get("COMPETITOR INSIGHTS:", section_a),
         "audience":       section_b,
         "smart_creative": section_c,
         "ad_guide":       ad_guide,
-        # New structured keys for upcoming frontend update
+        # New 11-section structure
         "sections": {
-            "business_and_market": section_a,
-            "strategies":          section_b,
-            "plan_and_assets":     section_c,
+            "business_understanding":  a_parts.get("BUSINESS UNDERSTANDING:", section_a),
+            "market_understanding":    a_parts.get("MARKET UNDERSTANDING:", ""),
+            "competitor_insights":     a_parts.get("COMPETITOR INSIGHTS:", ""),
+            "positioning_strategy":    a_parts.get("POSITIONING STRATEGY:", ""),
+            "audience_strategy":       b_parts.get("AUDIENCE STRATEGY:", section_b),
+            "safe_strategy":           b_parts.get("SAFE INDUSTRY STRATEGY:", ""),
+            "competitive_advantage":   b_parts.get("COMPETITIVE ADVANTAGE STRATEGY:", ""),
+            "category_dominating":     b_parts.get("CATEGORY DOMINATING STRATEGY:", ""),
+            "marketing_plan":          c_parts.get("FULL MARKETING PLAN:", section_c),
+            "ad_assets":               c_parts.get("AD ASSETS:", ""),
+            "revenue_recommendations": c_parts.get("REVENUE RECOMMENDATIONS:", ""),
         },
         "bi_data":   bi_data,
         "bi_cached": bi_cached,
