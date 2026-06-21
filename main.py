@@ -354,6 +354,9 @@ class FullReportRequest(BaseModel):
     competitor_name: str = ""
     competitor_website: str = ""
     language: str = "Hinglish"
+    target_industry: str = ""
+    target_city: str = ""
+    mode: str = "b2c"  # kept for backward compat, unused
 
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
@@ -443,11 +446,28 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     biz  = f"{request.url} | {request.business_type}"
     bdgt = f"Rs {request.budget}/month"
 
-    # ── Step 4: 3 parallel BI-driven calls + ad guide ─────────────────────
+    # ── Step 4: Build optional industry/B2B context, then 3 parallel calls ──
+    industry_context = ""
+    if request.target_industry:
+        city = request.target_city or "India"
+        industry_context = (
+            f"TARGET INDUSTRY: {request.target_industry} businesses in {city}\n"
+            f"MODE: B2B Lead Generation — target OWNERS, MANAGERS, DIRECTORS of {request.target_industry} businesses\n"
+            f"CITY/REGION: {city} — reference local factors (season, events, local competitors, local pain points)\n"
+            "INDUSTRY-AWARE RULES:\n"
+            f"1. Generate pain points specific to {request.target_industry} businesses in {city}\n"
+            f"2. Ads target business owners/managers — NOT their end customers\n"
+            "3. Include WhatsApp outreach messages with industry-specific hooks\n"
+            "4. Include Instagram DM scripts for cold outreach\n"
+            "5. Include where to find these businesses (Google Maps search terms, Instagram hashtags, directories)\n"
+            "6. Include first meeting pitch angle + how to close\n\n"
+        )
+
     prompt_a = (
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
         "Generate intelligence-driven analysis using the BI data below. No generic advice — every insight must come from the data.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+        f"{industry_context}"
         f"BUSINESS DNA:\n{dna_txt}\n\nTHREAT INTELLIGENCE:\n{thr_txt}\n\nPOSITIONING DATA:\n{pos_txt}\n\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 1-4:\n\n"
         "BUSINESS UNDERSTANDING:\n"
@@ -460,31 +480,61 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         "[Market position this business should own — reference winning_position, positioning_gap, category_ownership_opportunity, messaging_shift. 3-4 specific points]"
     )
 
-    prompt_b = (
-        "You are the Marketing Brain inside Sohscape Intelligence.\n"
-        "Generate intelligence-driven audience strategy and campaign strategies. Every recommendation must cite BI evidence.\n"
-        f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
-        f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
-        "IMPORTANT RULES:\n"
-        "1. INDUSTRY-SPECIFIC apps suggest karo — business type ke hisaab se. Fashion: Myntra, Nykaa, LBB. Food/Cafe: Zomato, Swiggy, EazyDiner. Hospitality: MakeMyTrip, Goibibo, TripAdvisor. Education: Unacademy, Vedantu. Jewellery: CaratLane, Tanishq, Pinterest. Sports: Dream11, MPL. Real Estate: 99acres, MagicBricks. Beauty: Nykaa, Purplle. Jo industry nahi hai uske apps KABHI mat do.\n"
-        "2. Age exclude sirf 45+ karo.\n"
-        "3. KABHI betting, gambling, investment words mat use karo.\n"
-        "4. KABHI earn money, win cash language mat use karo.\n\n"
-        "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
-        "AUDIENCE STRATEGY:\n"
-        "[3 validated audience segments from audience intelligence — each with pain points, desires, triggers, evidence_backing. Reference validated_segments from BI]\n\n"
-        f"SAFE INDUSTRY STRATEGY:\n"
-        f"[Standard proven approach for {request.business_type}. Budget split: {bdgt}. Specific platforms, formats, offers that work reliably]\n\n"
-        "COMPETITIVE ADVANTAGE STRATEGY:\n"
-        "[Ads built on BI strengths and competitor gaps — use differentiators from threat data and positioning_gap. How to outperform competitors specifically]\n\n"
-        "CATEGORY DOMINATING STRATEGY:\n"
-        "[Positioning-led brand strategy to own the market category — use category_ownership_opportunity and winning_position from BI. The big bet]"
-    )
+    if request.target_industry:
+        city = request.target_city or "India"
+        prompt_b = (
+            "You are the Marketing Brain inside Sohscape Intelligence.\n"
+            f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+            f"TARGET INDUSTRY: {request.target_industry} in {city}\n\n"
+            f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+            "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8 (B2B Industry Campaign):\n\n"
+            "AUDIENCE STRATEGY:\n"
+            f"[3 segments: Owners, Managers, Decision-Makers of {request.target_industry} businesses in {city}. "
+            f"For each: age, gender, income, specific pain points in {request.target_industry} industry, what they search for, where they hang out online]\n\n"
+            "SAFE INDUSTRY STRATEGY:\n"
+            f"[WHERE TO FIND THESE BUSINESSES: Google Maps search terms, Instagram hashtags, local directories, FB groups for {request.target_industry} in {city}. "
+            f"Also include seasonal timing — when is {request.target_industry} industry most active/stressed in {city}]\n\n"
+            "COMPETITIVE ADVANTAGE STRATEGY:\n"
+            f"[OUTREACH SCRIPTS — write actual copy:\n"
+            f"WhatsApp Message 1 (pain point hook for {request.target_industry}):\n"
+            f"WhatsApp Message 2 (result/proof hook):\n"
+            f"Instagram DM Script (3-line opener that gets replies):\n"
+            f"Cold Call Opening (10-second pitch)]\n\n"
+            "CATEGORY DOMINATING STRATEGY:\n"
+            f"[PITCH & CLOSE:\n"
+            f"First Meeting Agenda (for {request.target_industry} owner):\n"
+            f"Key Questions to Ask:\n"
+            f"How to Handle 'We already have someone doing it':\n"
+            f"Closing Offer (what to propose at end of meeting):\n"
+            f"Follow-up Sequence (Day 1, Day 3, Day 7)]"
+        )
+    else:
+        prompt_b = (
+            "You are the Marketing Brain inside Sohscape Intelligence.\n"
+            "Generate intelligence-driven audience strategy and campaign strategies. Every recommendation must cite BI evidence.\n"
+            f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+            f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+            "IMPORTANT RULES:\n"
+            "1. Indian market ke liye — Indian apps, platforms suggest karo.\n"
+            "2. Age exclude sirf 45+ karo.\n"
+            "3. KABHI betting, gambling, investment words mat use karo.\n"
+            "4. KABHI earn money, win cash language mat use karo.\n\n"
+            "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
+            "AUDIENCE STRATEGY:\n"
+            "[3 validated audience segments from audience intelligence — each with pain points, desires, triggers, evidence_backing. Reference validated_segments from BI]\n\n"
+            f"SAFE INDUSTRY STRATEGY:\n"
+            f"[Standard proven approach for {request.business_type}. Budget split: {bdgt}. Specific platforms, formats, offers that work reliably]\n\n"
+            "COMPETITIVE ADVANTAGE STRATEGY:\n"
+            "[Ads built on BI strengths and competitor gaps — use differentiators from threat data and positioning_gap. How to outperform competitors specifically]\n\n"
+            "CATEGORY DOMINATING STRATEGY:\n"
+            "[Positioning-led brand strategy to own the market category — use category_ownership_opportunity and winning_position from BI. The big bet]"
+        )
 
     prompt_c = (
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
         "Generate the complete marketing plan and ad assets. All recommendations must reference BI evidence.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+        f"{industry_context}"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
         "CRITICAL: Do NOT repeat Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy — those are already covered in sections 1-4. Start DIRECTLY with FULL MARKETING PLAN.\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
@@ -613,6 +663,8 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         },
         "bi_data":   bi_data,
         "bi_cached": bi_cached,
+        "target_industry": request.target_industry,
+        "target_city":     request.target_city,
         "meta_ad_library_link": meta_link,
         "google_ads_link":      google_link,
     }
@@ -1175,6 +1227,7 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
         "You are a CMO-level Executive Decision Engine. Based on all intelligence below, output the 5 highest-impact actions.\n\n"
         f"BUSINESS DNA:\n{dna_text_p}\n\n"
         f"OPPORTUNITY SCORES:\n{json.dumps(opportunity, indent=2)}\n\n"
+        f"{b2b_context}"
         f"THREAT INTELLIGENCE:\n{json.dumps(threat, indent=2)}\n\n"
         f"AUDIENCE INTELLIGENCE:\n{json.dumps({'validated_segments': audience_intel.get('validated_segments', []), 'audience_quality_score': audience_intel.get('audience_quality_score', 0)}, indent=2)}\n\n"
         "Return STRICT JSON:\n"
