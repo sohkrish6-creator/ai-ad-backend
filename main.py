@@ -1326,6 +1326,71 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
     }
 
 
+class MediaBuyingRequest(BaseModel):
+    url: str = ""
+    industry: str = ""
+    city: str = ""
+    budget: int = 0
+    goal: str = ""
+    language: str = "Hinglish"
+    bi_data: dict = {}
+    marketing_summary: str = ""
+
+@app.post("/media-buying-plan")
+async def media_buying_plan(request: MediaBuyingRequest):
+    system_prompt = (
+        "You are the Media Buying Engine inside Sohscape Intelligence. You are an expert Media Buyer. "
+        "You have access to the business intelligence data and marketing strategy provided below.\n\n"
+        "Using the BI data and marketing context, generate a complete media buying plan with these 13 sections:\n\n"
+        "1. CAMPAIGN OBJECTIVE: — Primary goal and why (Lead Gen / Sales / Awareness / etc.)\n"
+        "2. PLATFORM RECOMMENDATIONS: — Rank Google, Meta, LinkedIn, YouTube, Display, Remarketing as 1st/2nd/3rd priority with reasoning\n"
+        "3. BUDGET ALLOCATION: — Monthly budget, daily budget, platform split (e.g. Meta 50%, Google 40%, Remarketing 10%) with reasoning\n"
+        "4. BID STRATEGY: — Recommended bid strategy (Maximize Conversions / Target CPA / Manual CPC / etc.) and why it fits this business\n"
+        "5. LAUNCH PLAN: — Recommended launch date, what to prepare before launch\n"
+        "6. LEARNING PHASE: — Learning period duration, minimum data required, when NOT to judge the campaign\n"
+        "7. SCALING PLAN: — When to scale, how much to increase (%), safe vs aggressive scale rules, scale only if conditions\n"
+        "8. PAUSE RULES: — When to pause ads (CTR below benchmark, no conversions after learning, CPC too high)\n"
+        "9. STOP RULES: — When to stop campaign entirely (consistent losses, no improvement, poor audience match)\n"
+        "10. OPTIMIZATION PLAN: — Checklist for audience, creative, landing page, offer, and budget optimization\n"
+        "11. RISK ANALYSIS: — Risk level (Low/Medium/High), top risks (budget, audience, creative, competition)\n"
+        "12. MEDIA BUYER PLAYBOOK: — Exactly what to do on Day 1, Day 3, Day 7, Day 14, Day 30\n"
+        "13. INDUSTRY BENCHMARKS: — CTR range, CPC range, CPA range, conversion rate range for this industry (ranges only, no fake exact numbers)\n\n"
+        "RULES: Never predict exact ROAS or CPA. Use benchmark RANGES only. Every recommendation must explain WHY. Use the BI data evidence provided."
+    )
+
+    import json as _json
+    bi_summary = f"BI DATA:\n{_json.dumps(request.bi_data, indent=2)[:3000]}\n\n" if request.bi_data else ""
+
+    user_msg = (
+        f"IMPORTANT: Write entire response in: {request.language}\n\n"
+        f"BUSINESS: {request.url}\n"
+        f"INDUSTRY: {request.industry or 'Not specified'}\n"
+        f"CITY/REGION: {request.city or 'India'}\n"
+        f"MONTHLY BUDGET: \u20b9{request.budget:,}\n"
+        f"PRIMARY GOAL: {request.goal}\n\n"
+        + bi_summary
+        + (f"MARKETING STRATEGY SUMMARY:\n{request.marketing_summary[:2000]}\n\n" if request.marketing_summary else "")
+        + "Now generate the complete 13-section media buying plan."
+    )
+
+    try:
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=3500,
+            )
+        )
+        media_plan = resp.choices[0].message.content.strip()
+        return {"success": True, "media_plan": media_plan}
+    except Exception as ex:
+        logger.error(f"[MEDIA BUYING] error: {ex}")
+        return {"success": False, "media_plan": "", "error": str(ex)}
+
+
 class IntelligenceRequest(BaseModel):
     url: str
     business_type: str = ""
