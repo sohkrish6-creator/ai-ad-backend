@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 import os
 import logging
 import json
+import asyncio
+import re
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -355,33 +357,6 @@ class FullReportRequest(BaseModel):
 
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
-    import re, urllib.parse, asyncio
-
-    def extract_clean(html):
-        parts = []
-        t = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-        if t: parts.append("TITLE: " + t.group(1).strip())
-        m = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I)
-        if m: parts.append("DESCRIPTION: " + m.group(1).strip())
-        for tag in ["h1", "h2", "h3"]:
-            for h in re.findall(r"<" + tag + r"[^>]*>(.*?)</" + tag + r">", html, re.I | re.S):
-                clean = re.sub(r"<[^>]+>", "", h).strip()
-                if clean and len(clean) > 2:
-                    parts.append(tag.upper() + ": " + clean)
-        body = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.I | re.S)
-        body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.I | re.S)
-        body = re.sub(r"<[^>]+>", " ", body)
-        body = re.sub(r"\s+", " ", body).strip()
-        parts.append("BODY: " + body[:1500])
-        return "\n".join(parts)
-
-    async def fetch(u):
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-                r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
-                return extract_clean(r.text)
-        except:
-            return ""
 
     async def run_ai(prompt, max_tokens):
         resp = await asyncio.to_thread(
@@ -393,136 +368,198 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         )
         return resp.choices[0].message.content
 
-    my_content = await fetch(request.url)
-    if not my_content or len(my_content) < 100:
-        return {"success": False, "scan_failed": True, "message": "Website scan nahi ho payi."}
+    # ── Step 1: Get BI data (check cache first, then run fresh) ──────────
+    bi_data = None
+    bi_cached = False
 
-    comp_content = ""
-    if request.competitor_website:
-        comp_content = await fetch(request.competitor_website)
+    try:
+        cached_row = db.query(ReportModel).filter(
+            ReportModel.report_type == "intelligence",
+            ReportModel.title == request.url
+        ).order_by(ReportModel.id.desc()).first()
+        if cached_row and cached_row.result_data:
+            bi_data = json.loads(cached_row.result_data)
+            bi_cached = True
+            logger.info(f"[FULL-REPORT] Using cached BI for {request.url}")
+    except Exception as _e:
+        logger.warning(f"[FULL-REPORT] Cache lookup failed: {_e}")
 
-    strategy_prompt = (
-        "Tu ek senior digital marketing strategist hai jo Google Ads aur Meta Ads dono ka expert hai.\n"
-        "HUMAN WRITING: AI buzzwords (unleash, elevate, game-changer, unlock, dive in) mat use kar. Chhote punchy lines likho.\n"
-        "LANGUAGE: " + request.language + "\n\n"
-        "URL: " + request.url + "\nBusiness: " + request.business_type + "\nBudget: Rs " + str(request.budget) + "\nGoal: " + request.goal + "\nWebsite:\n" + my_content[:2000] + "\n\n"
-        "Koi asterisk mat use kar. Seedha likho:\n\n"
-        "BUSINESS SUMMARY:\n[2 lines — website evidence pe based]\n\n"
-        "TARGET AUDIENCE:\n[2 lines — specific, generic nahi]\n\n"
-        "BUDGET SPLIT:\n"
-        "1. Google Search Ads: Rs [amt] ([%]) - [reason]\n"
-        "2. Meta Ads (FB+IG): Rs [amt] ([%]) - [reason]\n"
-        "3. [Ek aur relevant platform]: Rs [amt] ([%]) - [reason]\n\n"
-        "GOOGLE ADS HEADLINES (8, STRICT max 30 characters each — count karke likho):\n"
-        "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n\n"
-        "GOOGLE ADS DESCRIPTIONS (4, max 90 characters each):\n"
-        "1. []\n2. []\n3. []\n4. []\n\n"
-        "META AD COPY:\n"
-        "Primary Text: [2-3 lines, conversational, Indian audience ke liye]\n"
-        "Headline: [max 40 chars, punchy]\n"
-        "CTA Button: [Shop Now / Book Now / Learn More / Get Quote]\n\n"
-        "KPI TARGETS:\n"
-        "Google Search CTR: [realistic 3-6%]\n"
-        "Meta CTR: [realistic 1-3%]\n"
-        "Expected CPL: Rs []\n"
-        "Expected ROAS: []\n"
-    )
+    if not bi_data:
+        logger.info(f"[FULL-REPORT] Running fresh BI for {request.url}")
+        fresh_bi = await gather_bi_data(
+            request.url,
+            request.business_type,
+            [request.competitor_website] if request.competitor_website else []
+        )
+        if fresh_bi:
+            bi_data = {**fresh_bi["intelligence"], "scores": fresh_bi["scores"]}
+            try:
+                bi_cache_row = ReportModel(
+                    report_type="intelligence",
+                    title=request.url,
+                    input_data=json.dumps({"url": request.url, "business_type": request.business_type}),
+                    result_data=json.dumps(bi_data),
+                    created_at=datetime.now().strftime("%d %b %Y, %I:%M %p")
+                )
+                db.add(bi_cache_row)
+                db.commit()
+            except Exception as _re:
+                logger.warning(f"[FULL-REPORT] Could not cache BI: {_re}")
+                db.rollback()
 
+    # ── Step 2: Ad library links ──────────────────────────────────────────
+    import urllib.parse
     ad_name = request.competitor_name or request.competitor_website or request.business_type
     encoded = urllib.parse.quote(ad_name)
-    meta_link = "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=IN&q=" + encoded + "&search_type=keyword_unordered"
+    meta_link = f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=IN&q={encoded}&search_type=keyword_unordered"
     if request.competitor_website:
         dom = request.competitor_website.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/").split("/")[0]
-        google_link = "https://adstransparency.google.com/?region=IN&domain=" + dom
+        google_link = f"https://adstransparency.google.com/?region=IN&domain={dom}"
     else:
         google_link = "https://adstransparency.google.com/?region=IN"
 
-    ad_prompt = (
-        "Tu elite ad intelligence strategist hai.\n\n"
-        "Competitor: " + ad_name + "\nIndustry: " + request.business_type + "\n\n"
-        "Koi asterisk mat use kar. Seedha likho:\n\n"
-        "AD LIBRARY MEIN KYA DEKHO:\n1. []\n2. []\n3. []\n\nWINNING AD KAISE PEHCHANE:\n1. []\n2. []\n3. []\n\nTUMHARA WINNING ANGLE:\n1. []\n2. []\n3. []\n"
-    )
-
-    audience_prompt = (
-        "Tu ek elite media buyer hai jo Meta aur Google Ads ka expert hai.\n\n"
-        "IMPORTANT RULES:\n"
-        "1. Yeh Indian market ke liye hai — Indian apps, communities, channels suggest karo.\n"
-        "2. Age exclude sirf 45+ karo.\n"
-        "3. KABHI betting, gambling, wagering, investment words mat use karo.\n"
-        "4. Display Placements mein gambling apps KABHI mat do.\n"
-        "5. IDEAL AUDIENCE mein paise kamaana, earn money, win cash KABHI mat likho.\n\n"
-        "BUSINESS: " + request.url + "\n"
-        "INDUSTRY: " + request.business_type + "\n"
-        "WEBSITE CONTENT:\n" + my_content[:1500] + "\n\n"
-        "Is business ke liye exact audience batao. Koi asterisk mat use kar. Seedha likho:\n\n"
-        "IDEAL AUDIENCE:\n[2-3 line — entertainment, competition, passion pe focus]\n\n"
-        "AUDIENCE SEGMENTS:\n"
-        "Segment 1 — [naam]: [age, gender, interests, behavior]\n"
-        "Segment 2 — [naam]: [age, gender, interests, behavior]\n"
-        "Segment 3 — [naam]: [age, gender, interests, behavior]\n\n"
-        "WHERE TO FIND THEM:\n"
-        "Apps: [5 RELEVANT apps jahan is specific business ki audience time spend karti hai. Fashion=Instagram/Myntra/Pinterest. Food=Zomato/Swiggy. Fitness=HealthifyMe/Cult.fit. KABHI irrelevant apps mat do jaise Zomato fashion ke liye ya UrbanClap food ke liye]\n"
-        "Pages/Communities: [3 Facebook pages ya groups]\n"
-        "YouTube Channels: [2-3 channels]\n"
-        "Influencer Type: [kis type ke influencer]\n\n"
-        "META ADS TARGETING:\n"
-        "Interests: [5 specific interests]\n"
-        "Behaviors: [2-3 behavior]\n"
-        "Age/Gender: []\n"
-        "Exclude: [sirf 45+]\n\n"
-        "GOOGLE ADS TARGETING:\n"
-        "In-Market Segments: [Sports & Fitness, Online Games, Mobile Games & Apps jaise actual segments — irrelevant mat do]\n"
-        "Custom Segment Keywords: [5 keywords]\n"
-        "Search Keywords: [5 high-intent keywords]\n\n"
-        "DISPLAY PLACEMENTS (IMPORTANT: specific website/app names do — jaise Vogue India, Femina, LBB, Hauterfly, Sportskeeda, Cricbuzz. Generic categories KABHI mat do):\n"
-        "1. []\n2. []\n3. []\n4. []\n5. []\n\n"
-        "POLICY SAFETY CHECK:\n"
-        "Risk Level: [Low/Medium/High]\n"
-        "Avoid These Words: []\n"
-        "Certification Needed: []\n"
-    )
-
-    async def get_competitor():
-        if not request.competitor_website:
-            return ""
-        comp_prompt = (
-            "Tu competitor intelligence analyst hai.\n\n"
-            "MERA BUSINESS (" + request.url + "):\n" + my_content[:1200] + "\n\nCOMPETITOR (" + request.competitor_website + "):\n" + comp_content[:1200] + "\n\n"
-            "Koi asterisk mat use kar. Seedha likho:\n\n"
-            "COMPETITOR POSITIONING:\n[2 lines]\n\nUNKI STRENGTHS:\n1. []\n2. []\n\nUNKI WEAKNESS:\n1. []\n2. []\n\nMARKET GAPS:\n1. []\n2. []\n3. []\n\nTUM KAHAN JEET SAKTE HO:\n1. []\n2. []\n3. []\n"
+    # ── Step 3: Extract BI context strings ───────────────────────────────
+    if bi_data:
+        dna      = bi_data.get("business_dna", {})
+        opp      = bi_data.get("opportunity_score", {})
+        thr      = bi_data.get("threat_intelligence", {})
+        pos      = bi_data.get("positioning", {})
+        aud      = bi_data.get("audience_intelligence", {})
+        exec_dec = bi_data.get("executive_decisions", {})
+        scores   = bi_data.get("scores", {})
+        dna_txt  = json.dumps(dna,      indent=2)[:2000]
+        opp_txt  = json.dumps(opp,      indent=2)[:1000]
+        thr_txt  = json.dumps(thr,      indent=2)[:1000]
+        pos_txt  = json.dumps(pos,      indent=2)[:1500]
+        aud_txt  = json.dumps(aud,      indent=2)[:2000]
+        exec_txt = json.dumps(exec_dec, indent=2)[:1500]
+        sc_txt   = json.dumps(scores,   indent=2)
+    else:
+        dna_txt = opp_txt = thr_txt = pos_txt = aud_txt = exec_txt = sc_txt = (
+            "Intelligence data not available — website could not be fully analyzed"
         )
-        return await run_ai(comp_prompt, 1200)
 
-    # Phase 1: strategy, competitor, ad_guide, audience all run in parallel
-    strategy, competitor_result, ad_guide, audience_result = await asyncio.gather(
-        run_ai(strategy_prompt, 1800),
-        get_competitor(),
-        run_ai(ad_prompt, 900),
-        run_ai(audience_prompt, 1500),
+    lang = request.language
+    biz  = f"{request.url} | {request.business_type}"
+    bdgt = f"Rs {request.budget}/month"
+
+    # ── Step 4: 3 parallel BI-driven calls + ad guide ─────────────────────
+    prompt_a = (
+        "You are the Marketing Brain inside Sohscape Intelligence.\n"
+        "Generate intelligence-driven analysis using the BI data below. No generic advice — every insight must come from the data.\n"
+        f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+        f"BUSINESS DNA:\n{dna_txt}\n\nTHREAT INTELLIGENCE:\n{thr_txt}\n\nPOSITIONING DATA:\n{pos_txt}\n\n"
+        "Koi asterisk mat use kar. Seedha likho. Generate sections 1-4:\n\n"
+        "BUSINESS UNDERSTANDING:\n"
+        "[What truly makes this business different — UVP, trust signals, detected_industry, core_products from DNA. 4-5 specific points]\n\n"
+        "MARKET UNDERSTANDING:\n"
+        "[Market size, growth, saturation, real gaps — reference market_size, market_opportunity_score, market_opportunity_reason. 4-5 specific points]\n\n"
+        "COMPETITOR INSIGHTS:\n"
+        "[Real competitor landscape, strengths, weaknesses, positioning gaps — reference key_threats, differentiators, moat_strength from threat data. 4-5 specific points]\n\n"
+        "POSITIONING STRATEGY:\n"
+        "[Market position this business should own — reference winning_position, positioning_gap, category_ownership_opportunity, messaging_shift. 3-4 specific points]"
     )
 
-    # Phase 2: smart_creative depends on competitor_result from Phase 1
-    creative_prompt = (
-        "LANGUAGE: " + request.language + "\n\n"
-        "Tu ek award-winning ad creative director hai. Competitor analysis dekh ke alag creative bana.\n"
-        "HUMAN WRITING: Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform your.\n\n"
-        "MERA BUSINESS: " + request.url + " (" + request.business_type + ")\nPROMOTE: " + request.goal + "\n\nCOMPETITOR ANALYSIS:\n" + (competitor_result or "N/A") + "\n\n"
-        "2 ad creative banao jo competitor se alag hon. Koi asterisk mat use kar.\n\n"
-        "WHY DIFFERENT:\n[1-2 line]\n\n"
-        "CREATIVE 1: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\n\n"
-        "CREATIVE 2: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\n"
+    prompt_b = (
+        "You are the Marketing Brain inside Sohscape Intelligence.\n"
+        "Generate intelligence-driven audience strategy and campaign strategies. Every recommendation must cite BI evidence.\n"
+        f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+        f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+        "IMPORTANT RULES:\n"
+        "1. Indian market ke liye — Indian apps, platforms suggest karo.\n"
+        "2. Age exclude sirf 45+ karo.\n"
+        "3. KABHI betting, gambling, investment words mat use karo.\n"
+        "4. KABHI earn money, win cash language mat use karo.\n\n"
+        "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
+        "AUDIENCE STRATEGY:\n"
+        "[3 validated audience segments from audience intelligence — each with pain points, desires, triggers, evidence_backing. Reference validated_segments from BI]\n\n"
+        f"SAFE INDUSTRY STRATEGY:\n"
+        f"[Standard proven approach for {request.business_type}. Budget split: {bdgt}. Specific platforms, formats, offers that work reliably]\n\n"
+        "COMPETITIVE ADVANTAGE STRATEGY:\n"
+        "[Ads built on BI strengths and competitor gaps — use differentiators from threat data and positioning_gap. How to outperform competitors specifically]\n\n"
+        "CATEGORY DOMINATING STRATEGY:\n"
+        "[Positioning-led brand strategy to own the market category — use category_ownership_opportunity and winning_position from BI. The big bet]"
     )
-    smart_creative = await run_ai(creative_prompt, 1400)
+
+    prompt_c = (
+        "You are the Marketing Brain inside Sohscape Intelligence.\n"
+        "Generate the complete marketing plan and ad assets. All recommendations must reference BI evidence.\n"
+        f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
+        f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+        "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11:\n\n"
+        "FULL MARKETING PLAN:\n"
+        "Google Ads: [strategy, keywords, budget allocation, bidding]\n"
+        "Meta Ads: [audience targeting, creative direction, placement]\n"
+        "Remarketing: [3 specific retargeting sequences with triggers]\n"
+        "Landing Page: [3 specific optimizations based on BI data]\n\n"
+        "AD ASSETS:\n"
+        "Google Headlines (8, STRICT max 30 characters each):\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n"
+        "Descriptions (4, max 90 characters each):\n"
+        "1. []\n2. []\n3. []\n4. []\n"
+        "Hook Lines (3 scroll-stopping opening lines for Meta/Reels):\n"
+        "1. []\n2. []\n3. []\n"
+        "CTAs (3): []\n"
+        "Creative Brief 1 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n"
+        "Creative Brief 2 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n"
+        "Video Concept: []\n\n"
+        "REVENUE RECOMMENDATIONS:\n"
+        "Highest ROI Action: [reference highest_roi_action from BI executive decisions]\n"
+        "Fastest Revenue Path: [based on best_platform and budget_efficiency from BI]\n"
+        "Best Offer Structure: [based on price_range and revenue_model from DNA]\n"
+        "Quick Wins (this week): [reference quick_wins from executive decisions]"
+    )
+
+    prompt_guide = (
+        "Tu elite ad intelligence strategist hai.\n\n"
+        f"Competitor: {ad_name}\nIndustry: {request.business_type}\n\n"
+        "Koi asterisk mat use kar. Seedha likho:\n\n"
+        "AD LIBRARY MEIN KYA DEKHO:\n1. []\n2. []\n3. []\n\n"
+        "WINNING AD KAISE PEHCHANE:\n1. []\n2. []\n3. []\n\n"
+        "TUMHARA WINNING ANGLE:\n1. []\n2. []\n3. []"
+    )
+
+    section_a, section_b, section_c, ad_guide = await asyncio.gather(
+        run_ai(prompt_a, 2000),
+        run_ai(prompt_b, 2000),
+        run_ai(prompt_c, 2500),
+        run_ai(prompt_guide, 900),
+    )
 
     try:
-        report = ReportModel(report_type="full-report", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "budget": request.budget, "goal": request.goal, "competitor_name": request.competitor_name, "competitor_website": request.competitor_website}), result_data=json.dumps({"strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "audience": audience_result}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+        report = ReportModel(
+            report_type="full-report",
+            title=request.url,
+            input_data=json.dumps({"url": request.url, "business_type": request.business_type, "budget": request.budget, "goal": request.goal, "competitor_name": request.competitor_name, "competitor_website": request.competitor_website}),
+            result_data=json.dumps({"section_a": section_a, "section_b": section_b, "section_c": section_c, "ad_guide": ad_guide}),
+            created_at=datetime.now().strftime("%d %b %Y, %I:%M %p")
+        )
         db.add(report)
         db.commit()
     except Exception as _re:
         logger.warning(f"[REPORTS] Could not save full-report: {_re}")
         db.rollback()
-    return {"success": True, "url": request.url, "strategy": strategy, "competitor": competitor_result, "ad_guide": ad_guide, "smart_creative": smart_creative, "audience": audience_result, "meta_ad_library_link": meta_link, "google_ads_link": google_link}
+
+    return {
+        "success": True,
+        "url": request.url,
+        # Backward-compatible keys (existing frontend reads these)
+        "strategy":       section_a,
+        "competitor":     section_a,
+        "audience":       section_b,
+        "smart_creative": section_c,
+        "ad_guide":       ad_guide,
+        # New structured keys for upcoming frontend update
+        "sections": {
+            "business_and_market": section_a,
+            "strategies":          section_b,
+            "plan_and_assets":     section_c,
+        },
+        "bi_data":   bi_data,
+        "bi_cached": bi_cached,
+        "meta_ad_library_link": meta_link,
+        "google_ads_link":      google_link,
+    }
 
 class AdCreativeRequest(BaseModel):
     url: str
@@ -694,21 +731,15 @@ async def audience_finder(request: AudienceRequest, db: Session = Depends(get_db
         db.rollback()
     return {"success": True, "url": request.url, "niche": request.niche, "audience": audience_text}
 
-class IntelligenceRequest(BaseModel):
-    url: str
-    business_type: str = ""
-    competitor_urls: list[str] = []
-
-@app.post("/intelligence")
-async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_db)):
-    import re, asyncio, json
-
-    # ── helpers ─────────────────────────────────────────────────────────────
+async def gather_bi_data(url: str, business_type: str = "", competitor_urls: list = []) -> Optional[dict]:
+    """
+    Gather full Business Intelligence on a URL.
+    Returns {'intelligence': {...}, 'scores': {...}} or None if site unreachable.
+    Called by /intelligence endpoint and /full-report endpoint.
+    """
 
     def extract_evidence(html, page_type="homepage"):
         evidence = []
-
-        # ── Standard meta tags ──────────────────────────────────────────────
         t = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
         if t:
             evidence.append({"type": "title", "value": t.group(1).strip(), "confidence": 0.95, "page": page_type})
@@ -718,7 +749,7 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
             ("twitter:title",      "twitter_title",       0.82),
             ("twitter:description","twitter_description", 0.80),
         ]:
-            m = re.search(r'<meta[^>]*name=["\']' + re.escape(name) + r'["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+            m = re.search(r'<meta[^>]*name=["\']'  + re.escape(name) + r'["\'][^>]*content=["\'](.+?)["\']'  , html, re.I)
             if m and m.group(1).strip():
                 evidence.append({"type": label, "value": m.group(1).strip(), "confidence": conf, "page": page_type})
         for prop, label, conf in [
@@ -727,19 +758,15 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
             ("og:site_name",   "og_site_name",   0.80),
             ("og:type",        "og_type",        0.70),
         ]:
-            og = re.search(r'<meta[^>]*property=["\']' + re.escape(prop) + r'["\'][^>]*content=["\'](.*?)["\']', html, re.I)
+            og = re.search(r'<meta[^>]*property=["\']'  + re.escape(prop) + r'["\'][^>]*content=["\'](.+?)["\']'  , html, re.I)
             if og and og.group(1).strip():
                 evidence.append({"type": label, "value": og.group(1).strip(), "confidence": conf, "page": page_type})
-
-        # ── Headings ────────────────────────────────────────────────────────
         for tag in ['h1', 'h2', 'h3']:
             conf = 0.85 if tag == 'h1' else (0.75 if tag == 'h2' else 0.65)
             for h in re.findall(r'<' + tag + r'[^>]*>(.*?)</' + tag + r'>', html, re.I | re.S):
                 clean = re.sub(r'<[^>]+>', '', h).strip()
                 if clean and len(clean) > 3:
                     evidence.append({"type": tag, "value": clean, "confidence": conf, "page": page_type})
-
-        # ── Trust + pricing signals ─────────────────────────────────────────
         for pattern, trust_type in [
             (r'(\d+\+?\s*(?:years?|yr)\s*(?:of\s*)?(?:experience|expertise))', "years_experience"),
             (r'(\d[\d,]*\+?\s*(?:customers?|clients?|users?))',                 "customer_count"),
@@ -751,17 +778,12 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
                 evidence.append({"type": f"trust_{trust_type}", "value": match.strip(), "confidence": 0.85, "page": page_type})
         for price in re.findall(r'(?:Rs\.?|INR|₹|\$)\s*[\d,]+(?:\.\d+)?', html)[:5]:
             evidence.append({"type": "pricing_signal", "value": price.strip(), "confidence": 0.80, "page": page_type})
-
-        # ── SPA / Next.js fallbacks ─────────────────────────────────────────
-        # __NEXT_DATA__ — deep extraction
         nd = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.I | re.S)
         if nd:
             try:
                 next_data = json.loads(nd.group(1).strip())
                 props = next_data.get("props", {}).get("pageProps", {})
-
                 def flatten_next(obj, depth=0):
-                    """Recursively pull key=value strings from __NEXT_DATA__ pageProps."""
                     out = []
                     if depth > 4:
                         return out
@@ -777,15 +799,12 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
                         for item in obj[:6]:
                             out.extend(flatten_next(item, depth + 1))
                     return out
-
                 flat = flatten_next(props)
                 value = " | ".join(flat[:40]) if flat else json.dumps(props)[:1500]
                 if value:
                     evidence.append({"type": "next_data", "value": value[:1500], "confidence": 0.85, "page": page_type})
             except:
                 pass
-
-        # JSON-LD structured data — field-aware extraction
         for jld_raw in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
             try:
                 jld = json.loads(jld_raw.strip())
@@ -806,43 +825,32 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
                 evidence.append({"type": "json_ld", "value": value[:800], "confidence": 0.88, "page": page_type})
             except:
                 pass
-
-        # noscript text
         for ns in re.findall(r'<noscript[^>]*>(.*?)</noscript>', html, re.I | re.S):
             clean = re.sub(r'<[^>]+>', ' ', ns)
             clean = re.sub(r'\s+', ' ', clean).strip()
             if clean and len(clean) > 10:
                 evidence.append({"type": "noscript_text", "value": clean[:400], "confidence": 0.65, "page": page_type})
-
-        # ── Body text ───────────────────────────────────────────────────────
         body = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.I | re.S)
         body = re.sub(r'<style[^>]*>.*?</style>', '', body, flags=re.I | re.S)
         body = re.sub(r'<[^>]+>', ' ', body)
         body = re.sub(r'\s+', ' ', body).strip()
         if body and len(body) > 50:
             evidence.append({"type": "body_text", "value": body[:2000], "confidence": 0.60, "page": page_type})
-
         return evidence
 
-    async def fetch_page(url, page_type="homepage"):
-        """Returns (fetched: bool, evidence: list)"""
+    async def fetch_page(u, page_type="homepage"):
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
-                r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                logger.info(f"[CRAWL] {url} → status={r.status_code} final_url={r.url}")
+                r = await c.get(u, headers={"User-Agent": "Mozilla/5.0"})
+                logger.info(f"[CRAWL] {u} → status={r.status_code}")
                 if r.status_code < 400:
-                    ev = extract_evidence(r.text, page_type)
-                    logger.info(f"[CRAWL] {url} → {len(ev)} evidence points extracted")
-                    return (True, ev)
-                else:
-                    logger.info(f"[CRAWL] {url} → SKIPPED (status {r.status_code})")
-                    return (False, [])
+                    return (True, extract_evidence(r.text, page_type))
+                return (False, [])
         except Exception as e:
-            logger.info(f"[CRAWL] {url} → EXCEPTION: {e}")
+            logger.info(f"[CRAWL] {u} → EXCEPTION: {e}")
         return (False, [])
 
     async def fetch_sitemap_urls(base):
-        """Fetch robots.txt → sitemap.xml, return scored list of crawlable URLs. Returns List[str]."""
         async def try_get(u):
             try:
                 async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
@@ -850,9 +858,7 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
                     return r.text if r.status_code < 400 else None
             except:
                 return None
-
         skip_ext = ('.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.pdf', '.xml', '.css', '.js', '.woff', '.ico', '.mp4')
-
         def score_url(u):
             p = u.lower().replace(base.lower(), '')
             if any(k in p for k in ('/product', '/item', '/collection', '/category', '/shop', '/store', '/catalogue')):
@@ -860,36 +866,26 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
             if any(k in p for k in ('/about', '/contact', '/service', '/who-we-are', '/our-story', '/brand')):
                 return 2
             if p in ('', '/', '/home', '/index'):
-                return -1  # skip homepage, fetched separately
+                return -1
             return 1
-
         sitemap_url = base + "/sitemap.xml"
         robots = await try_get(base + "/robots.txt")
         if robots:
             sm = re.search(r'Sitemap:\s*(https?://\S+)', robots, re.I)
             if sm:
                 sitemap_url = sm.group(1).strip()
-                logger.info(f"[SITEMAP] Found in robots.txt: {sitemap_url}")
-
         sitemap_xml = await try_get(sitemap_url)
         if not sitemap_xml:
-            logger.info(f"[SITEMAP] Not found at {sitemap_url}")
             return []
-
-        # Handle sitemap index → fetch first sub-sitemap
         sub_sitemaps = re.findall(r'<loc>(https?://[^<]*sitemap[^<]*\.xml[^<]*)</loc>', sitemap_xml, re.I)
         if sub_sitemaps:
-            logger.info(f"[SITEMAP] Index found, fetching sub-sitemap: {sub_sitemaps[0]}")
             sub = await try_get(sub_sitemaps[0])
             if sub:
                 sitemap_xml = sub
-
         all_urls = re.findall(r'<loc>(https?://[^<]+)</loc>', sitemap_xml, re.I)
         crawlable = [u for u in all_urls if not any(u.lower().endswith(e) for e in skip_ext)]
         selected = sorted(crawlable, key=score_url, reverse=True)
-        # Remove homepage, dedupe, take top 6
         selected = list(dict.fromkeys(u for u in selected if u.rstrip('/') != base))[:6]
-        logger.info(f"[SITEMAP] {len(all_urls)} total, {len(crawlable)} crawlable, {len(selected)} selected for crawl")
         return selected
 
     async def run_ai_json(prompt, max_tokens):
@@ -906,10 +902,8 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         except:
             return {}
 
-    # ── PHASE 1: Evidence Collection Engine ─────────────────────────────────
-
-    def classify_page_type(url):
-        p = url.lower()
+    def classify_page_type(u):
+        p = u.lower()
         if any(k in p for k in ('/product', '/item', '/collection', '/catalogue')):
             return 'products'
         if any(k in p for k in ('/category', '/shop', '/store')):
@@ -922,19 +916,18 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
             return 'services'
         return 'page'
 
-    base = request.url.rstrip('/')
+    base = url.rstrip('/')
 
-    # Phase 1a: homepage + sitemap discovery in parallel
-    logger.info(f"[CRAWL] Phase 1a: homepage + sitemap discovery for {base}")
+    # Phase 1: Evidence Collection
+    logger.info(f"[BI] Phase 1a: homepage + sitemap for {base}")
     (hp_fetched, hp_ev), sitemap_urls = await asyncio.gather(
         fetch_page(base, "homepage"),
         fetch_sitemap_urls(base)
     )
 
-    # Phase 1b: crawl real sitemap URLs or fall back to guesses
     if sitemap_urls:
         extra_targets = [(u, classify_page_type(u)) for u in sitemap_urls]
-        logger.info(f"[CRAWL] Phase 1b: crawling {len(extra_targets)} sitemap URLs")
+        logger.info(f"[BI] Phase 1b: crawling {len(extra_targets)} sitemap URLs")
     else:
         extra_targets = [
             (base + "/about",    "about"),
@@ -943,10 +936,7 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
             (base + "/shop",     "shop"),
             (base + "/contact",  "contact"),
         ]
-        logger.info(f"[CRAWL] Phase 1b: no sitemap, using {len(extra_targets)} fallback guesses")
-
-    for u, pt in extra_targets:
-        logger.info(f"[CRAWL]   → {u} ({pt})")
+        logger.info(f"[BI] Phase 1b: no sitemap, using {len(extra_targets)} fallback guesses")
 
     extra_results = await asyncio.gather(*[fetch_page(u, pt) for u, pt in extra_targets])
 
@@ -955,8 +945,6 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
     pages_fetched = sum(1 for (fetched, _) in all_page_results if fetched)
     pages_with_evidence = sum(1 for (fetched, ev) in all_page_results if fetched and ev)
     sitemap_crawled = bool(sitemap_urls)
-
-    logger.info(f"[CRAWL] pages_attempted={pages_attempted} pages_fetched={pages_fetched} pages_with_evidence={pages_with_evidence} sitemap_crawled={sitemap_crawled}")
 
     all_evidence = []
     seen = set()
@@ -968,10 +956,9 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
                 all_evidence.append(e)
 
     if not all_evidence:
-        return {"success": False, "scan_failed": True, "message": "Website unreachable. Check URL and try again."}
+        return None
 
     avg_confidence = round(sum(e["confidence"] for e in all_evidence) / len(all_evidence), 2)
-
     evidence_collection = {
         "pages_attempted": pages_attempted,
         "pages_fetched": pages_fetched,
@@ -991,14 +978,13 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         e["value"] for e in all_evidence if e["type"] == "body_text"
     )[:3000]
 
-    # ── PHASE 2: Business DNA Engine ────────────────────────────────────────
-
+    # Phase 2: Business DNA
     dna_prompt = (
         "You are a Business Intelligence DNA engine. Classify this business using ONLY the evidence below.\n"
         "Do NOT hallucinate. If evidence is missing for a field, use \"Unknown\".\n\n"
         f"EVIDENCE:\n{evidence_text}\n\n"
         f"BODY TEXT:\n{body_text[:1500]}\n\n"
-        f"USER-STATED CATEGORY (verify against evidence, may be wrong): {request.business_type or 'Not provided'}\n\n"
+        f"USER-STATED CATEGORY (verify against evidence, may be wrong): {business_type or 'Not provided'}\n\n"
         "Return STRICT JSON:\n"
         "{\n"
         '  "detected_industry": "",\n'
@@ -1016,18 +1002,16 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         "}\n\n"
         "dna_score 0-100: score 90+ only if pricing signals, trust signals, and a clear UVP are all found in evidence."
     )
-
     dna = await run_ai_json(dna_prompt, 800)
 
-    # ── PHASE 3: Opportunity + Threat + Audience in parallel ─────────────────
-
-    dna_text = json.dumps(dna, indent=2)
+    # Phase 3: Opportunity + Threat + Audience + Positioning in parallel
+    dna_text_p = json.dumps(dna, indent=2)
 
     positioning_prompt = (
         "You are a Brand Positioning Strategist. Analyze where this business currently stands and where it should position itself.\n\n"
-        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"BUSINESS DNA:\n{dna_text_p}\n\n"
         f"EVIDENCE:\n{evidence_text[:1500]}\n\n"
-        f"COMPETITOR URLS: {request.competitor_urls if request.competitor_urls else 'None provided — use industry knowledge'}\n\n"
+        f"COMPETITOR URLS: {competitor_urls if competitor_urls else 'None provided — use industry knowledge'}\n\n"
         "Return STRICT JSON:\n"
         "{\n"
         '  "current_positioning": "what this business currently stands for, based ONLY on evidence",\n'
@@ -1038,19 +1022,18 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         '  ],\n'
         '  "positioning_gap": "the unoccupied space no competitor currently owns in this market",\n'
         '  "winning_position": "the single best position this business should own — 1 punchy sentence",\n'
-        '  "category_ownership_opportunity": "the category name they could OWN, e.g. Indias Most Trusted Home Fitness Brand",\n'
+        '  "category_ownership_opportunity": "the category name they could OWN",\n'
         '  "messaging_shift": "what the business currently says vs what it SHOULD say",\n'
         '  "reasoning": "why this positioning works for this business specifically",\n'
         '  "supporting_evidence": ["exact quote from evidence that supports this positioning"],\n'
         '  "confidence_score": 0\n'
         "}\n\n"
-        "confidence_score 0-100: based on how much website evidence exists to support the positioning analysis. "
-        "If competitor URLs were provided, base competitor positioning on them. Otherwise, use top industry players."
+        "confidence_score 0-100: based on how much website evidence exists to support the positioning analysis."
     )
 
     opportunity_prompt = (
         "You are a Market Opportunity Scoring engine. Score this business's digital advertising opportunity.\n\n"
-        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"BUSINESS DNA:\n{dna_text_p}\n\n"
         f"EVIDENCE:\n{evidence_text[:1200]}\n\n"
         "Return STRICT JSON:\n"
         "{\n"
@@ -1067,14 +1050,13 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         '  "budget_efficiency": "Low or Medium or High",\n'
         '  "seasonal_factors": []\n'
         "}\n\n"
-        "All scores 0-100. overall_opportunity_score = (market_opportunity_score * 0.4) + (conversion_potential_score * 0.4) + ((100 - competition_difficulty_score) * 0.2). "
-        "High competition_difficulty_score = harder market = penalizes overall score."
+        "All scores 0-100. overall_opportunity_score = (market_opportunity_score * 0.4) + (conversion_potential_score * 0.4) + ((100 - competition_difficulty_score) * 0.2)."
     )
 
     threat_prompt = (
         "You are a Competitive Threat Intelligence engine. Assess the threat landscape for this business.\n\n"
-        f"BUSINESS DNA:\n{dna_text}\n\n"
-        f"COMPETITOR URLS: {request.competitor_urls if request.competitor_urls else 'None provided'}\n\n"
+        f"BUSINESS DNA:\n{dna_text_p}\n\n"
+        f"COMPETITOR URLS: {competitor_urls if competitor_urls else 'None provided'}\n\n"
         "Return STRICT JSON:\n"
         "{\n"
         '  "competitor_threat_score": 0,\n'
@@ -1088,13 +1070,13 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         '  "moat_reason": "",\n'
         '  "threat_level": "Low or Medium or High or Critical"\n'
         "}\n\n"
-        "competitor_threat_score 0-100: 0=no threat, 100=extreme competition. Base on industry DNA and market saturation signals."
+        "competitor_threat_score 0-100: 0=no threat, 100=extreme competition."
     )
 
     audience_prompt = (
         "You are an Audience Intelligence 2.0 engine. Generate audience segments ONLY from Business DNA evidence.\n"
         "RULE: Every segment MUST cite specific evidence. Reject any segment you cannot prove from the DNA.\n\n"
-        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"BUSINESS DNA:\n{dna_text_p}\n\n"
         f"EVIDENCE:\n{evidence_text[:1200]}\n\n"
         "Return STRICT JSON:\n"
         "{\n"
@@ -1120,8 +1102,8 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         '  "audience_quality_score": 0,\n'
         '  "audience_quality_reason": ""\n'
         "}\n\n"
-        "Generate exactly 3 validated_segments and at least 1 rejected_segment to show the filter is working. confidence_score per segment: 0-100. "
-        "audience_quality_score 0-100: average confidence of validated segments, penalised if fewer than 2 segments have strong evidence."
+        "Generate exactly 3 validated_segments and at least 1 rejected_segment. "
+        "audience_quality_score 0-100: average confidence of validated segments."
     )
 
     opportunity, threat, audience_intel, positioning = await asyncio.gather(
@@ -1130,13 +1112,12 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         run_ai_json(audience_prompt, 1400),
         run_ai_json(positioning_prompt, 700),
     )
-    logger.info(f"[AUDIENCE] audience_quality_score={audience_intel.get('audience_quality_score')} segments={len(audience_intel.get('validated_segments', []))}")
+    logger.info(f"[BI] audience_quality_score={audience_intel.get('audience_quality_score')} segments={len(audience_intel.get('validated_segments', []))}")
 
-    # ── PHASE 4: Executive Decision Engine ───────────────────────────────────
-
+    # Phase 4: Executive Decision Engine
     exec_prompt = (
         "You are a CMO-level Executive Decision Engine. Based on all intelligence below, output the 5 highest-impact actions.\n\n"
-        f"BUSINESS DNA:\n{dna_text}\n\n"
+        f"BUSINESS DNA:\n{dna_text_p}\n\n"
         f"OPPORTUNITY SCORES:\n{json.dumps(opportunity, indent=2)}\n\n"
         f"THREAT INTELLIGENCE:\n{json.dumps(threat, indent=2)}\n\n"
         f"AUDIENCE INTELLIGENCE:\n{json.dumps({'validated_segments': audience_intel.get('validated_segments', []), 'audience_quality_score': audience_intel.get('audience_quality_score', 0)}, indent=2)}\n\n"
@@ -1165,39 +1146,61 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         "}\n\n"
         "overall_readiness_score 0-100: weighted from DNA score, opportunity score, and inverse of threat score."
     )
-
     executive = await run_ai_json(exec_prompt, 700)
 
-    # ── Response ─────────────────────────────────────────────────────────────
-
     scores = {
-        "dna_score": dna.get("dna_score", 0),
-        "opportunity_score": round(opportunity.get("overall_opportunity_score", 0)),
-        "threat_score": threat.get("competitor_threat_score", 0),
-        "audience_quality_score": audience_intel.get("audience_quality_score", 0),
-        "positioning_score": positioning.get("confidence_score", 0),
-        "readiness_score": executive.get("overall_readiness_score", 0),
+        "dna_score":             dna.get("dna_score", 0),
+        "opportunity_score":     round(opportunity.get("overall_opportunity_score", 0)),
+        "threat_score":          threat.get("competitor_threat_score", 0),
+        "audience_quality_score":audience_intel.get("audience_quality_score", 0),
+        "positioning_score":     positioning.get("confidence_score", 0),
+        "readiness_score":       executive.get("overall_readiness_score", 0),
     }
+
+    return {
+        "intelligence": {
+            "evidence_collection": evidence_collection,
+            "business_dna":        dna,
+            "opportunity_score":   opportunity,
+            "threat_intelligence": threat,
+            "audience_intelligence":audience_intel,
+            "positioning":         positioning,
+            "executive_decisions": executive,
+        },
+        "scores": scores,
+    }
+
+
+class IntelligenceRequest(BaseModel):
+    url: str
+    business_type: str = ""
+    competitor_urls: list[str] = []
+
+@app.post("/intelligence")
+async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_db)):
+    bi = await gather_bi_data(request.url, request.business_type, request.competitor_urls)
+    if not bi:
+        return {"success": False, "scan_failed": True, "message": "Website unreachable. Check URL and try again."}
+
     try:
-        report = ReportModel(report_type="intelligence", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "competitor_urls": request.competitor_urls}), result_data=json.dumps({"business_dna": dna, "opportunity_score": opportunity, "threat_intelligence": threat, "audience_intelligence": audience_intel, "positioning": positioning, "executive_decisions": executive, "scores": scores}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+        report = ReportModel(
+            report_type="intelligence",
+            title=request.url,
+            input_data=json.dumps({"url": request.url, "business_type": request.business_type, "competitor_urls": request.competitor_urls}),
+            result_data=json.dumps({**bi["intelligence"], "scores": bi["scores"]}),
+            created_at=datetime.now().strftime("%d %b %Y, %I:%M %p")
+        )
         db.add(report)
         db.commit()
     except Exception as _re:
         logger.warning(f"[REPORTS] Could not save intelligence report: {_re}")
         db.rollback()
+
     return {
         "success": True,
         "url": request.url,
-        "intelligence": {
-            "evidence_collection": evidence_collection,
-            "business_dna": dna,
-            "opportunity_score": opportunity,
-            "threat_intelligence": threat,
-            "audience_intelligence": audience_intel,
-            "positioning": positioning,
-            "executive_decisions": executive,
-        },
-        "scores": scores,
+        "intelligence": bi["intelligence"],
+        "scores": bi["scores"],
     }
 
 
