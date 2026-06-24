@@ -347,7 +347,7 @@ async def ad_intelligence(request: AdIntelRequest, db: Session = Depends(get_db)
     return {"success": True, "business_name": request.business_name, "meta_ad_library_link": meta_link, "google_ads_link": google_link, "guide": guide_text}
 
 class FullReportRequest(BaseModel):
-    url: str
+    url: str = ""
     business_type: str
     budget: int
     goal: str
@@ -372,43 +372,68 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         return resp.choices[0].message.content
 
     # ── Step 1: Get BI data (check cache first, then run fresh) ──────────
-    bi_data = None
+    industry_only_mode = bool(request.target_industry and not (request.url or "").strip())
+
+    industry_only_context = f"""
+Business Type: Digital Marketing Agency (Sohscape)
+Target Industry: {request.target_industry}
+Target City: {request.target_city}
+Monthly Budget: Rs {request.budget}
+Goal: {request.goal}
+Language: {request.language}
+
+You are generating a B2B lead generation campaign for a digital marketing agency targeting {request.target_industry} businesses in {request.target_city}. Focus on reaching OWNERS, MANAGERS, and DECISION MAKERS of these businesses — not their end customers.
+
+For {request.target_industry} businesses in {request.target_city}, include:
+- Specific pain points these business owners face with their marketing
+- Where to find them (Google Maps search terms, Instagram hashtags, local FB groups, business associations, directories)
+- Seasonal timing — when are they most likely to need marketing help
+- A hyper-specific WhatsApp outreach message (not generic — reference their actual industry pain)
+- A hyper-specific Instagram DM script (3 lines max, reference something real)
+- What free offer to make (free audit, free report, free reel, etc.)
+- Pitch angle for first meeting + how to handle "we already have someone"
+"""
+
+    bi_data = {} if industry_only_mode else None
     bi_cached = False
 
-    try:
-        cached_row = db.query(ReportModel).filter(
-            ReportModel.report_type == "intelligence",
-            ReportModel.title == request.url
-        ).order_by(ReportModel.id.desc()).first()
-        if cached_row and cached_row.result_data:
-            bi_data = json.loads(cached_row.result_data)
-            bi_cached = True
-            logger.info(f"[FULL-REPORT] Using cached BI for {request.url}")
-    except Exception as _e:
-        logger.warning(f"[FULL-REPORT] Cache lookup failed: {_e}")
+    if industry_only_mode:
+        logger.info("[FULL-REPORT] Industry-only B2B mode: skipping crawl and BI engines")
+    else:
+        try:
+            cached_row = db.query(ReportModel).filter(
+                ReportModel.report_type == "intelligence",
+                ReportModel.title == request.url
+            ).order_by(ReportModel.id.desc()).first()
+            if cached_row and cached_row.result_data:
+                bi_data = json.loads(cached_row.result_data)
+                bi_cached = True
+                logger.info(f"[FULL-REPORT] Using cached BI for {request.url}")
+        except Exception as _e:
+            logger.warning(f"[FULL-REPORT] Cache lookup failed: {_e}")
 
-    if not bi_data:
-        logger.info(f"[FULL-REPORT] Running fresh BI for {request.url}")
-        fresh_bi = await gather_bi_data(
-            request.url,
-            request.business_type,
-            [request.competitor_website] if request.competitor_website else []
-        )
-        if fresh_bi:
-            bi_data = {**fresh_bi["intelligence"], "scores": fresh_bi["scores"]}
-            try:
-                bi_cache_row = ReportModel(
-                    report_type="intelligence",
-                    title=request.url,
-                    input_data=json.dumps({"url": request.url, "business_type": request.business_type}),
-                    result_data=json.dumps(bi_data),
-                    created_at=datetime.now().strftime("%d %b %Y, %I:%M %p")
-                )
-                db.add(bi_cache_row)
-                db.commit()
-            except Exception as _re:
-                logger.warning(f"[FULL-REPORT] Could not cache BI: {_re}")
-                db.rollback()
+        if not bi_data:
+            logger.info(f"[FULL-REPORT] Running fresh BI for {request.url}")
+            fresh_bi = await gather_bi_data(
+                request.url,
+                request.business_type,
+                [request.competitor_website] if request.competitor_website else []
+            )
+            if fresh_bi:
+                bi_data = {**fresh_bi["intelligence"], "scores": fresh_bi["scores"]}
+                try:
+                    bi_cache_row = ReportModel(
+                        report_type="intelligence",
+                        title=request.url,
+                        input_data=json.dumps({"url": request.url, "business_type": request.business_type}),
+                        result_data=json.dumps(bi_data),
+                        created_at=datetime.now().strftime("%d %b %Y, %I:%M %p")
+                    )
+                    db.add(bi_cache_row)
+                    db.commit()
+                except Exception as _re:
+                    logger.warning(f"[FULL-REPORT] Could not cache BI: {_re}")
+                    db.rollback()
 
     # ── Step 2: Ad library links ──────────────────────────────────────────
     import urllib.parse
@@ -422,7 +447,9 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         google_link = "https://adstransparency.google.com/?region=IN"
 
     # ── Step 3: Extract BI context strings ───────────────────────────────
-    if bi_data:
+    if industry_only_mode:
+        dna_txt = opp_txt = thr_txt = pos_txt = aud_txt = exec_txt = sc_txt = industry_only_context
+    elif bi_data:
         dna      = bi_data.get("business_dna", {})
         opp      = bi_data.get("opportunity_score", {})
         thr      = bi_data.get("threat_intelligence", {})
@@ -443,12 +470,14 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         )
 
     lang = request.language
-    biz  = f"{request.url} | {request.business_type}"
+    biz  = f"{(request.url or 'Industry-only B2B campaign')} | {request.business_type}"
     bdgt = f"Rs {request.budget}/month"
 
     # ── Step 4: Build optional industry/B2B context, then 3 parallel calls ──
     industry_context = ""
-    if request.target_industry:
+    if industry_only_mode:
+        industry_context = industry_only_context + "\n"
+    elif request.target_industry:
         city = request.target_city or "India"
         industry_context = (
             f"TARGET INDUSTRY: {request.target_industry} businesses in {city}\n"
@@ -627,8 +656,8 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     try:
         report = ReportModel(
             report_type="full-report",
-            title=request.url,
-            input_data=json.dumps({"url": request.url, "business_type": request.business_type, "budget": request.budget, "goal": request.goal, "competitor_name": request.competitor_name, "competitor_website": request.competitor_website}),
+            title=request.url or f"industry-only:{request.target_industry}:{request.target_city}",
+            input_data=json.dumps({"url": request.url, "business_type": request.business_type, "budget": request.budget, "goal": request.goal, "competitor_name": request.competitor_name, "competitor_website": request.competitor_website, "target_industry": request.target_industry, "target_city": request.target_city}),
             result_data=json.dumps({"section_a": section_a, "section_b": section_b, "section_c": section_c, "ad_guide": ad_guide}),
             created_at=datetime.now().strftime("%d %b %Y, %I:%M %p")
         )
@@ -663,6 +692,7 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
         },
         "bi_data":   bi_data,
         "bi_cached": bi_cached,
+        "industry_only_mode": industry_only_mode,
         "target_industry": request.target_industry,
         "target_city":     request.target_city,
         "meta_ad_library_link": meta_link,
@@ -1273,7 +1303,6 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
         "You are a CMO-level Executive Decision Engine. Based on all intelligence below, output the 5 highest-impact actions.\n\n"
         f"BUSINESS DNA:\n{dna_text_p}\n\n"
         f"OPPORTUNITY SCORES:\n{json.dumps(opportunity, indent=2)}\n\n"
-        f"{b2b_context}"
         f"THREAT INTELLIGENCE:\n{json.dumps(threat, indent=2)}\n\n"
         f"AUDIENCE INTELLIGENCE:\n{json.dumps({'validated_segments': audience_intel.get('validated_segments', []), 'audience_quality_score': audience_intel.get('audience_quality_score', 0)}, indent=2)}\n\n"
         "Return STRICT JSON:\n"
