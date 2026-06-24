@@ -33,6 +33,7 @@ app.add_middleware(
 )
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
@@ -358,6 +359,25 @@ class FullReportRequest(BaseModel):
     target_city: str = ""
     mode: str = "b2c"  # kept for backward compat, unused
 
+async def fetch_tavily(query: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.post(
+                "https://api.tavily.com/search",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "search_depth": "advanced",
+                    "max_results": 5,
+                },
+            )
+            data = resp.json()
+            snippets = [r.get("content", "") for r in data.get("results", []) if r.get("content")]
+            return "\n".join(snippets)
+    except Exception:
+        return ""
+
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
 
@@ -492,12 +512,46 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "6. Include first meeting pitch angle + how to close\n\n"
         )
 
+    # ── Step 4.5: Tavily real-time market intelligence ───────────────────────
+    tavily_competitors = ""
+    tavily_market = ""
+    live_data_used = False
+    if TAVILY_API_KEY:
+        city_for_tavily = request.target_city or "India"
+        q_competitors = (
+            f"Top competitors of {request.business_type} in {city_for_tavily} "
+            f"2026 real company names strengths weaknesses"
+        )
+        q_market = (
+            f"{request.business_type} industry market trends digital marketing "
+            f"India 2026 consumer behavior advertising"
+        )
+        logger.info(f"[FULL-REPORT] Fetching Tavily data for: {request.business_type}")
+        tavily_competitors, tavily_market = await asyncio.gather(
+            fetch_tavily(q_competitors),
+            fetch_tavily(q_market),
+        )
+        live_data_used = bool(tavily_competitors or tavily_market)
+        logger.info(f"[FULL-REPORT] Tavily live_data_used={live_data_used}")
+
+    live_intel_block = ""
+    if live_data_used:
+        live_intel_block = (
+            "LIVE MARKET INTELLIGENCE (real-time web data):\n"
+            "TOP COMPETITORS IN THIS MARKET:\n"
+            f"{tavily_competitors}\n\n"
+            "CURRENT MARKET TRENDS:\n"
+            f"{tavily_market}\n\n"
+            "Use this real data. Reference actual company names. Make analysis specific not generic.\n\n"
+        )
+
     prompt_a = (
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
         "Generate intelligence-driven analysis using the BI data below. No generic advice — every insight must come from the data.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
         f"BUSINESS DNA:\n{dna_txt}\n\nTHREAT INTELLIGENCE:\n{thr_txt}\n\nPOSITIONING DATA:\n{pos_txt}\n\n"
+        f"{live_intel_block}"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 1-4:\n\n"
         "BUSINESS UNDERSTANDING:\n"
         "[What truly makes this business different — UVP, trust signals, detected_industry, core_products from DNA. 4-5 specific points]\n\n"
@@ -516,6 +570,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
             f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
             f"TARGET INDUSTRY: {request.target_industry} in {city}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+            f"{live_intel_block}"
             "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8 (B2B Industry Campaign):\n\n"
             "AUDIENCE STRATEGY:\n"
             f"[3 segments: Owners, Managers, Decision-Makers of {request.target_industry} businesses in {city}. "
@@ -543,6 +598,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "Generate intelligence-driven audience strategy and campaign strategies. Every recommendation must cite BI evidence.\n"
             f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+            f"{live_intel_block}"
             "IMPORTANT RULES:\n"
             "1. Indian market ke liye — Indian apps, platforms suggest karo.\n"
             "2. Age exclude sirf 45+ karo.\n"
@@ -565,6 +621,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
+        f"{live_intel_block}"
         "CRITICAL: Do NOT repeat Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy — those are already covered in sections 1-4. Start DIRECTLY with FULL MARKETING PLAN.\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
         "FULL MARKETING PLAN:\n"
@@ -690,8 +747,9 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "ad_assets":               c_parts.get("AD ASSETS:", ""),
             "revenue_recommendations": c_parts.get("REVENUE RECOMMENDATIONS:", ""),
         },
-        "bi_data":   bi_data,
-        "bi_cached": bi_cached,
+        "bi_data":        bi_data,
+        "bi_cached":      bi_cached,
+        "live_data_used": live_data_used,
         "industry_only_mode": industry_only_mode,
         "target_industry": request.target_industry,
         "target_city":     request.target_city,
