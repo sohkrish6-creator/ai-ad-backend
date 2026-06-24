@@ -34,6 +34,7 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
@@ -359,6 +360,22 @@ class FullReportRequest(BaseModel):
     target_city: str = ""
     mode: str = "b2c"  # kept for backward compat, unused
 
+async def fetch_firecrawl(url: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            resp = await c.post(
+                "https://api.firecrawl.dev/v1/scrape",
+                headers={
+                    "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
+            )
+            data = resp.json()
+            return (data.get("data") or {}).get("markdown", "")
+    except Exception:
+        return ""
+
 async def fetch_tavily(query: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -416,6 +433,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
 
     bi_data = {} if industry_only_mode else None
     bi_cached = False
+    firecrawl_used_bi = False
 
     if industry_only_mode:
         logger.info("[FULL-REPORT] Industry-only B2B mode: skipping crawl and BI engines")
@@ -441,6 +459,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
             )
             if fresh_bi:
                 bi_data = {**fresh_bi["intelligence"], "scores": fresh_bi["scores"]}
+                firecrawl_used_bi = fresh_bi.get("firecrawl_used", False)
                 try:
                     bi_cache_row = ReportModel(
                         report_type="intelligence",
@@ -761,7 +780,8 @@ For {request.target_industry} businesses in {request.target_city}, include:
         },
         "bi_data":        bi_data,
         "bi_cached":      bi_cached,
-        "live_data_used": live_data_used,
+        "live_data_used":  live_data_used,
+        "firecrawl_used":  firecrawl_used_bi,
         "industry_only_mode": industry_only_mode,
         "target_industry": request.target_industry,
         "target_city":     request.target_city,
@@ -1092,6 +1112,33 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
             evidence.append({"type": "body_text", "value": body[:2000], "confidence": 0.60, "page": page_type})
         return evidence
 
+    def extract_evidence_from_markdown(md, page_type="homepage"):
+        ev = []
+        for line in md.split('\n'):
+            s = line.strip()
+            if s.startswith('### '):
+                ev.append({"type": "h3", "value": s[4:].strip(), "confidence": 0.65, "page": page_type})
+            elif s.startswith('## '):
+                ev.append({"type": "h2", "value": s[3:].strip(), "confidence": 0.75, "page": page_type})
+            elif s.startswith('# '):
+                ev.append({"type": "h1", "value": s[2:].strip(), "confidence": 0.85, "page": page_type})
+        for pattern, trust_type in [
+            (r'(\d+\+?\s*(?:years?|yr)\s*(?:of\s*)?(?:experience|expertise))', "years_experience"),
+            (r'(\d[\d,]*\+?\s*(?:customers?|clients?|users?))',                 "customer_count"),
+            (r'(ISO\s*\d+[:\-]\d+)',                                            "certification"),
+            (r'(rated\s*[\d.]+\s*(?:out\s*of\s*5|\/\s*5|stars?))',             "rating"),
+            (r'(\d+\+?\s*(?:projects?|orders?|deliveries?))',                   "project_count"),
+        ]:
+            for match in re.findall(pattern, md, re.I)[:2]:
+                ev.append({"type": f"trust_{trust_type}", "value": match.strip(), "confidence": 0.85, "page": page_type})
+        for price in re.findall(r'(?:Rs\.?|INR|₹|\$)\s*[\d,]+(?:\.\d+)?', md)[:5]:
+            ev.append({"type": "pricing_signal", "value": price.strip(), "confidence": 0.80, "page": page_type})
+        clean = re.sub(r'[#*`\[\]()>|~_]', ' ', md)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        if clean:
+            ev.append({"type": "body_text", "value": clean[:2000], "confidence": 0.75, "page": page_type})
+        return ev
+
     async def fetch_page(u, page_type="homepage"):
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
@@ -1172,12 +1219,25 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
 
     base = url.rstrip('/')
 
-    # Phase 1: Evidence Collection
+    # Phase 1: Evidence Collection — Firecrawl first, httpx fallback
+    firecrawl_used = False
+    if FIRECRAWL_API_KEY:
+        fc_md = await fetch_firecrawl(base)
+        if fc_md:
+            firecrawl_used = True
+            logger.info(f"[BI] Firecrawl succeeded for {base}: {len(fc_md)} chars")
+        else:
+            logger.info(f"[BI] Firecrawl returned empty for {base}, falling back to httpx")
+
     logger.info(f"[BI] Phase 1a: homepage + sitemap for {base}")
-    (hp_fetched, hp_ev), sitemap_urls = await asyncio.gather(
-        fetch_page(base, "homepage"),
-        fetch_sitemap_urls(base)
-    )
+    if firecrawl_used:
+        hp_fetched, hp_ev = True, extract_evidence_from_markdown(fc_md, "homepage")
+        sitemap_urls = await fetch_sitemap_urls(base)
+    else:
+        (hp_fetched, hp_ev), sitemap_urls = await asyncio.gather(
+            fetch_page(base, "homepage"),
+            fetch_sitemap_urls(base)
+        )
 
     if sitemap_urls:
         extra_targets = [(u, classify_page_type(u)) for u in sitemap_urls]
@@ -1421,7 +1481,8 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
             "positioning":         positioning,
             "executive_decisions": executive,
         },
-        "scores": scores,
+        "scores":         scores,
+        "firecrawl_used": firecrawl_used,
     }
 
 
@@ -1516,10 +1577,11 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
         db.rollback()
 
     return {
-        "success": True,
-        "url": request.url,
-        "intelligence": bi["intelligence"],
-        "scores": bi["scores"],
+        "success":        True,
+        "url":            request.url,
+        "intelligence":   bi["intelligence"],
+        "scores":         bi["scores"],
+        "firecrawl_used": bi.get("firecrawl_used", False),
     }
 
 
