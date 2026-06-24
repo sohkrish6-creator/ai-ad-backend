@@ -180,7 +180,7 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     )
 
     classification = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": classify_prompt}],
         max_tokens=600,
         response_format={"type": "json_object"}
@@ -229,7 +229,7 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
         "OPPORTUNITIES:\n1. []\n2. []\n3. []\n"
     )
 
-    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=4000)
+    ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=4000)
     result = ai_response.choices[0].message.content
 
     analysis = AnalysisModel(url=request.url, business_type=detected, budget=request.budget, goal=request.goal, result=result, created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
@@ -297,7 +297,7 @@ async def competitor(request: CompetitorRequest, db: Session = Depends(get_db)):
         "MARKET GAPS:\n1. []\n2. []\n3. []\n\nWHERE YOU CAN WIN:\n1. []\n2. []\n3. []\n\nRECOMMENDED MESSAGING:\n[]\n\nQUICK WINS:\n1. []\n2. []\n3. []\n"
     )
 
-    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2500)
+    ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=2500)
     analysis_text = ai_response.choices[0].message.content
     try:
         report = ReportModel(report_type="competitor", title=request.my_url, input_data=json.dumps({"my_url": request.my_url, "competitor_urls": request.competitor_urls, "business_type": request.business_type}), result_data=json.dumps({"analysis": analysis_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
@@ -337,7 +337,7 @@ async def ad_intelligence(request: AdIntelRequest, db: Session = Depends(get_db)
         "UNKI KAMZORI:\n1. []\n2. []\n3. []\n\nTUMHARA WINNING ANGLE:\n1. []\n2. []\n3. []\n\nABHI YEH KARO:\n1. []\n2. []\n3. []\n"
     )
 
-    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=1500)
+    ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=1500)
     guide_text = ai_response.choices[0].message.content
     try:
         report = ReportModel(report_type="ad-intelligence", title=request.business_name, input_data=json.dumps({"business_name": request.business_name, "business_type": request.business_type, "website": request.website}), result_data=json.dumps({"guide": guide_text, "meta_ad_library_link": meta_link, "google_ads_link": google_link}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
@@ -401,7 +401,7 @@ async def full_report(request: FullReportRequest, db: Session = Depends(get_db))
     async def run_ai(prompt, max_tokens):
         resp = await asyncio.to_thread(
             lambda: client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens
             )
@@ -975,7 +975,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     )
 
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
         max_tokens=4500,
@@ -1054,7 +1054,7 @@ async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db))
         "CREATIVE 3: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n"
     )
 
-    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
+    ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
     creative_text = ai_response.choices[0].message.content
     try:
         report = ReportModel(report_type="ad-creative", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "offer": request.offer, "platform": request.platform}), result_data=json.dumps({"creative": creative_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
@@ -1209,7 +1209,7 @@ async def audience_finder(request: AudienceRequest, db: Session = Depends(get_db
             + "Certification Needed: []\n"
         )
 
-    ai_response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
+    ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
     audience_text = ai_response.choices[0].message.content
     try:
         report = ReportModel(report_type="audience-finder", title=request.url or request.niche, input_data=json.dumps({"url": request.url, "niche": request.niche, "business_type": request.business_type, "offer": request.offer, "platform": request.platform}), result_data=json.dumps({"audience": audience_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
@@ -1407,7 +1407,7 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
     async def run_ai_json(prompt, max_tokens):
         resp = await asyncio.to_thread(
             lambda: client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"}
@@ -1751,7 +1751,7 @@ async def media_buying_plan(request: MediaBuyingRequest):
     try:
         resp = await asyncio.to_thread(
             lambda: client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
