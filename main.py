@@ -567,8 +567,18 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "Use this real data. Reference actual company names. Make analysis specific not generic.\n\n"
         )
 
+    _analyzed_url = request.url or f"{request.business_type} business"
+    business_critical = (
+        f"CRITICAL: The business you are analyzing is the one at {_analyzed_url}. "
+        f"Do NOT call it Sohscape or Sohscape Intelligence. "
+        f"Use the actual business name detected from the website content.\n"
+        "BANNED WORDS — never use these in any copy or analysis: "
+        "Elevate, Transform, Unlock, unleash, dive in, game-changer, revolutionize, seamless, empower.\n\n"
+    )
+
     prompt_a = (
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
+        f"{business_critical}"
         "Generate intelligence-driven analysis using the BI data below. No generic advice — every insight must come from the data.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
@@ -589,6 +599,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         city = request.target_city or "India"
         prompt_b = (
             "You are the Marketing Brain inside Sohscape Intelligence.\n"
+            f"{business_critical}"
             f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
             f"TARGET INDUSTRY: {request.target_industry} in {city}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
@@ -617,6 +628,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
     else:
         prompt_b = (
             "You are the Marketing Brain inside Sohscape Intelligence.\n"
+            f"{business_critical}"
             "Generate intelligence-driven audience strategy and campaign strategies. Every recommendation must cite BI evidence.\n"
             f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
@@ -640,6 +652,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
     prompt_c = (
         "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'FULL MARKETING PLAN' and only contain sections 9, 10, 11.\n\n"
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
+        f"{business_critical}"
         "Generate the complete marketing plan and ad assets. All recommendations must reference BI evidence.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
