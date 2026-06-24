@@ -825,6 +825,150 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "google_ads_link":      google_link,
     }
 
+class CampaignLaunchKitRequest(BaseModel):
+    url: str = ""
+    industry: str = ""
+    city: str = ""
+    budget: int = 10000
+    goal: str = ""
+    language: str = "Hinglish"
+    sections: dict = {}
+
+@app.post("/campaign-launch-kit")
+async def campaign_launch_kit(request: CampaignLaunchKitRequest):
+    biz_label  = request.url or request.industry or "this business"
+    city_label = request.city or "India"
+    bdgt       = request.budget
+    meta_bdgt  = int(bdgt * 0.50)
+    google_bdgt = int(bdgt * 0.40)
+    remarketing_bdgt = bdgt - meta_bdgt - google_bdgt
+
+    sections_summary = "\n\n".join([
+        f"{k.upper().replace('_', ' ')}:\n{str(v)[:400]}"
+        for k, v in request.sections.items() if v
+    ])
+
+    prompt = (
+        f"You are a senior media buyer building a ready-to-paste campaign launch kit.\n"
+        f"Business: {biz_label} | City: {city_label} | Total Monthly Budget: Rs {bdgt}\n"
+        f"Goal: {request.goal} | Language: {request.language}\n\n"
+        f"MARKETING BRAIN OUTPUT (use this to make everything specific, not generic):\n"
+        f"{sections_summary}\n\n"
+        "Generate THREE campaign kits. Use --- to separate sections. No markdown bold or bullets. "
+        "Plain text only, copy-paste ready. Use exact rupee amounts. Be specific to this business.\n\n"
+        "=== META ADS LAUNCH KIT ===\n"
+        f"Campaign Name: [exact campaign name to type in Meta]\n"
+        f"Objective: [exact Meta objective to select]\n"
+        f"Daily Budget: Rs {int(meta_bdgt / 30)} per day ({meta_bdgt}/month)\n"
+        "---\n"
+        "AUDIENCE SETTINGS\n"
+        f"Location: {city_label} + [X km radius]\n"
+        "Age: [range]\n"
+        "Gender: [All / Men / Women — justify choice]\n"
+        "Interests (copy-paste these 5 into Meta):\n"
+        "1. [exact interest]\n2. [exact interest]\n3. [exact interest]\n4. [exact interest]\n5. [exact interest]\n"
+        "Behaviors: [2-3 specific behaviors]\n"
+        "Exclude: [who to exclude]\n"
+        "---\n"
+        "AD COPY 1 — [angle name]\n"
+        "Primary Text: [write full ad text, 3-4 lines]\n"
+        "Headline: [max 40 chars]\n"
+        "Description: [max 30 chars]\n"
+        "CTA Button: [exact button to select]\n"
+        "---\n"
+        "AD COPY 2 — [different angle]\n"
+        "Primary Text: [write full ad text, 3-4 lines]\n"
+        "Headline: [max 40 chars]\n"
+        "Description: [max 30 chars]\n"
+        "CTA Button: [exact button to select]\n"
+        "---\n"
+        "CREATIVE DIRECTION\n"
+        "Image/Video: [specific visual to create or shoot]\n"
+        "Placements: [exact placements to enable in Meta]\n\n"
+        "=== GOOGLE ADS LAUNCH KIT ===\n"
+        f"Campaign Name: [exact campaign name]\n"
+        "Campaign Type: Search\n"
+        f"Daily Budget: Rs {int(google_bdgt / 30)} per day ({google_bdgt}/month)\n"
+        "Bid Strategy: [exact strategy + reason]\n"
+        "---\n"
+        "KEYWORDS (10 — exact match format, paste directly into Google)\n"
+        "[exact match] keyword 1\n"
+        "[exact match] keyword 2\n"
+        "[exact match] keyword 3\n"
+        "[exact match] keyword 4\n"
+        "[exact match] keyword 5\n"
+        "[exact match] keyword 6\n"
+        "[exact match] keyword 7\n"
+        "[exact match] keyword 8\n"
+        "[exact match] keyword 9\n"
+        "[exact match] keyword 10\n"
+        "---\n"
+        "NEGATIVE KEYWORDS (5)\n"
+        "1. [negative keyword]\n2. [negative keyword]\n3. [negative keyword]\n4. [negative keyword]\n5. [negative keyword]\n"
+        "---\n"
+        "AD 1 — [angle]\n"
+        "Headline 1: [max 30 chars]\n"
+        "Headline 2: [max 30 chars]\n"
+        "Headline 3: [max 30 chars]\n"
+        "Description 1: [max 90 chars]\n"
+        "Description 2: [max 90 chars]\n"
+        "---\n"
+        "AD 2 — [different angle]\n"
+        "Headline 1: [max 30 chars]\n"
+        "Headline 2: [max 30 chars]\n"
+        "Headline 3: [max 30 chars]\n"
+        "Description 1: [max 90 chars]\n"
+        "Description 2: [max 90 chars]\n"
+        "---\n"
+        "AD EXTENSIONS\n"
+        "Sitelinks (3): [label | URL description], [label | URL description], [label | URL description]\n"
+        "Callouts (3): [short phrase], [short phrase], [short phrase]\n\n"
+        "=== REMARKETING KIT ===\n"
+        f"Daily Budget: Rs {int(remarketing_bdgt / 30)} per day ({remarketing_bdgt}/month)\n"
+        "---\n"
+        "AUDIENCE 1 — Website Visitors\n"
+        "Trigger: [who qualifies for this audience]\n"
+        "Ad Copy: [Primary Text + Headline specific to warm audience]\n"
+        "---\n"
+        "AUDIENCE 2 — Video Viewers\n"
+        "Trigger: [who qualifies]\n"
+        "Ad Copy: [Primary Text + Headline]\n"
+        "---\n"
+        "AUDIENCE 3 — Engaged Users\n"
+        "Trigger: [who qualifies]\n"
+        "Ad Copy: [Primary Text + Headline]\n"
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+        max_tokens=3000,
+    )
+    full_text = resp.choices[0].message.content.strip()
+
+    def extract_kit(text, start_marker, end_marker=None):
+        start = text.find(start_marker)
+        if start == -1:
+            return text
+        start += len(start_marker)
+        if end_marker:
+            end = text.find(end_marker, start)
+            return text[start:end].strip() if end != -1 else text[start:].strip()
+        return text[start:].strip()
+
+    meta_kit        = extract_kit(full_text, "=== META ADS LAUNCH KIT ===",   "=== GOOGLE ADS LAUNCH KIT ===")
+    google_kit      = extract_kit(full_text, "=== GOOGLE ADS LAUNCH KIT ===", "=== REMARKETING KIT ===")
+    remarketing_kit = extract_kit(full_text, "=== REMARKETING KIT ===")
+
+    return {
+        "success": True,
+        "meta_kit": meta_kit or full_text,
+        "google_kit": google_kit,
+        "remarketing_kit": remarketing_kit,
+    }
+
+
 class AdCreativeRequest(BaseModel):
     url: str
     business_type: str
