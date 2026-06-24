@@ -604,26 +604,31 @@ For {request.target_industry} businesses in {request.target_city}, include:
             f"TARGET INDUSTRY: {request.target_industry} in {city}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
             f"{live_intel_block}"
-            "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8 (B2B Industry Campaign):\n\n"
+            "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
             "AUDIENCE STRATEGY:\n"
-            f"[3 segments: Owners, Managers, Decision-Makers of {request.target_industry} businesses in {city}. "
-            f"For each: age, gender, income, specific pain points in {request.target_industry} industry, what they search for, where they hang out online]\n\n"
-            "SAFE INDUSTRY STRATEGY:\n"
-            f"[WHERE TO FIND THESE BUSINESSES: Google Maps search terms, Instagram hashtags, local directories, FB groups for {request.target_industry} in {city}. "
-            f"Also include seasonal timing — when is {request.target_industry} industry most active/stressed in {city}]\n\n"
-            "COMPETITIVE ADVANTAGE STRATEGY:\n"
-            f"[OUTREACH SCRIPTS — write actual copy:\n"
-            f"WhatsApp Message 1 (pain point hook for {request.target_industry}):\n"
-            f"WhatsApp Message 2 (result/proof hook):\n"
+            f"[BUYER INTELLIGENCE — 3 segments: Owner, Manager, Director of {request.target_industry} businesses in {city}. "
+            f"For each: age, gender, income level, specific pain points in {request.target_industry}, "
+            f"what they search for online, where they hang out online, what triggers them to buy a service like yours]\n\n"
+            "LEAD SOURCES:\n"
+            f"[WHERE TO FIND {request.target_industry.upper()} BUSINESSES IN {city.upper()}:\n"
+            f"Google Maps search terms to find them:\n"
+            f"Instagram hashtags they use:\n"
+            f"Facebook groups they're in:\n"
+            f"Local directories and trade associations:\n"
+            f"Seasonal timing — when are they most stressed or spending in {city}:]\n\n"
+            "OUTREACH SCRIPTS:\n"
+            f"[Write actual ready-to-send copy:\n"
+            f"WhatsApp Message 1 — Pain point hook for {request.target_industry}:\n"
+            f"WhatsApp Message 2 — Result/proof hook:\n"
             f"Instagram DM Script (3-line opener that gets replies):\n"
-            f"Cold Call Opening (10-second pitch)]\n\n"
-            "CATEGORY DOMINATING STRATEGY:\n"
-            f"[PITCH & CLOSE:\n"
-            f"First Meeting Agenda (for {request.target_industry} owner):\n"
+            f"Cold Call Opening (10-second pitch):\n"
+            f"Objection 'We already have someone' → Response:]\n\n"
+            "PITCH & CLOSE:\n"
+            f"[First Meeting Agenda (for {request.target_industry} owner):\n"
             f"Key Questions to Ask:\n"
-            f"How to Handle 'We already have someone doing it':\n"
+            f"Top 2 Objections + exact responses:\n"
             f"Closing Offer (what to propose at end of meeting):\n"
-            f"Follow-up Sequence (Day 1, Day 3, Day 7)]"
+            f"Follow-up Sequence: Day 1 / Day 3 / Day 7:]"
         )
     else:
         prompt_b = (
@@ -640,31 +645,47 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "4. KABHI earn money, win cash language mat use karo.\n\n"
             "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
             "AUDIENCE STRATEGY:\n"
-            "[3 validated audience segments from audience intelligence — each with pain points, desires, triggers, evidence_backing. Reference validated_segments from BI]\n\n"
-            f"SAFE INDUSTRY STRATEGY:\n"
-            f"[Standard proven approach for {request.business_type}. Budget split: {bdgt}. Specific platforms, formats, offers that work reliably]\n\n"
-            "COMPETITIVE ADVANTAGE STRATEGY:\n"
-            "[Ads built on BI strengths and competitor gaps — use differentiators from threat data and positioning_gap. How to outperform competitors specifically]\n\n"
-            "CATEGORY DOMINATING STRATEGY:\n"
-            "[Positioning-led brand strategy to own the market category — use category_ownership_opportunity and winning_position from BI. The big bet]"
+            "[BUYER INTELLIGENCE — 3 validated segments from audience BI. "
+            "For each: age, gender, income level, specific pain points, what triggers purchase, "
+            "where they hang out online, what they search before buying. Reference validated_segments from BI]\n\n"
+            "LEAD SOURCES:\n"
+            f"[WHERE TO FIND BUYERS for {request.business_type}:\n"
+            "Online — platforms, communities, hashtags, Facebook groups they're in:\n"
+            "Offline — events, locations, associations, seasonal moments:\n"
+            "Google Maps search terms they use:\n"
+            "Best time of year / month / week to reach them:]\n\n"
+            "OUTREACH SCRIPTS:\n"
+            f"[Write actual ready-to-use copy for {request.business_type}:\n"
+            "WhatsApp Message 1 — Pain point hook:\n"
+            "WhatsApp Message 2 — Result/proof hook:\n"
+            "Instagram DM Script (3-line opener that gets replies):\n"
+            "Cold Outreach Email — subject line + first line:\n"
+            "Objection 'Not interested' → Response:]\n\n"
+            "PITCH & CLOSE:\n"
+            "[How to convert an interested lead into a paying customer:\n"
+            "Discovery call agenda:\n"
+            "Key qualifying questions:\n"
+            "Top 2 objections + exact responses:\n"
+            "Closing offer / call-to-action:\n"
+            "Follow-up Sequence: Day 1 / Day 3 / Day 7:]"
         )
 
     prompt_c = (
-        "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'FULL MARKETING PLAN' and only contain sections 9, 10, 11.\n\n"
+        "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'MARKETING PLAN' and only contain sections 9, 10, 11.\n\n"
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
         f"{business_critical}"
-        "Generate the complete marketing plan and ad assets. All recommendations must reference BI evidence.\n"
+        "Generate the marketing plan, ad assets, and media buying plan. All recommendations must reference BI evidence.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
         f"{live_intel_block}"
         "NEVER use the word Elevate in any headline, hook, or copy.\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
-        "FULL MARKETING PLAN:\n"
-        "Google Ads: [strategy, keywords, budget allocation, bidding]\n"
-        "Meta Ads: [audience targeting, creative direction, placement]\n"
-        "Remarketing: [3 specific retargeting sequences with triggers]\n"
-        "Landing Page: [3 specific optimizations based on BI data]\n\n"
+        "MARKETING PLAN:\n"
+        "Google Ads: [specific keywords, match types, bid strategy, budget split]\n"
+        "Meta Ads: [exact audience — age, gender, interests, behaviors, placements]\n"
+        "Remarketing: [3 retargeting sequences with triggers and copy angles]\n"
+        "Landing Page: [3 conversion optimizations based on BI data]\n\n"
         "AD ASSETS:\n"
         "Google Headlines (8, STRICT max 30 characters each):\n"
         "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n"
@@ -674,13 +695,16 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "1. []\n2. []\n3. []\n"
         "CTAs (3): []\n"
         "Creative Brief 1 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n"
-        "Creative Brief 2 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n"
-        "Video Concept: []\n\n"
-        "REVENUE RECOMMENDATIONS:\n"
-        "Highest ROI Action: [reference highest_roi_action from BI executive decisions]\n"
-        "Fastest Revenue Path: [based on best_platform and budget_efficiency from BI]\n"
-        "Best Offer Structure: [based on price_range and revenue_model from DNA]\n"
-        "Quick Wins (this week): [reference quick_wins from executive decisions]"
+        "Creative Brief 2 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n\n"
+        "MEDIA BUYING PLAN:\n"
+        f"Campaign Objective: [{request.goal} — explain why this fits the business]\n"
+        "Platform Priority: [1st: [] — why | 2nd: [] — why | 3rd: [] — why]\n"
+        f"Budget Split: [{bdgt} — exact rupee allocation per platform with reasoning]\n"
+        "Bid Strategy: [recommended bid strategy + why it fits this business and goal]\n"
+        "Launch Plan: [recommended launch date, what to set up first, first 7 days checklist]\n"
+        "Scaling Rules: [when to scale — conditions, by how much %, safe vs aggressive thresholds]\n"
+        "Pause Rules: [exact conditions — CTR below X%, no conversions after Y days, CPC above Z]\n"
+        "Benchmarks: [CTR range, CPC range, CPL range, conversion rate range for this industry]"
     )
 
     prompt_guide = (
@@ -727,33 +751,31 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "COMPETITOR INSIGHTS:", "POSITIONING STRATEGY:",
     ])
     b_parts = split_by_headers(section_b, [
-        "AUDIENCE STRATEGY:", "SAFE INDUSTRY STRATEGY:",
-        "COMPETITIVE ADVANTAGE STRATEGY:", "CATEGORY DOMINATING STRATEGY:",
+        "AUDIENCE STRATEGY:", "LEAD SOURCES:", "OUTREACH SCRIPTS:", "PITCH & CLOSE:",
     ])
     c_parts = split_by_headers(section_c, [
-        "FULL MARKETING PLAN:", "AD ASSETS:", "REVENUE RECOMMENDATIONS:",
+        "MARKETING PLAN:", "AD ASSETS:", "MEDIA BUYING PLAN:",
     ])
     # Strip any repeated sections 1-4 content from section_c in case AI ignored the instruction
     _dupe_headers = ["BUSINESS UNDERSTANDING:", "MARKET UNDERSTANDING:", "COMPETITOR INSIGHTS:", "POSITIONING STRATEGY:"]
     for _dh in _dupe_headers:
         _m = re.search(re.escape(_dh), section_c, re.I)
-        _plan_m = re.search(re.escape("FULL MARKETING PLAN:"), section_c, re.I)
+        _plan_m = re.search(re.escape("MARKETING PLAN:"), section_c, re.I)
         if _m and _plan_m and _m.start() < _plan_m.start():
-            # AI put dupe content before the real section — trim it off at FULL MARKETING PLAN
             section_c = section_c[_plan_m.start():]
             c_parts = split_by_headers(section_c, [
-                "FULL MARKETING PLAN:", "AD ASSETS:", "REVENUE RECOMMENDATIONS:",
+                "MARKETING PLAN:", "AD ASSETS:", "MEDIA BUYING PLAN:",
             ])
             break
 
     # Secondary cleanup: strip leaked section 1-4 content from the parsed marketing_plan value
-    _mplan = c_parts.get("FULL MARKETING PLAN:", section_c)
+    _mplan = c_parts.get("MARKETING PLAN:", section_c)
     if re.search(r'BUSINESS UNDERSTANDING:', _mplan, re.I):
-        _anchor = re.search(r'(?:FULL MARKETING PLAN:|Google Ads:)', _mplan, re.I)
+        _anchor = re.search(r'(?:MARKETING PLAN:|Google Ads:)', _mplan, re.I)
         if _anchor:
             _trimmed = _mplan[_anchor.start():]
-            _fmp_header = re.match(r'FULL MARKETING PLAN:\s*', _trimmed, re.I)
-            c_parts["FULL MARKETING PLAN:"] = (_trimmed[_fmp_header.end():] if _fmp_header else _trimmed).strip()
+            _fmp_header = re.match(r'MARKETING PLAN:\s*', _trimmed, re.I)
+            c_parts["MARKETING PLAN:"] = (_trimmed[_fmp_header.end():] if _fmp_header else _trimmed).strip()
 
     try:
         report = ReportModel(
@@ -780,17 +802,17 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "ad_guide":       ad_guide,
         # New 11-section structure
         "sections": {
-            "business_understanding":  a_parts.get("BUSINESS UNDERSTANDING:", section_a),
-            "market_understanding":    a_parts.get("MARKET UNDERSTANDING:", ""),
-            "competitor_insights":     a_parts.get("COMPETITOR INSIGHTS:", ""),
-            "positioning_strategy":    a_parts.get("POSITIONING STRATEGY:", ""),
-            "audience_strategy":       b_parts.get("AUDIENCE STRATEGY:", section_b),
-            "safe_strategy":           b_parts.get("SAFE INDUSTRY STRATEGY:", ""),
-            "competitive_advantage":   b_parts.get("COMPETITIVE ADVANTAGE STRATEGY:", ""),
-            "category_dominating":     b_parts.get("CATEGORY DOMINATING STRATEGY:", ""),
-            "marketing_plan":          c_parts.get("FULL MARKETING PLAN:", section_c),
-            "ad_assets":               c_parts.get("AD ASSETS:", ""),
-            "revenue_recommendations": c_parts.get("REVENUE RECOMMENDATIONS:", ""),
+            "business_understanding": a_parts.get("BUSINESS UNDERSTANDING:", section_a),
+            "market_understanding":   a_parts.get("MARKET UNDERSTANDING:", ""),
+            "competitor_insights":    a_parts.get("COMPETITOR INSIGHTS:", ""),
+            "positioning_strategy":   a_parts.get("POSITIONING STRATEGY:", ""),
+            "audience_strategy":      b_parts.get("AUDIENCE STRATEGY:", section_b),
+            "lead_sources":           b_parts.get("LEAD SOURCES:", ""),
+            "outreach_scripts":       b_parts.get("OUTREACH SCRIPTS:", ""),
+            "pitch_close":            b_parts.get("PITCH & CLOSE:", ""),
+            "marketing_plan":         c_parts.get("MARKETING PLAN:", section_c),
+            "ad_assets":              c_parts.get("AD ASSETS:", ""),
+            "media_buying_plan":      c_parts.get("MEDIA BUYING PLAN:", ""),
         },
         "bi_data":        bi_data,
         "bi_cached":      bi_cached,
