@@ -658,6 +658,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         f"{industry_context}"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
         f"{live_intel_block}"
+        "NEVER use the word Elevate in any headline, hook, or copy.\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
         "FULL MARKETING PLAN:\n"
         "Google Ads: [strategy, keywords, budget allocation, bidding]\n"
@@ -1512,7 +1513,7 @@ class MediaBuyingRequest(BaseModel):
 @app.post("/media-buying-plan")
 async def media_buying_plan(request: MediaBuyingRequest):
     system_prompt = (
-        "You are the Media Buying Engine inside Sohscape Intelligence. You are an expert Media Buyer. "
+        "You are an expert Media Buyer. "
         "You have access to the business intelligence data and marketing strategy provided below.\n\n"
         "Using the BI data and marketing context, generate a complete media buying plan with these 13 sections:\n\n"
         "1. CAMPAIGN OBJECTIVE: — Primary goal and why (Lead Gen / Sales / Awareness / etc.)\n"
