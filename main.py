@@ -517,14 +517,17 @@ For {request.target_industry} businesses in {request.target_city}, include:
     tavily_market = ""
     live_data_used = False
     if TAVILY_API_KEY:
-        city_for_tavily = request.target_city or "India"
+        city_for_tavily = request.target_city or "Jaipur"
         q_competitors = (
-            f"Top competitors of {request.business_type} in {city_for_tavily} "
-            f"2026 real company names strengths weaknesses"
+            f"List actual {request.business_type} companies and "
+            f"{request.business_type} providers operating in {city_for_tavily} India 2026. "
+            f"Include local players, not just WeWork or Regus. "
+            f"Give company names, locations, pricing if available."
         )
         q_market = (
-            f"{request.business_type} industry market trends digital marketing "
-            f"India 2026 consumer behavior advertising"
+            f"Digital marketing strategies working for {request.business_type} businesses "
+            f"in {city_for_tavily} India in 2026. "
+            f"What platforms, what content, what offers are getting results right now."
         )
         logger.info(f"[FULL-REPORT] Fetching Tavily data for: {request.business_type}")
         tavily_competitors, tavily_market = await asyncio.gather(
