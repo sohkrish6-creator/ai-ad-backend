@@ -616,13 +616,13 @@ For {request.target_industry} businesses in {request.target_city}, include:
         )
 
     prompt_c = (
+        "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'FULL MARKETING PLAN' and only contain sections 9, 10, 11.\n\n"
         "You are the Marketing Brain inside Sohscape Intelligence.\n"
         "Generate the complete marketing plan and ad assets. All recommendations must reference BI evidence.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
         f"{live_intel_block}"
-        "CRITICAL: Do NOT repeat Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy — those are already covered in sections 1-4. Start DIRECTLY with FULL MARKETING PLAN.\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
         "FULL MARKETING PLAN:\n"
         "Google Ads: [strategy, keywords, budget allocation, bidding]\n"
@@ -709,6 +709,15 @@ For {request.target_industry} businesses in {request.target_city}, include:
                 "FULL MARKETING PLAN:", "AD ASSETS:", "REVENUE RECOMMENDATIONS:",
             ])
             break
+
+    # Secondary cleanup: strip leaked section 1-4 content from the parsed marketing_plan value
+    _mplan = c_parts.get("FULL MARKETING PLAN:", section_c)
+    if re.search(r'BUSINESS UNDERSTANDING:', _mplan, re.I):
+        _anchor = re.search(r'(?:FULL MARKETING PLAN:|Google Ads:)', _mplan, re.I)
+        if _anchor:
+            _trimmed = _mplan[_anchor.start():]
+            _fmp_header = re.match(r'FULL MARKETING PLAN:\s*', _trimmed, re.I)
+            c_parts["FULL MARKETING PLAN:"] = (_trimmed[_fmp_header.end():] if _fmp_header else _trimmed).strip()
 
     try:
         report = ReportModel(
