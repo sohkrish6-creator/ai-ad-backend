@@ -207,40 +207,43 @@ def _normalize_biz_key(url: str, industry: str = "", city: str = "") -> str:
         return k
     return f"{industry}::{city}".lower()
 
-def save_to_memory(table_key: str, business_key: str, data: dict):
-    """Upsert data into a memory table. Logs errors but never raises."""
+def save_to_memory(table_key: str, business_key: str, data: dict) -> tuple:
+    """
+    Upsert data into a memory table.
+    Returns (success: bool, error: str | None).
+    Never raises — all errors are caught, logged at ERROR level with full traceback.
+    """
+    import traceback as _tb
     table = _MEMORY_TABLES.get(table_key)
     if not table:
-        logger.warning(f"[MEMORY] Unknown table key: {table_key}")
-        return
+        msg = f"Unknown table key: {table_key!r}"
+        logger.error(f"[MEMORY] save_to_memory: {msg}")
+        return (False, msg)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Serialize dicts/lists; drop None values
     data = {k: _json_val(v) for k, v in data.items() if v is not None}
-    if not data:
-        # Nothing to save beyond the key itself — still upsert the row so the key exists
-        data = {}
     cols   = ["business_key", "updated_at"] + list(data.keys())
     vals   = [business_key, now] + list(data.values())
     params = {f"p{i}": v for i, v in enumerate(vals)}
     placeholders = ", ".join(f":p{i}" for i in range(len(vals)))
     col_str      = ", ".join(cols)
-    # Build update pairs — include updated_at, plus all data columns
-    update_parts = [f"updated_at = :p1"]
-    update_parts += [f"{c} = :p{i+2}" for i, c in enumerate(data.keys())]
+    update_parts = ["updated_at = :p1"] + [f"{c} = :p{i+2}" for i, c in enumerate(data.keys())]
     update_pairs = ", ".join(update_parts)
     sql = f"""
         INSERT INTO {table} ({col_str}, created_at)
         VALUES ({placeholders}, :p1)
         ON CONFLICT(business_key) DO UPDATE SET {update_pairs}
     """
+    logger.info(f"[MEMORY] Attempting save: table={table} key={business_key!r} cols={cols}")
     try:
         with engine.connect() as conn:
             conn.execute(text(sql), params)
             conn.commit()
-        logger.info(f"[MEMORY] Saved {table_key} for key={business_key!r}")
+        logger.info(f"[MEMORY] SUCCESS: table={table} key={business_key!r}")
+        return (True, None)
     except Exception as _e:
-        import traceback
-        logger.error(f"[MEMORY] save_to_memory({table_key}) FAILED for key={business_key!r}: {_e}\n{traceback.format_exc()}")
+        err = f"{type(_e).__name__}: {_e}"
+        logger.error(f"[MEMORY] FAILED: table={table} key={business_key!r}\n{err}\n{_tb.format_exc()}")
+        return (False, err)
 
 def get_memory(business_key: str) -> dict:
     """Return all stored memory for a business across all 5 tables as one dict."""
@@ -1188,63 +1191,51 @@ For {request.target_industry} businesses in {request.target_city}, include:
         logger.warning(f"[REPORTS] Could not save full-report: {_re}")
         db.rollback()
 
-    # ── Memory Save (fire-and-forget, after response is assembled) ────────────
-    def _save_memory_sync():
-        _sections = {
-            "business_understanding": a_parts.get("BUSINESS UNDERSTANDING:", ""),
-            "market_understanding":   a_parts.get("MARKET UNDERSTANDING:", ""),
-            "competitor_insights":    a_parts.get("COMPETITOR INSIGHTS:", ""),
-            "positioning_strategy":   a_parts.get("POSITIONING STRATEGY:", ""),
-            "audience_strategy":      b_parts.get("AUDIENCE STRATEGY:", ""),
-        }
-        _dna  = bi_data.get("business_dna", {})  if bi_data else {}
-        _opp  = bi_data.get("opportunity_score", {}) if bi_data else {}
-        _aud  = bi_data.get("audience_intelligence", {}) if bi_data else {}
-        _thr  = bi_data.get("threat_intelligence", {}) if bi_data else {}
-        _scores = bi_data.get("scores", {}) if bi_data else {}
+    # ── Memory Save ───────────────────────────────────────────────────────────
+    logger.info(f"[MEMORY] Starting saves for key={_mem_key!r}")
+    _dna    = bi_data.get("business_dna", {})           if bi_data else {}
+    _opp    = bi_data.get("opportunity", {})             if bi_data else {}
+    _aud    = bi_data.get("audience_intelligence", {})   if bi_data else {}
+    _thr    = bi_data.get("threat_intelligence", {})     if bi_data else {}
+    _scores = bi_data.get("scores", {})                  if bi_data else {}
 
-        # business_memory
-        save_to_memory("business", _mem_key, {
-            "business_name":     _dna.get("business_name") or request.business_type,
-            "industry":          _dna.get("detected_industry") or request.business_type,
-            "city":              request.target_city,
-            "business_dna":      _dna,
-            "uvp":               _dna.get("value_proposition") or _dna.get("uvp"),
-            "positioning":       _dna.get("positioning_statement"),
-            "brand_score":       _scores.get("brand_strength"),
-            "trust_score":       _scores.get("trust_score"),
-            "opportunity_score": _scores.get("opportunity_score"),
-        })
-        # market_memory
-        save_to_memory("market", _mem_key, {
-            "market_size":        str(_opp.get("market_size", "")),
-            "growth":             str(_opp.get("market_growth", "")),
-            "trends":             _opp.get("trending_opportunities"),
-            "seasonality":        _opp.get("seasonal_patterns"),
-            "competition_level":  str(_thr.get("competition_level") or _scores.get("market_saturation", "")),
-            "market_gap":         str(_opp.get("market_gap") or _opp.get("market_opportunity_reason", "")),
-        })
-        # competitor_memory — extract names from threat intelligence
-        _comp_list = []
-        if _thr.get("key_threats"):
-            for t in (_thr["key_threats"] if isinstance(_thr.get("key_threats"), list) else []):
-                if isinstance(t, dict):
-                    name = t.get("competitor") or t.get("name")
-                    if name:
-                        _comp_list.append(name)
-                elif isinstance(t, str):
-                    _comp_list.append(t)
-        if request.competitor_name:
-            _comp_list = [request.competitor_name] + _comp_list
-        save_to_memory("competitor", _mem_key, {"competitors": list(dict.fromkeys(_comp_list))[:10]})
-        # audience_memory
-        _segs = _aud.get("validated_segments") or _aud.get("segments") or []
-        save_to_memory("audience", _mem_key, {"segments": _segs})
+    _ok1, _err1 = save_to_memory("business", _mem_key, {
+        "business_name":     _dna.get("business_name") or request.business_type,
+        "industry":          _dna.get("detected_industry") or request.business_type,
+        "city":              request.target_city,
+        "business_dna":      _dna or None,
+        "uvp":               _dna.get("value_proposition") or _dna.get("uvp"),
+        "positioning":       _dna.get("positioning_statement"),
+        "brand_score":       _scores.get("brand_strength"),
+        "trust_score":       _scores.get("trust_score"),
+        "opportunity_score": _scores.get("opportunity_score"),
+    })
+    logger.info(f"[MEMORY] business save: {'OK' if _ok1 else 'FAIL ' + str(_err1)}")
 
-    try:
-        _save_memory_sync()
-    except Exception as _sme:
-        logger.warning(f"[MEMORY] Background save failed: {_sme}")
+    _ok2, _err2 = save_to_memory("market", _mem_key, {
+        "market_size":       str(_opp.get("market_size", "") or ""),
+        "growth":            str(_opp.get("market_growth", "") or ""),
+        "trends":            _opp.get("trending_opportunities") or None,
+        "seasonality":       _opp.get("seasonal_patterns") or None,
+        "competition_level": str(_thr.get("competition_level") or _scores.get("market_saturation") or ""),
+        "market_gap":        str(_opp.get("market_gap") or _opp.get("market_opportunity_reason") or ""),
+    })
+    logger.info(f"[MEMORY] market save: {'OK' if _ok2 else 'FAIL ' + str(_err2)}")
+
+    _comp_list = []
+    if isinstance(_thr.get("key_threats"), list):
+        for _t in _thr["key_threats"]:
+            _n = (_t.get("competitor") or _t.get("name")) if isinstance(_t, dict) else (_t if isinstance(_t, str) else None)
+            if _n:
+                _comp_list.append(_n)
+    if request.competitor_name:
+        _comp_list = [request.competitor_name] + _comp_list
+    _ok3, _err3 = save_to_memory("competitor", _mem_key, {"competitors": list(dict.fromkeys(_comp_list))[:10]})
+    logger.info(f"[MEMORY] competitor save: {'OK' if _ok3 else 'FAIL ' + str(_err3)}")
+
+    _segs = _aud.get("validated_segments") or _aud.get("segments") or []
+    _ok4, _err4 = save_to_memory("audience", _mem_key, {"segments": _segs or None})
+    logger.info(f"[MEMORY] audience save: {'OK' if _ok4 else 'FAIL ' + str(_err4)}")
 
     return {
         "success": True,
@@ -2558,20 +2549,46 @@ async def google_ads_daily(days: int = 30):
 
 @app.get("/memory")
 async def read_memory(business_key: str):
-    """Return all stored memory for a business_key. Normalizes the key (strips https://)."""
+    """Return all stored memory. Normalizes the key (strips https://)."""
     normalized = _normalize_biz_key(business_key)
     mem = get_memory(normalized)
     return {"success": bool(mem), "business_key_raw": business_key, "business_key_normalized": normalized, "memory": mem}
 
-@app.post("/memory/test")
-async def test_memory_save():
-    """Debug endpoint: writes a test row and immediately reads it back."""
-    test_key = "__memory_test__"
-    save_to_memory("business", test_key, {
-        "business_name": "Test Business",
-        "uvp": "Test UVP",
-        "positioning": "Test Positioning",
-        "business_dna": {"detected_industry": "Test Industry", "value_proposition": "Test UVP"},
+@app.get("/memory/selftest")
+async def memory_selftest():
+    """
+    Isolation test: attempts save_to_memory then reads back immediately.
+    Returns the exact error string if anything fails — no swallowing.
+    """
+    test_key = "testkey123"
+    save_ok, save_err = save_to_memory("business", test_key, {
+        "business_name": "Test",
+        "industry":      "Test",
+        "city":          "Test",
+        "uvp":           "test uvp",
     })
-    mem = get_memory(test_key)
-    return {"saved": bool(mem), "memory": mem}
+    read_back = get_memory(test_key)
+    return {
+        "save_attempted": True,
+        "save_ok":        save_ok,
+        "save_error":     save_err,
+        "read_back":      read_back,
+        "tables_in_db":   _list_memory_tables(),
+    }
+
+def _list_memory_tables() -> list:
+    """Return which memory tables actually exist in the DB right now."""
+    try:
+        with engine.connect() as conn:
+            if _is_sqlite:
+                rows = conn.execute(text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%memory%'"
+                )).fetchall()
+            else:
+                rows = conn.execute(text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name LIKE '%memory%'"
+                )).fetchall()
+        return [r[0] for r in rows]
+    except Exception as _e:
+        return [f"ERROR: {_e}"]
