@@ -144,6 +144,13 @@ CREATE TABLE IF NOT EXISTS campaign_memory (
     created_at    TEXT,
     updated_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS opportunity_memory (
+    id                BIGSERIAL PRIMARY KEY,
+    business_key      TEXT UNIQUE NOT NULL,
+    opportunity_data  TEXT,
+    created_at        TEXT,
+    updated_at        TEXT
+);
 """
 
 def _create_memory_tables():
@@ -153,7 +160,7 @@ def _create_memory_tables():
     drop and recreate them — they are always empty if saves were failing.
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
-                           "audience_memory", "campaign_memory"]
+                           "audience_memory", "campaign_memory", "opportunity_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -188,11 +195,12 @@ except Exception as _me:
 
 # ── Memory helpers ───────────────────────────────────────────────────────────
 _MEMORY_TABLES = {
-    "business":   "business_memory",
-    "market":     "market_memory",
-    "competitor": "competitor_memory",
-    "audience":   "audience_memory",
-    "campaign":   "campaign_memory",
+    "business":    "business_memory",
+    "market":      "market_memory",
+    "competitor":  "competitor_memory",
+    "audience":    "audience_memory",
+    "campaign":    "campaign_memory",
+    "opportunity": "opportunity_memory",
 }
 
 def _json_val(v):
@@ -2616,4 +2624,144 @@ async def debug_db():
         "connected":  connected,
         "error":      error,
         "env_var_set": os.getenv("DATABASE_URL") is not None,
+    }
+
+# ── Opportunity Engine ────────────────────────────────────────────────────────
+
+class OpportunityEngineRequest(BaseModel):
+    business_key: str
+    industry: str = ""
+    city: str = ""
+    budget: int = 0
+
+@app.post("/opportunity-engine")
+async def opportunity_engine(request: OpportunityEngineRequest):
+    norm_key = _normalize_biz_key(request.business_key, request.industry, request.city)
+    memory   = get_memory(norm_key)
+
+    if not memory:
+        return {
+            "success": False,
+            "memory_used": False,
+            "message": (
+                "No memory found for this business. "
+                "Run Marketing Brain (/full-report) for this business first "
+                "so the Opportunity Engine has data to analyze."
+            ),
+        }
+
+    # ── Build memory context string ──────────────────────────────────────────
+    bm = memory.get("business", {})
+    mm = memory.get("market", {})
+    cm = memory.get("competitor", {})
+    am = memory.get("audience", {})
+
+    ctx_parts = []
+    if bm.get("business_name"): ctx_parts.append(f"Business: {bm['business_name']}")
+    if bm.get("industry"):      ctx_parts.append(f"Industry: {bm['industry']}")
+    if bm.get("city"):          ctx_parts.append(f"City: {bm['city']}")
+    if bm.get("uvp"):           ctx_parts.append(f"UVP: {bm['uvp']}")
+    if bm.get("positioning"):   ctx_parts.append(f"Positioning: {bm['positioning']}")
+    if bm.get("brand_score"):   ctx_parts.append(f"Brand Score: {bm['brand_score']}")
+    if bm.get("trust_score"):   ctx_parts.append(f"Trust Score: {bm['trust_score']}")
+    if bm.get("opportunity_score"): ctx_parts.append(f"Opportunity Score: {bm['opportunity_score']}")
+
+    if mm.get("market_size"):       ctx_parts.append(f"Market Size: {mm['market_size']}")
+    if mm.get("growth"):            ctx_parts.append(f"Market Growth: {mm['growth']}")
+    if mm.get("market_gap"):        ctx_parts.append(f"Market Gap: {mm['market_gap']}")
+    if mm.get("competition_level"): ctx_parts.append(f"Competition Level: {mm['competition_level']}")
+    if mm.get("trends"):
+        t = mm["trends"]
+        ctx_parts.append(f"Trends: {json.dumps(t) if isinstance(t, (dict, list)) else t}")
+
+    if cm.get("competitors"):
+        comps = cm["competitors"]
+        ctx_parts.append(f"Known Competitors: {', '.join(comps) if isinstance(comps, list) else comps}")
+
+    if am.get("segments"):
+        segs = am["segments"]
+        ctx_parts.append(f"Audience Segments: {json.dumps(segs) if isinstance(segs, (dict, list)) else segs}")
+
+    if request.budget:
+        ctx_parts.append(f"Monthly Budget: ₹{request.budget:,}")
+    if request.industry:
+        ctx_parts.append(f"Industry (user-specified): {request.industry}")
+    if request.city:
+        ctx_parts.append(f"City (user-specified): {request.city}")
+
+    memory_context = "\n".join(ctx_parts)
+
+    # ── GPT-4o call ──────────────────────────────────────────────────────────
+    prompt = f"""You are a senior growth strategist. Analyze this business's stored data and identify the highest-ROI opportunities.
+
+BUSINESS DATA (from Adsoh memory system):
+{memory_context}
+
+Your job: decide where this specific business should focus FIRST to get the fastest, highest return.
+
+RULES:
+- Be specific to THIS business. Reference actual segments, competitors, and gaps from the data above.
+- No generic advice. Every recommendation must cite evidence from the data.
+- BANNED WORDS: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer.
+- Revenue potential: "High" = can 2x revenue in 3 months, "Medium" = 30-50% lift, "Low" = < 30% lift.
+- Priority score 0-100: 90+ = do this week, 70-89 = do this month, below 70 = plan for later.
+
+Respond ONLY with a valid JSON object — no markdown, no explanation, just the JSON:
+
+{{
+  "highest_roi_audience": {{
+    "segment": "exact segment name from the data",
+    "why": "specific reason citing evidence",
+    "priority_score": 0
+  }},
+  "highest_roi_offer": {{
+    "offer": "specific offer or product/service to push",
+    "why": "specific reason citing evidence",
+    "revenue_potential": "High|Medium|Low"
+  }},
+  "highest_roi_platform": {{
+    "platform": "exact platform name",
+    "why": "specific reason citing evidence"
+  }},
+  "highest_roi_location": {{
+    "area": "specific area or locality",
+    "why": "specific reason citing evidence"
+  }},
+  "quick_wins": [
+    "Specific action 1 — can be done this week",
+    "Specific action 2 — can be done this week",
+    "Specific action 3 — can be done this week"
+  ],
+  "biggest_opportunity": {{
+    "opportunity": "the single biggest untapped opportunity",
+    "why": "specific reason citing evidence from the data",
+    "expected_impact": "specific measurable impact"
+  }},
+  "what_to_do_first": "One clear sentence — the single most important action this business must take right now.",
+  "confidence": 0
+}}"""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=1200,
+            temperature=0.4,
+        )
+        raw = resp.choices[0].message.content.strip()
+        opportunity = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[OPPORTUNITY ENGINE] GPT call failed: {_e}")
+        return {"success": False, "memory_used": True, "error": str(_e)}
+
+    # ── Save to opportunity_memory ────────────────────────────────────────────
+    save_to_memory("opportunity", norm_key, {"opportunity_data": opportunity})
+
+    return {
+        "success":      True,
+        "memory_used":  True,
+        "business_key": norm_key,
+        "opportunity":  opportunity,
     }
