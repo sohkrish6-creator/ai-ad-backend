@@ -35,6 +35,7 @@ app.add_middleware(
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
@@ -394,6 +395,168 @@ async def fetch_tavily(query: str) -> str:
             return "\n".join(snippets)
     except Exception:
         return ""
+
+async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
+    if not YOUTUBE_API_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "key": YOUTUBE_API_KEY,
+                    "q": query,
+                    "part": "snippet",
+                    "type": "video",
+                    "order": "viewCount",
+                    "maxResults": max_results,
+                    "relevanceLanguage": "en",
+                },
+            )
+            data = resp.json()
+            items = data.get("items", [])
+            return [
+                {
+                    "videoId":     item["id"]["videoId"],
+                    "title":       item["snippet"]["title"],
+                    "channel":     item["snippet"]["channelTitle"],
+                    "publishedAt": item["snippet"]["publishedAt"][:10],
+                    "thumbnail":   item["snippet"]["thumbnails"].get("medium", {}).get("url", ""),
+                }
+                for item in items
+                if item.get("id", {}).get("videoId")
+            ]
+    except Exception:
+        return []
+
+async def fetch_youtube_video_stats(video_ids: list) -> list:
+    if not YOUTUBE_API_KEY or not video_ids:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={
+                    "key": YOUTUBE_API_KEY,
+                    "id": ",".join(video_ids),
+                    "part": "statistics,snippet",
+                },
+            )
+            data = resp.json()
+            results = []
+            for item in data.get("items", []):
+                stats = item.get("statistics", {})
+                snippet = item.get("snippet", {})
+                results.append({
+                    "videoId":      item["id"],
+                    "title":        snippet.get("title", ""),
+                    "channel":      snippet.get("channelTitle", ""),
+                    "publishedAt":  snippet.get("publishedAt", "")[:10],
+                    "views":        int(stats.get("viewCount", 0)),
+                    "likes":        int(stats.get("likeCount", 0)),
+                    "comments":     int(stats.get("commentCount", 0)),
+                })
+            return sorted(results, key=lambda x: x["views"], reverse=True)
+    except Exception:
+        return []
+
+class YoutubeIntelligenceRequest(BaseModel):
+    industry: str
+    city: str = ""
+    topic: str = ""
+
+@app.post("/youtube-intelligence")
+async def youtube_intelligence(request: YoutubeIntelligenceRequest):
+    if not YOUTUBE_API_KEY:
+        return {"success": False, "error": "YouTube API not configured"}
+
+    city_part  = f" {request.city}" if request.city else ""
+    topic_part = f" {request.topic}" if request.topic else "marketing reels viral"
+    query      = f"{request.industry}{city_part} {topic_part}"
+
+    videos = await fetch_youtube_search(query, max_results=10)
+    if not videos:
+        return {"success": False, "error": "YouTube search returned no results. Check API key or quota."}
+
+    video_ids     = [v["videoId"] for v in videos]
+    video_stats   = await fetch_youtube_video_stats(video_ids)
+
+    stats_map = {v["videoId"]: v for v in video_stats}
+    top_videos = []
+    for v in videos:
+        s = stats_map.get(v["videoId"], {})
+        top_videos.append({
+            "videoId":     v["videoId"],
+            "title":       s.get("title") or v["title"],
+            "channel":     s.get("channel") or v["channel"],
+            "publishedAt": s.get("publishedAt") or v["publishedAt"],
+            "views":       s.get("views", 0),
+            "likes":       s.get("likes", 0),
+            "comments":    s.get("comments", 0),
+            "url":         f"https://www.youtube.com/watch?v={v['videoId']}",
+        })
+    top_videos.sort(key=lambda x: x["views"], reverse=True)
+
+    video_list_txt = "\n".join([
+        f"{i+1}. \"{v['title']}\" — {v['channel']} — {v['views']:,} views ({v['publishedAt']})"
+        for i, v in enumerate(top_videos)
+    ])
+
+    prompt = (
+        f"You are a YouTube content strategist for Indian businesses.\n"
+        f"Industry: {request.industry} | City: {request.city or 'India'} | Topic focus: {request.topic or 'marketing & content'}\n\n"
+        f"TOP PERFORMING YOUTUBE VIDEOS IN THIS NICHE (real data):\n{video_list_txt}\n\n"
+        "Analyze these real results and generate THREE outputs. Be specific to the industry and city. "
+        "No generic advice. Base insights on actual patterns in the titles above.\n\n"
+        "TRENDING CONTENT IDEAS:\n"
+        f"[Generate 8 specific video content ideas for {request.industry} businesses"
+        f"{f' in {request.city}' if request.city else ''}. "
+        "Each idea: Topic (specific angle) | Format (Reel/Short/Tutorial/Vlog/Case Study) | Why it will work (based on the top videos above). "
+        "Number them 1-8. No asterisks. Plain text.]\n\n"
+        "VIRAL HOOKS:\n"
+        f"[Write 10 hook lines / video title templates adapted from the top-performing titles above, "
+        f"rewritten for {request.industry} businesses in India. "
+        "Each hook should be punchy, curiosity-driven, and ready to use as a YouTube title or Reel opening line. "
+        "Number them 1-10. Keep each under 70 characters. No asterisks.]\n\n"
+        "COMPETITOR INSIGHTS:\n"
+        f"[Write 3-4 paragraphs analyzing: "
+        "1) What content FORMATS appear most (shorts vs long, tutorial vs vlog vs talking head), "
+        "2) What TOPICS and angles are driving the most views, "
+        "3) What these top creators are doing RIGHT that this business should copy, "
+        "4) One clear CONTENT STRATEGY recommendation for this industry based on the data above. "
+        "Be specific — name actual patterns you see in the titles, not generic advice.]"
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+        max_tokens=2500,
+    )
+    ai_text = resp.choices[0].message.content.strip()
+
+    def extract_section(text, start_marker, end_marker=None):
+        start = text.find(start_marker)
+        if start == -1:
+            return ""
+        start += len(start_marker)
+        if end_marker:
+            end = text.find(end_marker, start)
+            return text[start:end].strip() if end != -1 else text[start:].strip()
+        return text[start:].strip()
+
+    content_ideas     = extract_section(ai_text, "TRENDING CONTENT IDEAS:", "VIRAL HOOKS:")
+    viral_hooks       = extract_section(ai_text, "VIRAL HOOKS:", "COMPETITOR INSIGHTS:")
+    competitor_insights = extract_section(ai_text, "COMPETITOR INSIGHTS:")
+
+    return {
+        "success":              True,
+        "query":                query,
+        "top_videos":           top_videos,
+        "content_ideas":        content_ideas or ai_text,
+        "viral_hooks":          viral_hooks,
+        "competitor_insights":  competitor_insights,
+    }
 
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
