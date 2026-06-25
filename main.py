@@ -151,6 +151,13 @@ CREATE TABLE IF NOT EXISTS opportunity_memory (
     created_at        TEXT,
     updated_at        TEXT
 );
+CREATE TABLE IF NOT EXISTS offer_memory (
+    id           BIGSERIAL PRIMARY KEY,
+    business_key TEXT UNIQUE NOT NULL,
+    offer_data   TEXT,
+    created_at   TEXT,
+    updated_at   TEXT
+);
 """
 
 def _create_memory_tables():
@@ -160,7 +167,8 @@ def _create_memory_tables():
     drop and recreate them — they are always empty if saves were failing.
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
-                           "audience_memory", "campaign_memory", "opportunity_memory"]
+                           "audience_memory", "campaign_memory", "opportunity_memory",
+                           "offer_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -201,6 +209,7 @@ _MEMORY_TABLES = {
     "audience":    "audience_memory",
     "campaign":    "campaign_memory",
     "opportunity": "opportunity_memory",
+    "offer":       "offer_memory",
 }
 
 def _json_val(v):
@@ -2764,4 +2773,135 @@ Respond ONLY with a valid JSON object — no markdown, no explanation, just the 
         "memory_used":  True,
         "business_key": norm_key,
         "opportunity":  opportunity,
+    }
+
+# ── Offer Intelligence ────────────────────────────────────────────────────────
+
+class OfferIntelligenceRequest(BaseModel):
+    business_key: str
+    industry: str = ""
+    city: str = ""
+
+@app.post("/offer-intelligence")
+async def offer_intelligence(request: OfferIntelligenceRequest):
+    norm_key = _normalize_biz_key(request.business_key, request.industry, request.city)
+    memory   = get_memory(norm_key)
+
+    if not memory:
+        return {
+            "success": False,
+            "memory_used": False,
+            "message": (
+                "No memory found for this business. "
+                "Run Marketing Brain (/full-report) first so the Offer Intelligence engine has data to analyze."
+            ),
+        }
+
+    # ── Build memory context ─────────────────────────────────────────────────
+    bm  = memory.get("business", {})
+    mm  = memory.get("market", {})
+    cm  = memory.get("competitor", {})
+    am  = memory.get("audience", {})
+    opm = memory.get("opportunity", {})
+
+    ctx = []
+    if bm.get("business_name"): ctx.append(f"Business: {bm['business_name']}")
+    if bm.get("industry"):      ctx.append(f"Industry: {bm['industry']}")
+    if bm.get("city"):          ctx.append(f"City: {bm['city']}")
+    if bm.get("uvp"):           ctx.append(f"UVP: {bm['uvp']}")
+    if bm.get("positioning"):   ctx.append(f"Positioning: {bm['positioning']}")
+    if mm.get("market_gap"):    ctx.append(f"Market Gap: {mm['market_gap']}")
+    if mm.get("competition_level"): ctx.append(f"Competition Level: {mm['competition_level']}")
+    if mm.get("trends"):
+        t = mm["trends"]
+        ctx.append(f"Market Trends: {json.dumps(t) if isinstance(t, (dict, list)) else t}")
+    if cm.get("competitors"):
+        comps = cm["competitors"]
+        ctx.append(f"Competitors: {', '.join(comps) if isinstance(comps, list) else comps}")
+    if am.get("segments"):
+        segs = am["segments"]
+        ctx.append(f"Audience Segments: {json.dumps(segs) if isinstance(segs, (dict, list)) else segs}")
+    if opm.get("opportunity_data"):
+        od = opm["opportunity_data"]
+        if isinstance(od, dict):
+            if od.get("highest_roi_audience"): ctx.append(f"Highest-ROI Audience: {json.dumps(od['highest_roi_audience'])}")
+            if od.get("biggest_opportunity"):  ctx.append(f"Biggest Opportunity: {json.dumps(od['biggest_opportunity'])}")
+        else:
+            ctx.append(f"Opportunity Data: {od}")
+    if request.industry: ctx.append(f"Industry (user-specified): {request.industry}")
+    if request.city:     ctx.append(f"City (user-specified): {request.city}")
+
+    memory_context = "\n".join(ctx)
+
+    prompt = f"""You are an expert offer strategist. Analyze this business's stored intelligence and design the most irresistible offer that will convert their target audience.
+
+BUSINESS INTELLIGENCE (from Adsoh memory system):
+{memory_context}
+
+Your job: design a specific, compelling offer tailored to THIS business's real audience pain points, competitors, and market gaps.
+
+RULES:
+- Reference actual audience segments, competitor weaknesses, and market gaps from the data.
+- No generic offers. Tied to real evidence from the data above.
+- Offer names must be specific (include the city or niche if applicable).
+- BANNED WORDS: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer.
+- offer_score 0-100: 90+ = near-certain to convert, 70-89 = strong, below 70 = needs tweaking.
+- confidence 0-100: how confident you are in this recommendation given the available data.
+
+Respond ONLY with valid JSON — no markdown, no explanation:
+
+{{
+  "recommended_offer": {{
+    "name": "specific offer name (not generic)",
+    "description": "2-3 sentences — what it is, who it's for, what they get",
+    "why_it_works": "specific reason tied to audience data and market gap",
+    "offer_score": 0
+  }},
+  "lead_magnet": {{
+    "name": "specific lead magnet name",
+    "format": "free audit / checklist / calculator / consultation / sample / report",
+    "why": "why this format works for this specific audience"
+  }},
+  "pricing_suggestion": {{
+    "model": "one-time / monthly retainer / per-lead / performance-based / tiered",
+    "entry_offer": "specific low-barrier entry price or trial offer",
+    "reasoning": "why this pricing model fits this market and audience"
+  }},
+  "guarantee": {{
+    "guarantee": "specific risk-reversal guarantee",
+    "why": "why this guarantee removes the main buying objection for this audience"
+  }},
+  "cta": "the single best call-to-action line — specific, action-oriented, urgency-driven",
+  "competitor_offer_gap": "what competitors are NOT offering that this business can own",
+  "irresistible_offer_stack": [
+    "Element 1 — specific value add",
+    "Element 2 — specific value add",
+    "Element 3 — specific value add",
+    "Element 4 — specific value add"
+  ],
+  "confidence": 0
+}}"""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=1200,
+            temperature=0.4,
+        )
+        raw  = resp.choices[0].message.content.strip()
+        offer = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[OFFER INTELLIGENCE] GPT call failed: {_e}")
+        return {"success": False, "memory_used": True, "error": str(_e)}
+
+    save_to_memory("offer", norm_key, {"offer_data": offer})
+
+    return {
+        "success":      True,
+        "memory_used":  True,
+        "business_key": norm_key,
+        "offer":        offer,
     }
