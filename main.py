@@ -90,6 +90,152 @@ except Exception as _e:
         except Exception as _te:
             logger.warning(f"[DB] Could not create table '{_model.__tablename__}': {_te}")
 
+# ── Memory System Tables ─────────────────────────────────────────────────────
+# Use raw SQL so JSONB works on Postgres and TEXT works on SQLite identically.
+_MEMORY_DDL = """
+CREATE TABLE IF NOT EXISTS business_memory (
+    id           SERIAL PRIMARY KEY,
+    business_key TEXT UNIQUE NOT NULL,
+    business_name TEXT,
+    industry      TEXT,
+    city          TEXT,
+    business_dna  {json_type},
+    uvp           TEXT,
+    positioning   TEXT,
+    brand_score   REAL,
+    trust_score   REAL,
+    opportunity_score REAL,
+    created_at    TEXT,
+    updated_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS market_memory (
+    id               SERIAL PRIMARY KEY,
+    business_key     TEXT UNIQUE NOT NULL,
+    market_size      TEXT,
+    growth           TEXT,
+    trends           {json_type},
+    seasonality      {json_type},
+    competition_level TEXT,
+    market_gap       TEXT,
+    created_at       TEXT,
+    updated_at       TEXT
+);
+CREATE TABLE IF NOT EXISTS competitor_memory (
+    id           SERIAL PRIMARY KEY,
+    business_key TEXT UNIQUE NOT NULL,
+    competitors  {json_type},
+    created_at   TEXT,
+    updated_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS audience_memory (
+    id           SERIAL PRIMARY KEY,
+    business_key TEXT UNIQUE NOT NULL,
+    segments     {json_type},
+    created_at   TEXT,
+    updated_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS campaign_memory (
+    id            SERIAL PRIMARY KEY,
+    business_key  TEXT UNIQUE NOT NULL,
+    campaign_data {json_type},
+    created_at    TEXT,
+    updated_at    TEXT
+);
+"""
+
+def _create_memory_tables():
+    json_type = "TEXT" if _is_sqlite else "JSONB"
+    with engine.connect() as conn:
+        # SQLite doesn't support SERIAL — swap to INTEGER
+        ddl = _MEMORY_DDL.format(json_type=json_type)
+        if _is_sqlite:
+            ddl = ddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+        conn.commit()
+
+try:
+    _create_memory_tables()
+    logger.info("[MEMORY] Memory tables created/verified")
+except Exception as _me:
+    logger.warning(f"[MEMORY] Could not create memory tables: {_me}")
+
+# ── Memory helpers ───────────────────────────────────────────────────────────
+_MEMORY_TABLES = {
+    "business":   "business_memory",
+    "market":     "market_memory",
+    "competitor": "competitor_memory",
+    "audience":   "audience_memory",
+    "campaign":   "campaign_memory",
+}
+
+def _json_val(v):
+    """Serialize dict/list → JSON string for storage; pass strings through."""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v)
+    return v
+
+def save_to_memory(table_key: str, business_key: str, data: dict):
+    """Upsert data into a memory table. Fire-and-forget safe — swallows all errors."""
+    table = _MEMORY_TABLES.get(table_key)
+    if not table:
+        logger.warning(f"[MEMORY] Unknown table key: {table_key}")
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = {k: _json_val(v) for k, v in data.items() if v is not None}
+    cols   = ["business_key", "updated_at"] + list(data.keys())
+    vals   = [business_key, now] + list(data.values())
+    params = {f"p{i}": v for i, v in enumerate(vals)}
+    placeholders = ", ".join(f":p{i}" for i in range(len(vals)))
+    col_str      = ", ".join(cols)
+    update_pairs = ", ".join(
+        f"{c} = :p{i+2}" for i, c in enumerate(data.keys())
+    )
+    update_pairs += f", updated_at = :p1"
+    if _is_sqlite:
+        sql = f"""
+            INSERT INTO {table} ({col_str}, created_at)
+            VALUES ({placeholders}, :p1)
+            ON CONFLICT(business_key) DO UPDATE SET {update_pairs}
+        """
+    else:
+        sql = f"""
+            INSERT INTO {table} ({col_str}, created_at)
+            VALUES ({placeholders}, :p1)
+            ON CONFLICT(business_key) DO UPDATE SET {update_pairs}
+        """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(sql), params)
+            conn.commit()
+        logger.info(f"[MEMORY] Saved {table_key} for key={business_key}")
+    except Exception as _e:
+        logger.warning(f"[MEMORY] save_to_memory({table_key}) failed: {_e}")
+
+def get_memory(business_key: str) -> dict:
+    """Return all stored memory for a business across all 5 tables as one dict."""
+    result = {}
+    for key, table in _MEMORY_TABLES.items():
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(f"SELECT * FROM {table} WHERE business_key = :bk"),
+                    {"bk": business_key}
+                ).mappings().first()
+            if row:
+                row_dict = dict(row)
+                # Parse JSON strings back to dicts/lists
+                for col, val in row_dict.items():
+                    if isinstance(val, str) and val.startswith(("{", "[")):
+                        try:
+                            row_dict[col] = json.loads(val)
+                        except Exception:
+                            pass
+                result[key] = row_dict
+        except Exception as _e:
+            logger.warning(f"[MEMORY] get_memory({table}) failed: {_e}")
+    return result
+
 def get_db():
     db = SessionLocal()
     try:
@@ -739,9 +885,49 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "Elevate, Transform, Unlock, unleash, dive in, game-changer, revolutionize, seamless, empower.\n\n"
     )
 
+    # ── Memory: derive key + fetch existing knowledge ────────────────────────
+    _mem_key = (request.url.strip().rstrip("/").lower() if request.url.strip()
+                else f"{request.target_industry}::{request.target_city}".lower())
+    _prior_memory = get_memory(_mem_key)
+    memory_used = bool(_prior_memory)
+
+    _memory_block = ""
+    if _prior_memory:
+        parts = []
+        bm = _prior_memory.get("business", {})
+        mm = _prior_memory.get("market", {})
+        cm = _prior_memory.get("competitor", {})
+        am = _prior_memory.get("audience", {})
+        if bm.get("uvp"):
+            parts.append(f"UVP (previously detected): {bm['uvp']}")
+        if bm.get("positioning"):
+            parts.append(f"Positioning (previously detected): {bm['positioning']}")
+        if bm.get("brand_score"):
+            parts.append(f"Brand Score: {bm['brand_score']} | Trust Score: {bm.get('trust_score','')} | Opportunity Score: {bm.get('opportunity_score','')}")
+        if mm.get("market_gap"):
+            parts.append(f"Market Gap (previously detected): {mm['market_gap']}")
+        if mm.get("competition_level"):
+            parts.append(f"Competition Level: {mm['competition_level']}")
+        if cm.get("competitors"):
+            comp_list = cm["competitors"]
+            if isinstance(comp_list, list):
+                parts.append(f"Known Competitors: {', '.join(str(c) for c in comp_list[:5])}")
+        if am.get("segments"):
+            segs = am["segments"]
+            if isinstance(segs, list) and segs:
+                parts.append(f"Audience Segments (previously identified): {json.dumps(segs[:2])[:300]}")
+        if parts:
+            _memory_block = (
+                "PREVIOUSLY KNOWN ABOUT THIS BUSINESS (from prior Adsoh reports — use this as baseline, build on it, do not contradict without new evidence):\n"
+                + "\n".join(f"- {p}" for p in parts)
+                + "\n\n"
+            )
+        logger.info(f"[MEMORY] Injecting {len(parts)} prior memory points for key={_mem_key}")
+
     prompt_a = (
         "You are the Marketing Brain inside Adsoh.\n"
         f"{business_critical}"
+        f"{_memory_block}"
         "Generate intelligence-driven analysis using the BI data below. No generic advice — every insight must come from the data.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
@@ -763,6 +949,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         prompt_b = (
             "You are the Marketing Brain inside Adsoh.\n"
             f"{business_critical}"
+            f"{_memory_block}"
             f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
             f"TARGET INDUSTRY: {request.target_industry} in {city}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
@@ -802,6 +989,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         prompt_b = (
             "You are the Marketing Brain inside Adsoh.\n"
             f"{business_critical}"
+            f"{_memory_block}"
             "Generate intelligence-driven audience strategy and campaign strategies. Every recommendation must cite BI evidence.\n"
             f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
             f"AUDIENCE INTELLIGENCE:\n{aud_txt}\n\nMARKET OPPORTUNITY:\n{opp_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
@@ -848,6 +1036,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'MARKETING PLAN' and only contain sections 9, 10, 11.\n\n"
         "You are the Marketing Brain inside Adsoh.\n"
         f"{business_critical}"
+        f"{_memory_block}"
         "Generate the marketing plan, ad assets, and media buying plan. All recommendations must reference BI evidence.\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
@@ -970,6 +1159,64 @@ For {request.target_industry} businesses in {request.target_city}, include:
         logger.warning(f"[REPORTS] Could not save full-report: {_re}")
         db.rollback()
 
+    # ── Memory Save (fire-and-forget, after response is assembled) ────────────
+    def _save_memory_sync():
+        _sections = {
+            "business_understanding": a_parts.get("BUSINESS UNDERSTANDING:", ""),
+            "market_understanding":   a_parts.get("MARKET UNDERSTANDING:", ""),
+            "competitor_insights":    a_parts.get("COMPETITOR INSIGHTS:", ""),
+            "positioning_strategy":   a_parts.get("POSITIONING STRATEGY:", ""),
+            "audience_strategy":      b_parts.get("AUDIENCE STRATEGY:", ""),
+        }
+        _dna  = bi_data.get("business_dna", {})  if bi_data else {}
+        _opp  = bi_data.get("opportunity_score", {}) if bi_data else {}
+        _aud  = bi_data.get("audience_intelligence", {}) if bi_data else {}
+        _thr  = bi_data.get("threat_intelligence", {}) if bi_data else {}
+        _scores = bi_data.get("scores", {}) if bi_data else {}
+
+        # business_memory
+        save_to_memory("business", _mem_key, {
+            "business_name":     _dna.get("business_name") or request.business_type,
+            "industry":          _dna.get("detected_industry") or request.business_type,
+            "city":              request.target_city,
+            "business_dna":      _dna,
+            "uvp":               _dna.get("value_proposition") or _dna.get("uvp"),
+            "positioning":       _dna.get("positioning_statement"),
+            "brand_score":       _scores.get("brand_strength"),
+            "trust_score":       _scores.get("trust_score"),
+            "opportunity_score": _scores.get("opportunity_score"),
+        })
+        # market_memory
+        save_to_memory("market", _mem_key, {
+            "market_size":        str(_opp.get("market_size", "")),
+            "growth":             str(_opp.get("market_growth", "")),
+            "trends":             _opp.get("trending_opportunities"),
+            "seasonality":        _opp.get("seasonal_patterns"),
+            "competition_level":  str(_thr.get("competition_level") or _scores.get("market_saturation", "")),
+            "market_gap":         str(_opp.get("market_gap") or _opp.get("market_opportunity_reason", "")),
+        })
+        # competitor_memory — extract names from threat intelligence
+        _comp_list = []
+        if _thr.get("key_threats"):
+            for t in (_thr["key_threats"] if isinstance(_thr.get("key_threats"), list) else []):
+                if isinstance(t, dict):
+                    name = t.get("competitor") or t.get("name")
+                    if name:
+                        _comp_list.append(name)
+                elif isinstance(t, str):
+                    _comp_list.append(t)
+        if request.competitor_name:
+            _comp_list = [request.competitor_name] + _comp_list
+        save_to_memory("competitor", _mem_key, {"competitors": list(dict.fromkeys(_comp_list))[:10]})
+        # audience_memory
+        _segs = _aud.get("validated_segments") or _aud.get("segments") or []
+        save_to_memory("audience", _mem_key, {"segments": _segs})
+
+    try:
+        _save_memory_sync()
+    except Exception as _sme:
+        logger.warning(f"[MEMORY] Background save failed: {_sme}")
+
     return {
         "success": True,
         "url": request.url,
@@ -997,6 +1244,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "bi_cached":      bi_cached,
         "live_data_used":  live_data_used,
         "firecrawl_used":  firecrawl_used_bi,
+        "memory_used":     memory_used,
         "industry_only_mode": industry_only_mode,
         "target_industry": request.target_industry,
         "target_city":     request.target_city,
@@ -2278,3 +2526,9 @@ async def google_ads_daily(days: int = 30):
     except Exception as ex:
         logger.error(f"[GOOGLE ADS] daily unexpected: {ex}")
         return {"success": False, "error": str(ex)}
+
+@app.get("/memory")
+async def read_memory(business_key: str):
+    """Return all stored memory for a business_key (for debugging / inspection)."""
+    mem = get_memory(business_key)
+    return {"success": bool(mem), "business_key": business_key, "memory": mem}
