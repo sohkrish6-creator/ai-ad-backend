@@ -94,12 +94,12 @@ except Exception as _e:
 # Use raw SQL so JSONB works on Postgres and TEXT works on SQLite identically.
 _MEMORY_DDL = """
 CREATE TABLE IF NOT EXISTS business_memory (
-    id           SERIAL PRIMARY KEY,
+    id           BIGSERIAL PRIMARY KEY,
     business_key TEXT UNIQUE NOT NULL,
     business_name TEXT,
     industry      TEXT,
     city          TEXT,
-    business_dna  {json_type},
+    business_dna  TEXT,
     uvp           TEXT,
     positioning   TEXT,
     brand_score   REAL,
@@ -109,47 +109,70 @@ CREATE TABLE IF NOT EXISTS business_memory (
     updated_at    TEXT
 );
 CREATE TABLE IF NOT EXISTS market_memory (
-    id               SERIAL PRIMARY KEY,
+    id               BIGSERIAL PRIMARY KEY,
     business_key     TEXT UNIQUE NOT NULL,
     market_size      TEXT,
     growth           TEXT,
-    trends           {json_type},
-    seasonality      {json_type},
+    trends           TEXT,
+    seasonality      TEXT,
     competition_level TEXT,
     market_gap       TEXT,
     created_at       TEXT,
     updated_at       TEXT
 );
 CREATE TABLE IF NOT EXISTS competitor_memory (
-    id           SERIAL PRIMARY KEY,
+    id           BIGSERIAL PRIMARY KEY,
     business_key TEXT UNIQUE NOT NULL,
-    competitors  {json_type},
+    competitors  TEXT,
     created_at   TEXT,
     updated_at   TEXT
 );
 CREATE TABLE IF NOT EXISTS audience_memory (
-    id           SERIAL PRIMARY KEY,
+    id           BIGSERIAL PRIMARY KEY,
     business_key TEXT UNIQUE NOT NULL,
-    segments     {json_type},
+    segments     TEXT,
     created_at   TEXT,
     updated_at   TEXT
 );
 CREATE TABLE IF NOT EXISTS campaign_memory (
-    id            SERIAL PRIMARY KEY,
+    id            BIGSERIAL PRIMARY KEY,
     business_key  TEXT UNIQUE NOT NULL,
-    campaign_data {json_type},
+    campaign_data TEXT,
     created_at    TEXT,
     updated_at    TEXT
 );
 """
 
 def _create_memory_tables():
-    json_type = "TEXT" if _is_sqlite else "JSONB"
+    """
+    Create memory tables with TEXT columns for JSON data.
+    If tables already exist with JSONB columns (from a prior bad schema),
+    drop and recreate them — they are always empty if saves were failing.
+    """
+    _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
+                           "audience_memory", "campaign_memory"]
     with engine.connect() as conn:
-        # SQLite doesn't support SERIAL — swap to INTEGER
-        ddl = _MEMORY_DDL.format(json_type=json_type)
+        # Check if any table has JSONB columns (only on Postgres)
+        needs_recreate = False
+        if not _is_sqlite:
+            try:
+                row = conn.execute(text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_name IN ('business_memory','market_memory','competitor_memory','audience_memory','campaign_memory') "
+                    "AND data_type = 'jsonb'"
+                )).scalar()
+                needs_recreate = (row or 0) > 0
+            except Exception:
+                pass
+        if needs_recreate:
+            logger.info("[MEMORY] Detected JSONB columns — dropping and recreating memory tables with TEXT")
+            for t in reversed(_memory_table_names):
+                conn.execute(text(f"DROP TABLE IF EXISTS {t}"))
+            conn.commit()
+
+        ddl = _MEMORY_DDL
         if _is_sqlite:
-            ddl = ddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+            ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
         for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
             conn.execute(text(stmt))
         conn.commit()
@@ -170,47 +193,54 @@ _MEMORY_TABLES = {
 }
 
 def _json_val(v):
-    """Serialize dict/list → JSON string for storage; pass strings through."""
+    """Serialize dict/list → JSON string for TEXT storage."""
     if isinstance(v, (dict, list)):
-        return json.dumps(v)
+        return json.dumps(v, ensure_ascii=False)
     return v
 
+def _normalize_biz_key(url: str, industry: str = "", city: str = "") -> str:
+    """Produce a stable, protocol-free business key so saving and lookup always match."""
+    if url and url.strip():
+        k = url.strip().rstrip("/").lower()
+        k = re.sub(r'^https?://', '', k)   # strip http:// or https://
+        k = k.rstrip("/")
+        return k
+    return f"{industry}::{city}".lower()
+
 def save_to_memory(table_key: str, business_key: str, data: dict):
-    """Upsert data into a memory table. Fire-and-forget safe — swallows all errors."""
+    """Upsert data into a memory table. Logs errors but never raises."""
     table = _MEMORY_TABLES.get(table_key)
     if not table:
         logger.warning(f"[MEMORY] Unknown table key: {table_key}")
         return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Serialize dicts/lists; drop None values
     data = {k: _json_val(v) for k, v in data.items() if v is not None}
+    if not data:
+        # Nothing to save beyond the key itself — still upsert the row so the key exists
+        data = {}
     cols   = ["business_key", "updated_at"] + list(data.keys())
     vals   = [business_key, now] + list(data.values())
     params = {f"p{i}": v for i, v in enumerate(vals)}
     placeholders = ", ".join(f":p{i}" for i in range(len(vals)))
     col_str      = ", ".join(cols)
-    update_pairs = ", ".join(
-        f"{c} = :p{i+2}" for i, c in enumerate(data.keys())
-    )
-    update_pairs += f", updated_at = :p1"
-    if _is_sqlite:
-        sql = f"""
-            INSERT INTO {table} ({col_str}, created_at)
-            VALUES ({placeholders}, :p1)
-            ON CONFLICT(business_key) DO UPDATE SET {update_pairs}
-        """
-    else:
-        sql = f"""
-            INSERT INTO {table} ({col_str}, created_at)
-            VALUES ({placeholders}, :p1)
-            ON CONFLICT(business_key) DO UPDATE SET {update_pairs}
-        """
+    # Build update pairs — include updated_at, plus all data columns
+    update_parts = [f"updated_at = :p1"]
+    update_parts += [f"{c} = :p{i+2}" for i, c in enumerate(data.keys())]
+    update_pairs = ", ".join(update_parts)
+    sql = f"""
+        INSERT INTO {table} ({col_str}, created_at)
+        VALUES ({placeholders}, :p1)
+        ON CONFLICT(business_key) DO UPDATE SET {update_pairs}
+    """
     try:
         with engine.connect() as conn:
             conn.execute(text(sql), params)
             conn.commit()
-        logger.info(f"[MEMORY] Saved {table_key} for key={business_key}")
+        logger.info(f"[MEMORY] Saved {table_key} for key={business_key!r}")
     except Exception as _e:
-        logger.warning(f"[MEMORY] save_to_memory({table_key}) failed: {_e}")
+        import traceback
+        logger.error(f"[MEMORY] save_to_memory({table_key}) FAILED for key={business_key!r}: {_e}\n{traceback.format_exc()}")
 
 def get_memory(business_key: str) -> dict:
     """Return all stored memory for a business across all 5 tables as one dict."""
@@ -224,7 +254,6 @@ def get_memory(business_key: str) -> dict:
                 ).mappings().first()
             if row:
                 row_dict = dict(row)
-                # Parse JSON strings back to dicts/lists
                 for col, val in row_dict.items():
                     if isinstance(val, str) and val.startswith(("{", "[")):
                         try:
@@ -233,7 +262,7 @@ def get_memory(business_key: str) -> dict:
                             pass
                 result[key] = row_dict
         except Exception as _e:
-            logger.warning(f"[MEMORY] get_memory({table}) failed: {_e}")
+            logger.error(f"[MEMORY] get_memory({table}) FAILED: {_e}")
     return result
 
 def get_db():
@@ -886,8 +915,8 @@ For {request.target_industry} businesses in {request.target_city}, include:
     )
 
     # ── Memory: derive key + fetch existing knowledge ────────────────────────
-    _mem_key = (request.url.strip().rstrip("/").lower() if request.url.strip()
-                else f"{request.target_industry}::{request.target_city}".lower())
+    _mem_key = _normalize_biz_key(request.url, request.target_industry, request.target_city)
+    logger.info(f"[MEMORY] business_key derived as: {_mem_key!r}")
     _prior_memory = get_memory(_mem_key)
     memory_used = bool(_prior_memory)
 
@@ -2529,6 +2558,20 @@ async def google_ads_daily(days: int = 30):
 
 @app.get("/memory")
 async def read_memory(business_key: str):
-    """Return all stored memory for a business_key (for debugging / inspection)."""
-    mem = get_memory(business_key)
-    return {"success": bool(mem), "business_key": business_key, "memory": mem}
+    """Return all stored memory for a business_key. Normalizes the key (strips https://)."""
+    normalized = _normalize_biz_key(business_key)
+    mem = get_memory(normalized)
+    return {"success": bool(mem), "business_key_raw": business_key, "business_key_normalized": normalized, "memory": mem}
+
+@app.post("/memory/test")
+async def test_memory_save():
+    """Debug endpoint: writes a test row and immediately reads it back."""
+    test_key = "__memory_test__"
+    save_to_memory("business", test_key, {
+        "business_name": "Test Business",
+        "uvp": "Test UVP",
+        "positioning": "Test Positioning",
+        "business_dna": {"detected_industry": "Test Industry", "value_proposition": "Test UVP"},
+    })
+    mem = get_memory(test_key)
+    return {"saved": bool(mem), "memory": mem}
