@@ -40,6 +40,9 @@ _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
 _is_sqlite = DATABASE_URL.startswith("sqlite")
+# Mask password for safe logging: show scheme + host only
+_db_host = DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else DATABASE_URL[:40]
+logger.info(f"[DB] Connecting to host: {_db_host} | sqlite={_is_sqlite}")
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if _is_sqlite else {},
@@ -2592,3 +2595,25 @@ def _list_memory_tables() -> list:
         return [r[0] for r in rows]
     except Exception as _e:
         return [f"ERROR: {_e}"]
+
+@app.get("/debug/db")
+async def debug_db():
+    """Shows which DB host the running app is actually connected to. Safe — password is never exposed."""
+    host = DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else "sqlite-local"
+    db_name = DATABASE_URL.split("/")[-1].split("?")[0] if "/" in DATABASE_URL else ""
+    try:
+        with engine.connect() as conn:
+            ping = conn.execute(text("SELECT 1")).scalar()
+        connected = (ping == 1)
+        error = None
+    except Exception as _e:
+        connected = False
+        error = str(_e)
+    return {
+        "db_host":    host,
+        "db_name":    db_name,
+        "is_sqlite":  _is_sqlite,
+        "connected":  connected,
+        "error":      error,
+        "env_var_set": os.getenv("DATABASE_URL") is not None,
+    }
