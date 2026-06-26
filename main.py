@@ -2764,7 +2764,7 @@ async def google_ads_performance(days: int = 30, customer_id: Optional[str] = No
         return {"success": False, "error": str(ex)}
 
 @app.get("/google-ads/campaigns")
-async def google_ads_campaigns(days: int = 30):
+async def google_ads_campaigns(days: int = 90):
     """Per-campaign breakdown sorted by cost descending."""
     customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
     end   = date.today()
@@ -2816,7 +2816,7 @@ async def google_ads_campaigns(days: int = 30):
         return {"success": False, "error": str(ex)}
 
 @app.get("/google-ads/daily")
-async def google_ads_daily(days: int = 30):
+async def google_ads_daily(days: int = 90):
     """Daily time-series: date, impressions, clicks, cost_inr."""
     customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
     end   = date.today()
