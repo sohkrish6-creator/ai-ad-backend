@@ -4985,7 +4985,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
 
         # 5. Save to prospect_memory keyed by industry::city
         prospect_key = derive_business_key("", industry, city)
-        _now = _dt.utcnow().isoformat()
+        _now = datetime.utcnow().isoformat()
         def _save_prospect():
             with engine.begin() as conn:
                 if _is_sqlite:
@@ -5012,4 +5012,264 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[PROSPECT] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+
+# ── Google Ads Campaign Creation (Basic Access) ───────────────────────────────
+
+class CreateCampaignRequest(BaseModel):
+    campaign_name:  str
+    budget_daily:   float                  # in ₹
+    campaign_type:  str  = "SEARCH"        # SEARCH or DISPLAY
+    start_date:     str  = ""              # YYYYMMDD; defaults to tomorrow
+    end_date:       str  = ""              # YYYYMMDD; optional
+    business_key:   str  = ""             # if set, pull keywords from campaign_memory
+
+class CreateAdRequest(BaseModel):
+    campaign_id:    str
+    ad_group_name:  str  = ""
+    headlines:      list = []              # max 15, each max 30 chars
+    descriptions:   list = []              # max 4, each max 90 chars
+    final_url:      str  = ""
+
+class AddKeywordsRequest(BaseModel):
+    ad_group_id:    str
+    keywords:       list = []              # [{"text": "...", "match_type": "EXACT/PHRASE/BROAD"}]
+
+
+def _gads_customer_id():
+    return _genv("GOOGLE_ADS_CUSTOMER_ID")
+
+
+def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type: str,
+                          start_date: str, end_date: str, customer_id: str):
+    """Synchronous: create CampaignBudget + Campaign + AdGroup. Returns dict."""
+    client = get_google_ads_client()
+
+    # 1. CampaignBudget
+    budget_service = client.get_service("CampaignBudgetService")
+    budget_op      = client.get_type("CampaignBudgetOperation")
+    cb = budget_op.create
+    cb.name                 = f"Budget — {campaign_name}"
+    cb.amount_micros        = int(budget_daily * 1_000_000)
+    cb.delivery_method      = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    cb.explicitly_shared    = False
+    budget_resp    = budget_service.mutate_campaign_budgets(customer_id=customer_id, operations=[budget_op])
+    budget_rn      = budget_resp.results[0].resource_name
+
+    # 2. Campaign
+    campaign_service = client.get_service("CampaignService")
+    campaign_op      = client.get_type("CampaignOperation")
+    camp = campaign_op.create
+    camp.name            = campaign_name
+    camp.status          = client.enums.CampaignStatusEnum.PAUSED   # safe default
+    camp.campaign_budget = budget_rn
+    if campaign_type.upper() == "DISPLAY":
+        camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.DISPLAY
+    else:
+        camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
+        camp.manual_cpc.enhanced_cpc_enabled = False
+
+    # Dates
+    if not start_date:
+        start_date = (date.today() + timedelta(days=1)).strftime("%Y%m%d")
+    camp.start_date = start_date
+    if end_date:
+        camp.end_date = end_date
+
+    campaign_resp = campaign_service.mutate_campaigns(customer_id=customer_id, operations=[campaign_op])
+    campaign_rn   = campaign_resp.results[0].resource_name
+    campaign_id   = campaign_rn.split("/")[-1]
+
+    # 3. AdGroup
+    ad_group_service = client.get_service("AdGroupService")
+    ag_op            = client.get_type("AdGroupOperation")
+    ag = ag_op.create
+    ag.name           = f"{campaign_name} — Ad Group 1"
+    ag.campaign       = campaign_rn
+    ag.status         = client.enums.AdGroupStatusEnum.ENABLED
+    ag.type_          = client.enums.AdGroupTypeEnum.SEARCH_STANDARD
+    ag.cpc_bid_micros = 1_000_000   # ₹1 default, user can update in dashboard
+
+    ag_resp     = ad_group_service.mutate_ad_groups(customer_id=customer_id, operations=[ag_op])
+    ag_rn       = ag_resp.results[0].resource_name
+    ad_group_id = ag_rn.split("/")[-1]
+
+    return {
+        "campaign_id":   campaign_id,
+        "campaign_name": campaign_name,
+        "ad_group_id":   ad_group_id,
+        "budget_rn":     budget_rn,
+        "campaign_rn":   campaign_rn,
+        "ad_group_rn":   ag_rn,
+        "status":        "PAUSED",
+        "start_date":    start_date,
+        "end_date":      end_date or None,
+    }
+
+
+def _add_keywords_sync(ad_group_rn: str, keywords: list, customer_id: str):
+    """Synchronous: add keyword criteria to an ad group."""
+    client    = get_google_ads_client()
+    svc       = client.get_service("AdGroupCriterionService")
+    _match_map = {
+        "EXACT":  client.enums.KeywordMatchTypeEnum.EXACT,
+        "PHRASE": client.enums.KeywordMatchTypeEnum.PHRASE,
+        "BROAD":  client.enums.KeywordMatchTypeEnum.BROAD,
+    }
+    ops = []
+    for kw in keywords[:100]:
+        op  = client.get_type("AdGroupCriterionOperation")
+        crit = op.create
+        crit.ad_group = ad_group_rn
+        crit.status   = client.enums.AdGroupCriterionStatusEnum.ENABLED
+        crit.keyword.text       = kw.get("text", "")[:80]
+        crit.keyword.match_type = _match_map.get(kw.get("match_type", "BROAD").upper(),
+                                                  client.enums.KeywordMatchTypeEnum.BROAD)
+        ops.append(op)
+    if not ops:
+        return []
+    resp = svc.mutate_ad_group_criteria(customer_id=customer_id, operations=ops)
+    return [r.resource_name for r in resp.results]
+
+
+def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
+                    final_url: str, customer_id: str):
+    """Synchronous: create a ResponsiveSearchAd in an ad group."""
+    client  = get_google_ads_client()
+    svc     = client.get_service("AdGroupAdService")
+    op      = client.get_type("AdGroupAdOperation")
+    aga     = op.create
+    aga.ad_group = ad_group_rn
+    aga.status   = client.enums.AdGroupAdStatusEnum.ENABLED
+
+    rsa = aga.ad.responsive_search_ad
+    for h in headlines[:15]:
+        asset = client.get_type("AdTextAsset")
+        asset.text = str(h)[:30]
+        rsa.headlines.append(asset)
+    for d in descriptions[:4]:
+        asset = client.get_type("AdTextAsset")
+        asset.text = str(d)[:90]
+        rsa.descriptions.append(asset)
+    aga.ad.final_urls.append(final_url)
+
+    resp   = svc.mutate_ad_group_ads(customer_id=customer_id, operations=[op])
+    ad_rn  = resp.results[0].resource_name
+    return {"ad_id": ad_rn.split("/")[-1], "resource_name": ad_rn, "status": "ENABLED"}
+
+
+@app.post("/google-ads/create-campaign")
+async def gads_create_campaign(request: CreateCampaignRequest):
+    try:
+        customer_id = _gads_customer_id()
+        if not customer_id:
+            return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
+
+        logger.info(f"[GADS-CREATE] campaign={request.campaign_name!r} budget_daily={request.budget_daily} type={request.campaign_type}")
+
+        result = await asyncio.to_thread(
+            _create_campaign_sync,
+            request.campaign_name, request.budget_daily, request.campaign_type,
+            request.start_date.replace("-", ""),  # accept both YYYY-MM-DD and YYYYMMDD
+            request.end_date.replace("-", "") if request.end_date else "",
+            customer_id,
+        )
+
+        # If business_key provided — pull keywords from campaign_memory and add them
+        keywords_added = []
+        if request.business_key:
+            mem = get_memory(request.business_key)
+            camp_data_raw = mem.get("campaign", {}).get("campaign_data", "") if mem else ""
+            try:
+                camp_data = json.loads(camp_data_raw) if isinstance(camp_data_raw, str) and camp_data_raw.startswith("{") else {}
+                kw_list = camp_data.get("keywords", camp_data.get("google_keywords", []))
+                if isinstance(kw_list, list) and kw_list:
+                    kw_objs = [{"text": str(k), "match_type": "BROAD"} for k in kw_list[:30] if k]
+                    keywords_added = await asyncio.to_thread(
+                        _add_keywords_sync, result["ad_group_rn"], kw_objs, customer_id
+                    )
+                    logger.info(f"[GADS-CREATE] Added {len(keywords_added)} keywords from memory")
+            except Exception as _ke:
+                logger.warning(f"[GADS-CREATE] Keyword pull failed: {_ke}")
+
+        result["keywords_added"] = len(keywords_added)
+        result["google_ads_dashboard"] = f"https://ads.google.com/aw/campaigns?campaignId={result['campaign_id']}"
+        logger.info(f"[GADS-CREATE] Done: campaign_id={result['campaign_id']}")
+        return {"success": True, **result}
+
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GADS-CREATE] API error: {errors}")
+        return {"success": False, "error": "; ".join(errors)}
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[GADS-CREATE] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+
+@app.post("/google-ads/create-ad")
+async def gads_create_ad(request: CreateAdRequest):
+    try:
+        customer_id = _gads_customer_id()
+        if not customer_id:
+            return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
+
+        # Build ad_group resource name from campaign_id + ad_group_id
+        # Caller may pass ad_group_id directly as resource name or bare ID
+        ad_group_id = request.campaign_id  # overloaded: caller passes ad_group resource or we build it
+        if not ad_group_id.startswith("customers/"):
+            ad_group_rn = f"customers/{customer_id}/adGroups/{ad_group_id}"
+        else:
+            ad_group_rn = ad_group_id
+
+        if not request.headlines or not request.descriptions or not request.final_url:
+            return {"success": False, "error": "headlines, descriptions, and final_url are required"}
+
+        logger.info(f"[GADS-AD] Creating RSA in ad_group_rn={ad_group_rn!r}")
+        result = await asyncio.to_thread(
+            _create_ad_sync,
+            ad_group_rn, request.headlines, request.descriptions, request.final_url, customer_id,
+        )
+        return {"success": True, **result}
+
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GADS-AD] API error: {errors}")
+        return {"success": False, "error": "; ".join(errors)}
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[GADS-AD] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+
+@app.post("/google-ads/add-keywords")
+async def gads_add_keywords(request: AddKeywordsRequest):
+    try:
+        customer_id = _gads_customer_id()
+        if not customer_id:
+            return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
+
+        ad_group_id = request.ad_group_id
+        if not ad_group_id.startswith("customers/"):
+            ad_group_rn = f"customers/{customer_id}/adGroups/{ad_group_id}"
+        else:
+            ad_group_rn = ad_group_id
+
+        if not request.keywords:
+            return {"success": False, "error": "keywords list is empty"}
+
+        logger.info(f"[GADS-KW] Adding {len(request.keywords)} keywords to {ad_group_rn!r}")
+        added = await asyncio.to_thread(
+            _add_keywords_sync, ad_group_rn, request.keywords, customer_id
+        )
+        return {"success": True, "keywords_added": len(added), "resource_names": added}
+
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GADS-KW] API error: {errors}")
+        return {"success": False, "error": "; ".join(errors)}
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[GADS-KW] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
