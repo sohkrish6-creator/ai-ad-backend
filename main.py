@@ -183,6 +183,15 @@ CREATE TABLE IF NOT EXISTS outreach_memory (
     created_at    TEXT,
     updated_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS kpi_memory (
+    id           BIGSERIAL PRIMARY KEY,
+    business_key TEXT UNIQUE NOT NULL,
+    kpi_data     TEXT,
+    budget       REAL,
+    goal         TEXT,
+    created_at   TEXT,
+    updated_at   TEXT
+);
 """
 
 def _create_memory_tables():
@@ -193,7 +202,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -238,6 +247,7 @@ _MEMORY_TABLES = {
     "website":     "website_memory",
     "visibility":  "visibility_memory",
     "outreach":    "outreach_memory",
+    "kpi":         "kpi_memory",
 }
 
 def _json_val(v):
@@ -3600,4 +3610,192 @@ RULES:
         "memory_used":  True,
         "business_key": norm_key,
         "outreach":     outreach,
+    }
+
+
+# ── Module 19: KPI Engine ─────────────────────────────────────────────────────
+
+class KPIEngineRequest(BaseModel):
+    url:      str = ""
+    industry: str
+    city:     str = "Jaipur"
+    budget:   float = 0.0
+    goal:     str = "Lead Generation"
+
+@app.post("/kpi-engine")
+async def kpi_engine(request: KPIEngineRequest):
+    industry = (request.industry or "").strip()
+    city     = (request.city     or "Jaipur").strip()
+    goal     = (request.goal     or "Lead Generation").strip()
+    budget   = request.budget or 0.0
+
+    _bk_src  = (request.url or "").strip()
+    norm_key = derive_business_key(_bk_src, industry, city)
+    logger.info(f"[KPI-ENGINE] key={norm_key!r} industry={industry!r} city={city!r} budget={budget} goal={goal!r}")
+
+    # ── Load ALL memory ──────────────────────────────────────────────────────
+    memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+
+    if not memory:
+        return {
+            "success":     False,
+            "memory_used": False,
+            "message":     "No memory found. Run Marketing Brain first with the same URL + industry.",
+        }
+
+    # ── Build context from all tables ────────────────────────────────────────
+    _bm   = memory.get("business",  {})
+    _mm   = memory.get("market",    {})
+    _am   = memory.get("audience",  {})
+    _opm  = memory.get("opportunity", {})
+    _ofm  = memory.get("offer",     {})
+    _cm   = memory.get("campaign",  {})
+    _wm   = memory.get("website",   {})
+
+    def _safe(val, key, default=""):
+        v = val.get(key, default) if isinstance(val, dict) else default
+        if isinstance(v, (dict, list)):
+            try: return json.dumps(v, ensure_ascii=False)[:300]
+            except: return str(v)[:300]
+        return str(v or default)
+
+    _opp_data = _opm.get("opportunity_data") or {}
+    _offer_data = _ofm.get("offer_data") or {}
+    if isinstance(_opp_data, str):
+        try: _opp_data = json.loads(_opp_data)
+        except: _opp_data = {}
+    if isinstance(_offer_data, str):
+        try: _offer_data = json.loads(_offer_data)
+        except: _offer_data = {}
+
+    _segs = _am.get("segments", [])
+    if isinstance(_segs, str):
+        try: _segs = json.loads(_segs)
+        except: _segs = [_segs]
+
+    budget_str = f"₹{int(budget):,}/month" if budget > 0 else "₹10,000/month (assumed)"
+    context = f"""
+CAMPAIGN PARAMETERS:
+- Industry: {industry}
+- City: {city}
+- Goal: {goal}
+- Budget: {budget_str}
+
+BUSINESS INTELLIGENCE:
+- Name: {_safe(_bm, "business_name")} | UVP: {_safe(_bm, "uvp")}
+- Positioning: {_safe(_bm, "positioning")}
+- Brand score: {_safe(_bm, "brand_score")} | Trust score: {_safe(_bm, "trust_score")}
+- Opportunity score: {_safe(_bm, "opportunity_score")}
+
+MARKET INTELLIGENCE:
+- Market size: {_safe(_mm, "market_size")}
+- Competition level: {_safe(_mm, "competition_level")}
+- Market gap: {_safe(_mm, "market_gap")}
+
+TARGET AUDIENCE:
+{chr(10).join(f"• {s}" for s in (_segs[:3] if isinstance(_segs, list) else [str(_segs)])) or "Decision makers in " + industry}
+
+BEST OPPORTUNITY:
+- Audience: {_opp_data.get("highest_roi_audience", "")}
+- Offer: {_opp_data.get("recommended_offer", "")}
+- Platform: {_opp_data.get("best_platform", "")}
+
+RECOMMENDED OFFER:
+- Offer: {_offer_data.get("recommended_offer", "")}
+- Lead magnet: {_offer_data.get("lead_magnet", "")}
+- Guarantee: {_offer_data.get("guarantee", "")}
+
+WEBSITE HEALTH:
+- Audit score: {_safe(_wm, "overall_score", "not audited")}
+"""
+
+    prompt = f"""You are a performance marketing expert specialising in Indian digital advertising for {industry} businesses in {city}.
+Generate precise, data-driven KPI predictions for this campaign. All numbers must reflect real Indian market benchmarks for this specific industry and city.
+
+{context}
+
+Return ONLY a valid JSON object (no markdown, no text outside JSON) with this EXACT schema:
+{{
+  "primary_kpi": {{
+    "metric": "CPL or CPA or ROAS or CTR — pick the ONE most important metric for {goal}",
+    "target": "specific target value with unit (e.g. ₹350 CPL, 4.2x ROAS)",
+    "why": "one sentence why this is the north-star metric for {goal} in {industry}"
+  }},
+  "predicted_metrics": {{
+    "ctr": {{"value": "X.X%", "range": "X%-X%", "benchmark": "industry avg for {industry} on Google/Meta"}},
+    "cpc": {{"value": "₹XX", "range": "₹X-₹X", "benchmark": "avg CPC for {industry} in {city}"}},
+    "cpl": {{"value": "₹XXX", "range": "₹X-₹X", "benchmark": "avg CPL for {industry} in {city}"}},
+    "cpa": {{"value": "₹XXX", "range": "₹X-₹X", "benchmark": "avg CPA for {industry}"}},
+    "roas": {{"value": "X.Xx", "range": "X-Xx", "benchmark": "expected ROAS for {industry} at this budget"}},
+    "reach": {{"value": "XX,XXX", "range": "XX,XXX-XX,XXX"}},
+    "impressions": {{"value": "XX,XXX", "range": "XX,XXX-XX,XXX"}},
+    "clicks": {{"value": "XXX", "range": "XXX-XXX"}},
+    "leads": {{"value": "XX", "range": "XX-XX"}},
+    "conversions": {{"value": "X", "range": "X-X"}},
+    "revenue_potential": {{"value": "₹X,XX,XXX", "range": "₹X,XX,XXX-₹X,XX,XXX"}}
+  }},
+  "secondary_kpis": [
+    {{"metric": "metric name", "target": "specific target", "why": "one sentence"}},
+    {{"metric": "metric name", "target": "specific target", "why": "one sentence"}},
+    {{"metric": "metric name", "target": "specific target", "why": "one sentence"}}
+  ],
+  "success_criteria": {{
+    "week_1": "specific, measurable milestone by end of week 1 (data collection + first signals)",
+    "week_2": "specific measurable milestone by end of week 2 (optimisation signals)",
+    "month_1": "specific measurable milestone by end of month 1 (traction proof)",
+    "month_2": "specific measurable milestone by end of month 2 (scaling decision point)",
+    "month_3": "specific measurable milestone by end of month 3 (full ROI picture)"
+  }},
+  "budget_breakdown": {{
+    "recommended_total": "₹{int(budget) if budget > 0 else 10000:,}/month",
+    "google_ads": "₹X,XXX (XX%) — search + display",
+    "meta_ads": "₹X,XXX (XX%) — feed + stories + reels",
+    "remarketing": "₹X,XXX (XX%) — retargeting warm audience",
+    "daily_budget": "₹XXX/day"
+  }},
+  "cac_ltv": {{
+    "estimated_cac": "₹X,XXX — cost to acquire one paying customer",
+    "estimated_ltv": "₹XX,XXX — 12-month lifetime value estimate for {industry} client",
+    "ltv_cac_ratio": "X:1",
+    "payback_period": "X months"
+  }},
+  "confidence": <integer 0-100>,
+  "confidence_reason": "one sentence explaining confidence level based on data available"
+}}
+
+RULES:
+- All monetary values in Indian Rupees (₹).
+- All numbers calibrated for {industry} in {city} at {budget_str} budget — no generic global averages.
+- Budget breakdown must sum to the total budget.
+- LTV must be realistic for {industry} (hotel: ₹50k+, restaurant: ₹30k+, agency: ₹1L+).
+- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless.
+- Return ONLY the JSON. Nothing outside it."""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2000,
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content.strip()
+        kpi = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[KPI-ENGINE] GPT call failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    save_to_memory("kpi", norm_key, {
+        "kpi_data": kpi,
+        "budget":   budget,
+        "goal":     goal,
+    })
+    logger.info(f"[KPI-ENGINE] Done: key={norm_key!r} confidence={kpi.get('confidence')}")
+
+    return {
+        "success":      True,
+        "memory_used":  True,
+        "business_key": norm_key,
+        "kpi":          kpi,
     }
