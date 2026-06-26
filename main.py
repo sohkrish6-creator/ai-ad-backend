@@ -37,6 +37,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
@@ -230,6 +231,15 @@ CREATE TABLE IF NOT EXISTS growth_memory (
     confidence       REAL,
     created_at       TEXT
 );
+CREATE TABLE IF NOT EXISTS prospect_memory (
+    id              BIGSERIAL PRIMARY KEY,
+    business_key    TEXT UNIQUE NOT NULL,
+    prospects_data  TEXT,
+    industry        TEXT,
+    city            TEXT,
+    created_at      TEXT,
+    updated_at      TEXT
+);
 """
 
 def _create_memory_tables():
@@ -240,7 +250,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -289,6 +299,7 @@ _MEMORY_TABLES = {
     "performance": "performance_memory",
     "optimizer":   "optimizer_memory",
     "result":      "result_memory",
+    "prospect":    "prospect_memory",
 }
 
 def _json_val(v):
@@ -745,6 +756,54 @@ async def fetch_tavily(query: str) -> str:
             return "\n".join(snippets)
     except Exception:
         return ""
+
+async def fetch_google_places(query: str, city: str, max_results: int = 20) -> list:
+    """Search Google Places Text Search API. Returns [] on failure or missing key."""
+    if not GOOGLE_PLACES_API_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=12) as c:
+            resp = await c.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": f"{query} in {city}", "key": GOOGLE_PLACES_API_KEY},
+            )
+            data = resp.json()
+            results = data.get("results", [])[:max_results]
+            out = []
+            for r in results:
+                out.append({
+                    "name":                r.get("name", ""),
+                    "address":             r.get("formatted_address", ""),
+                    "rating":              r.get("rating"),
+                    "user_ratings_total":  r.get("user_ratings_total", 0),
+                    "website":             r.get("website", ""),
+                    "place_id":            r.get("place_id", ""),
+                    "business_status":     r.get("business_status", ""),
+                })
+            return out
+    except Exception as _e:
+        logger.warning(f"[PLACES] fetch_google_places failed: {_e}")
+        return []
+
+async def fetch_place_details(place_id: str) -> dict:
+    """Fetch detailed info for a single place. Returns {} on failure."""
+    if not GOOGLE_PLACES_API_KEY or not place_id:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=12) as c:
+            resp = await c.get(
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params={
+                    "place_id": place_id,
+                    "fields": "name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews",
+                    "key": GOOGLE_PLACES_API_KEY,
+                },
+            )
+            data = resp.json()
+            return data.get("result", {})
+    except Exception as _e:
+        logger.warning(f"[PLACES] fetch_place_details failed for {place_id}: {_e}")
+        return {}
 
 async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
@@ -4726,4 +4785,231 @@ async def result_center(request: ResultCenterRequest):
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[RESULT] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+
+# ── Module 3: Prospect Discovery ─────────────────────────────────────────────
+
+_INDUSTRY_SEARCH_TERMS = {
+    "hospitality (hotels, restaurants, cafes)": "hotels restaurants cafes",
+    "schools & education":                      "schools coaching institutes tuition",
+    "healthcare & clinics":                     "clinics hospitals doctors medical centre",
+    "real estate":                              "real estate developers builders property dealers",
+    "retail & fashion":                         "clothing stores boutiques fashion retail",
+    "food & beverage":                          "restaurants cafes bakeries food delivery",
+    "wellness & fitness":                       "gyms fitness centres yoga wellness spa",
+    "wedding & events":                         "wedding planners event management decorators",
+    "auto & transport":                         "car dealers service centres auto garage",
+    "professional services":                    "chartered accountants lawyers consultants",
+    "coaching & tutoring":                      "coaching centres tutors training institutes",
+    "jewellery & accessories":                  "jewellery stores showrooms gold silver",
+    "interior design & architecture":           "interior designers architects home decor",
+    "photography & videography":                "photographers videographers studios",
+    "legal & ca services":                      "lawyers advocates chartered accountants",
+    "it & software companies":                  "software companies IT firms tech startups",
+    "travel & tourism":                         "travel agents tour operators holiday packages",
+    "salon & beauty":                           "salons beauty parlours makeup artists",
+    "gym & sports academy":                     "gyms sports academies fitness clubs",
+    "ngo & social enterprise":                  "NGO social enterprise non profit foundation",
+    "agriculture & dairy":                      "dairy farms agriculture suppliers",
+    "logistics & transport":                    "logistics courier transport fleet",
+    "printing & packaging":                     "printing press packaging manufacturers",
+    "construction & builders":                  "construction companies builders contractors",
+    "media & entertainment":                    "media production entertainment events",
+    "other":                                    "local businesses services",
+}
+
+def _get_search_terms(industry: str) -> str:
+    k = (industry or "").strip().lower()
+    for key, terms in _INDUSTRY_SEARCH_TERMS.items():
+        if k == key or k in key or key in k:
+            return terms
+    return k or "local businesses"
+
+
+class ProspectDiscoveryRequest(BaseModel):
+    industry:       str
+    city:           str  = "Jaipur"
+    url:            str  = ""
+    max_prospects:  int  = 15
+
+
+@app.post("/prospect-discovery")
+async def prospect_discovery(request: ProspectDiscoveryRequest):
+    try:
+        industry       = (request.industry or "").strip()
+        city           = (request.city or "Jaipur").strip()
+        max_prospects  = max(5, min(request.max_prospects, 20))
+
+        search_terms   = _get_search_terms(industry)
+        logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms!r}")
+
+        # 1. Text-search Google Places
+        raw_places = await fetch_google_places(search_terms, city, max_results=20)
+        google_places_used = bool(raw_places)
+        logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results")
+
+        # 2. Enrich top 10 with place details (parallel)
+        top_places = raw_places[:10]
+        detail_tasks = [fetch_place_details(p["place_id"]) for p in top_places if p.get("place_id")]
+        details_list = await asyncio.gather(*detail_tasks, return_exceptions=True)
+
+        enriched = []
+        for i, place in enumerate(top_places):
+            det = details_list[i] if i < len(details_list) and isinstance(details_list[i], dict) else {}
+            enriched.append({
+                "name":               det.get("name") or place.get("name", ""),
+                "address":            det.get("formatted_address") or place.get("address", ""),
+                "phone":              det.get("formatted_phone_number", ""),
+                "website":            det.get("website") or place.get("website", ""),
+                "rating":             det.get("rating") or place.get("rating"),
+                "user_ratings_total": det.get("user_ratings_total") or place.get("user_ratings_total", 0),
+                "place_id":           place.get("place_id", ""),
+                "business_status":    place.get("business_status", ""),
+                "recent_reviews":     [r.get("text", "")[:120] for r in (det.get("reviews") or [])[:2]],
+            })
+
+        # 3. Tavily social / ad presence checks for businesses with names
+        tavily_results = {}
+        if TAVILY_API_KEY and enriched:
+            tasks_social = [
+                fetch_tavily(f"{p['name']} {city} Instagram Facebook social media")
+                for p in enriched[:6]
+            ]
+            tasks_ads = [
+                fetch_tavily(f"{p['name']} {city} ads marketing campaigns")
+                for p in enriched[:6]
+            ]
+            social_data, ads_data = await asyncio.gather(
+                asyncio.gather(*tasks_social, return_exceptions=True),
+                asyncio.gather(*tasks_ads,    return_exceptions=True),
+            )
+            for i, p in enumerate(enriched[:6]):
+                tavily_results[p["name"]] = {
+                    "social": social_data[i] if isinstance(social_data[i], str) else "",
+                    "ads":    ads_data[i]    if isinstance(ads_data[i],    str) else "",
+                }
+
+        # 4. Build prompt (plain string concat — no f-string dicts)
+        RS = "RS"
+
+        biz_lines = ""
+        for i, p in enumerate(enriched):
+            tv = tavily_results.get(p["name"], {})
+            biz_lines += (
+                "\n---\n"
+                "Business " + str(i + 1) + ": " + p["name"] + "\n"
+                "Address: " + p["address"] + "\n"
+                "Phone: " + (p["phone"] or "not found") + "\n"
+                "Website: " + (p["website"] or "NONE") + "\n"
+                "Google Rating: " + str(p["rating"] or "no rating") + " (" + str(p["user_ratings_total"]) + " reviews)\n"
+                "Status: " + (p["business_status"] or "unknown") + "\n"
+                "Recent Reviews: " + (" | ".join(p["recent_reviews"]) or "none") + "\n"
+                "Social Media Intel: " + (tv.get("social") or "no data")[:300] + "\n"
+                "Ads/Marketing Intel: " + (tv.get("ads") or "no data")[:300] + "\n"
+            )
+
+        prompt = (
+            "You are a B2B prospect scoring expert for a digital marketing agency in " + city + ".\n"
+            "Industry focus: " + industry + "\n\n"
+            "Analyse these REAL local businesses found on Google Maps and score them as prospects.\n\n"
+            "SCORING RULES:\n"
+            "- No website → HIGH opportunity (score 80-95)\n"
+            "- Low rating (<3.5) + few reviews → HIGH opportunity (score 70-90)\n"
+            "- Few reviews (<20) → HIGH opportunity\n"
+            "- No social media presence → HIGH opportunity\n"
+            "- Already running active ads → LOWER opportunity (score 30-50)\n"
+            "- HOT = opportunity_score > 75\n"
+            "- WARM = opportunity_score 50-75\n"
+            "- COLD = opportunity_score < 50\n\n"
+            "For each business provide a SPECIFIC, PERSONALIZED analysis based on the actual data.\n"
+            "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness).\n"
+            "Use " + RS + " for Indian Rupee symbol in expected_ltv.\n\n"
+            "Businesses to score:\n" + biz_lines + "\n"
+            "Return JSON:\n"
+            "{\n"
+            '  "total_found": ' + str(len(enriched)) + ',\n'
+            '  "city": "' + city + '",\n'
+            '  "industry": "' + industry + '",\n'
+            '  "search_query_used": "' + search_terms + ' in ' + city + '",\n'
+            '  "data_source": "Google Places API + Tavily",\n'
+            '  "top_opportunity": "Name of best prospect and one sentence why",\n'
+            '  "prospects": [\n'
+            "    {\n"
+            '      "rank": 1,\n'
+            '      "name": "exact business name from data",\n'
+            '      "address": "exact address",\n'
+            '      "phone": "phone or empty string",\n'
+            '      "website": "url or empty string",\n'
+            '      "google_rating": 4.2,\n'
+            '      "total_reviews": 145,\n'
+            '      "classification": "hot",\n'
+            '      "opportunity_score": 85,\n'
+            '      "website_score": 30,\n'
+            '      "marketing_maturity": "low",\n'
+            '      "closing_probability": "75%",\n'
+            '      "expected_ltv": "' + RS + '25,000/month",\n'
+            '      "why_contact": "specific reason based on real data",\n'
+            '      "weakness_found": "specific weakness (no website / 3 reviews only / no Instagram / last post 4 months ago)",\n'
+            '      "recommended_service": "Meta Ads Management",\n'
+            '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + city + ' get more customers through [service]. Would love to show you what we did for similar businesses here."\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Return ONLY valid JSON. Score all " + str(len(enriched)) + " businesses. Rank by opportunity_score descending."
+        )
+
+        logger.info(f"[PROSPECT] Calling GPT-4o with {len(enriched)} businesses")
+        raw_resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=3500,
+                temperature=0.3,
+                response_format={"type": "json_object"},
+            ).choices[0].message.content
+        )
+
+        result_obj = json.loads(raw_resp)
+        result_obj = _fix_rs(result_obj)
+
+        # Separate into hot/warm/cold
+        prospects = result_obj.get("prospects", [])
+        result_obj["hot_prospects"]  = [p for p in prospects if p.get("classification", "").lower() == "hot"]
+        result_obj["warm_prospects"] = [p for p in prospects if p.get("classification", "").lower() == "warm"]
+        result_obj["cold_prospects"] = [p for p in prospects if p.get("classification", "").lower() == "cold"]
+        result_obj["total_found"]    = len(prospects)
+
+        # Trim to max_prospects
+        result_obj["prospects"] = prospects[:max_prospects]
+
+        # 5. Save to prospect_memory keyed by industry::city
+        prospect_key = derive_business_key("", industry, city)
+        _now = _dt.utcnow().isoformat()
+        def _save_prospect():
+            with engine.begin() as conn:
+                if _is_sqlite:
+                    conn.execute(text(
+                        "INSERT INTO prospect_memory (business_key, prospects_data, industry, city, created_at, updated_at) "
+                        "VALUES (:k, :d, :ind, :cit, :ca, :ua) "
+                        "ON CONFLICT(business_key) DO UPDATE SET prospects_data=:d, updated_at=:ua"
+                    ), {"k": prospect_key, "d": json.dumps(result_obj), "ind": industry, "cit": city, "ca": _now, "ua": _now})
+                else:
+                    conn.execute(text(
+                        "INSERT INTO prospect_memory (business_key, prospects_data, industry, city, created_at, updated_at) "
+                        "VALUES (:k, :d, :ind, :cit, :ca, :ua) "
+                        "ON CONFLICT(business_key) DO UPDATE SET prospects_data=:d, updated_at=:ua"
+                    ), {"k": prospect_key, "d": json.dumps(result_obj), "ind": industry, "cit": city, "ca": _now, "ua": _now})
+        await asyncio.to_thread(_save_prospect)
+        logger.info(f"[PROSPECT] Saved to prospect_memory key={prospect_key!r}")
+
+        return {
+            "success":            True,
+            "google_places_used": google_places_used,
+            "data":               result_obj,
+        }
+
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[PROSPECT] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
