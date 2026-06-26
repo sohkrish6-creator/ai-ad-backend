@@ -2785,7 +2785,7 @@ async def google_ads_campaigns(days: int = 30):
                 metrics.average_cpc
             FROM campaign
             WHERE segments.date BETWEEN '{start}' AND '{end}'
-              AND metrics.impressions > 0
+              -- -- AND metrics.impressions > 0
             ORDER BY metrics.cost_micros DESC
         """
         rows = list(service.search(customer_id=customer_id, query=query))
@@ -4005,9 +4005,8 @@ def _fetch_gads_campaigns(days: int) -> list:
                 metrics.conversions,
                 metrics.ctr
             FROM campaign
-            WHERE segments.date BETWEEN '{start}' AND '{end}'
-              AND metrics.impressions > 0
-            ORDER BY metrics.cost_micros DESC
+WHERE segments.date BETWEEN '{start}' AND '{end}'
+ORDER BY metrics.cost_micros DESC
             LIMIT 20
         """
         rows      = list(service.search(customer_id=customer_id, query=query))
