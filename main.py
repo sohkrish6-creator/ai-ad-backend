@@ -2606,7 +2606,7 @@ def get_google_ads_client():
         "client_id":         _genv("GOOGLE_ADS_CLIENT_ID"),
         "client_secret":     _genv("GOOGLE_ADS_CLIENT_SECRET"),
         "refresh_token":     _genv("GOOGLE_ADS_REFRESH_TOKEN"),
-        "login_customer_id": "3879422819",
+        "login_customer_id": _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "3879422819",
         "use_proto_plus":    True,
     }
     # Log config shape so we can verify login_customer_id is present (secrets masked)
