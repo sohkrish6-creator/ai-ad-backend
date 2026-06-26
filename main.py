@@ -209,6 +209,27 @@ CREATE TABLE IF NOT EXISTS optimizer_memory (
     created_at     TEXT,
     updated_at     TEXT
 );
+CREATE TABLE IF NOT EXISTS result_memory (
+    id             BIGSERIAL PRIMARY KEY,
+    business_key   TEXT UNIQUE NOT NULL,
+    result_data    TEXT,
+    overall_score  REAL,
+    created_at     TEXT,
+    updated_at     TEXT
+);
+CREATE TABLE IF NOT EXISTS growth_memory (
+    id               BIGSERIAL PRIMARY KEY,
+    industry         TEXT,
+    business_type    TEXT,
+    budget_range     TEXT,
+    winning_audience TEXT,
+    winning_platform TEXT,
+    winning_offer    TEXT,
+    avg_cpl          TEXT,
+    avg_roas         TEXT,
+    confidence       REAL,
+    created_at       TEXT
+);
 """
 
 def _create_memory_tables():
@@ -219,7 +240,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -267,6 +288,7 @@ _MEMORY_TABLES = {
     "kpi":         "kpi_memory",
     "performance": "performance_memory",
     "optimizer":   "optimizer_memory",
+    "result":      "result_memory",
 }
 
 def _json_val(v):
@@ -4401,4 +4423,294 @@ async def ai_optimizer(request: AIOptimizerRequest):
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[AI-OPT] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+
+# ── Module 22: Result Center ──────────────────────────────────────────────────
+
+class ResultCenterRequest(BaseModel):
+    url:      str = ""
+    industry: str = ""
+    city:     str = "Jaipur"
+
+def _save_growth_memory(gmp: dict):
+    """Insert one row into growth_memory (anonymous, no business_key)."""
+    now = datetime.now().isoformat()
+    try:
+        with engine.connect() as conn:
+            if "postgresql" in str(engine.url):
+                conn.execute(text("""
+                    INSERT INTO growth_memory
+                      (industry, business_type, budget_range, winning_audience,
+                       winning_platform, winning_offer, avg_cpl, avg_roas, confidence, created_at)
+                    VALUES (:industry, :business_type, :budget_range, :winning_audience,
+                            :winning_platform, :winning_offer, :avg_cpl, :avg_roas, :confidence, :created_at)
+                """), {
+                    "industry":         gmp.get("industry", ""),
+                    "business_type":    gmp.get("business_type", ""),
+                    "budget_range":     gmp.get("budget_range", ""),
+                    "winning_audience": gmp.get("winning_audience", ""),
+                    "winning_platform": gmp.get("winning_platform", ""),
+                    "winning_offer":    gmp.get("winning_offer", ""),
+                    "avg_cpl":          gmp.get("avg_cpl", ""),
+                    "avg_roas":         gmp.get("avg_roas", ""),
+                    "confidence":       float(gmp.get("confidence", 0) or 0),
+                    "created_at":       now,
+                })
+            else:
+                conn.execute(text("""
+                    INSERT INTO growth_memory
+                      (industry, business_type, budget_range, winning_audience,
+                       winning_platform, winning_offer, avg_cpl, avg_roas, confidence, created_at)
+                    VALUES (:industry, :business_type, :budget_range, :winning_audience,
+                            :winning_platform, :winning_offer, :avg_cpl, :avg_roas, :confidence, :created_at)
+                """), {
+                    "industry":         gmp.get("industry", ""),
+                    "business_type":    gmp.get("business_type", ""),
+                    "budget_range":     gmp.get("budget_range", ""),
+                    "winning_audience": gmp.get("winning_audience", ""),
+                    "winning_platform": gmp.get("winning_platform", ""),
+                    "winning_offer":    gmp.get("winning_offer", ""),
+                    "avg_cpl":          gmp.get("avg_cpl", ""),
+                    "avg_roas":         gmp.get("avg_roas", ""),
+                    "confidence":       float(gmp.get("confidence", 0) or 0),
+                    "created_at":       now,
+                })
+            conn.commit()
+        logger.info(f"[RESULT] Growth memory saved: industry={gmp.get('industry')!r}")
+    except Exception as _e:
+        logger.error(f"[RESULT] growth_memory save failed: {_e}")
+
+@app.post("/result-center")
+async def result_center(request: ResultCenterRequest):
+    try:
+        industry = (request.industry or "").strip()
+        city     = (request.city     or "Jaipur").strip()
+        _bk_src  = (request.url     or "").strip()
+
+        logger.info(f"[RESULT] url={request.url!r} industry={industry!r} city={city!r}")
+
+        memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+        logger.info(f"[RESULT] key={norm_key!r} tables={list(memory.keys())}")
+
+        if not memory:
+            return {"success": False, "memory_used": False,
+                    "message": "No memory found. Run Marketing Brain first with the same URL + industry."}
+
+        # ── Unpack all relevant memory tables ────────────────────────────────
+        def _jload(raw):
+            if isinstance(raw, str):
+                try: return json.loads(raw)
+                except: return {}
+            return raw or {}
+
+        def _field(table_key, field_key):
+            return _jload(_jload(memory.get(table_key, {})).get(field_key, {}))
+
+        kpi_data         = _field("kpi",         "kpi_data")
+        perf_data        = _field("performance",  "performance_data")
+        optimizer_data   = _field("optimizer",    "optimizer_data")
+        business_data    = _jload(memory.get("business",  {}))
+        audience_data    = _jload(memory.get("audience",  {}))
+        offer_data       = _field("offer",        "offer_data")
+        outreach_data    = _field("outreach",      "outreach_data")
+        opportunity_data = _field("opportunity",   "opportunity_data")
+
+        has_perf = bool(perf_data)
+        has_kpi  = bool(kpi_data)
+        has_opt  = bool(optimizer_data)
+
+        def _sv(d, *keys, dfl="N/A"):
+            cur = d
+            for k in keys:
+                if not isinstance(cur, dict): return dfl
+                cur = cur.get(k, dfl)
+            return str(cur or dfl)
+
+        # ── Build compact context for GPT ─────────────────────────────────────
+        pm_exp   = kpi_data.get("predicted_metrics", {}) or {}
+        prim_kpi = kpi_data.get("primary_kpi", {})       or {}
+        cac_ltv  = kpi_data.get("cac_ltv", {})           or {}
+        am       = perf_data.get("actual_metrics", {})   or {}
+        eva      = perf_data.get("expected_vs_actual", []) or []
+        camp_bk  = perf_data.get("campaign_breakdown", []) or []
+        health   = perf_data.get("overall_health", 0)
+        trend    = perf_data.get("trend", "N/A")
+        top_ins  = perf_data.get("top_insight", "")
+        big_prob = perf_data.get("biggest_problem", "")
+
+        def _exp(key):
+            m = pm_exp.get(key, {})
+            return (m.get("value", "N/A") if isinstance(m, dict) else str(m)) if m else "N/A"
+
+        good_camps = [c.get("campaign_name","?") for c in (camp_bk if isinstance(camp_bk,list) else [])
+                      if isinstance(c, dict) and c.get("performance_rating") == "good"]
+        poor_camps = [c.get("campaign_name","?") for c in (camp_bk if isinstance(camp_bk,list) else [])
+                      if isinstance(c, dict) and c.get("performance_rating") == "poor"]
+
+        opt_works = [r.get("what","?") for r in (optimizer_data.get("scale_recommendations",[]) or [])
+                     if isinstance(r, dict)][:3]
+        opt_pause = [r.get("what","?") for r in (optimizer_data.get("pause_recommendations",[]) or [])
+                     if isinstance(r, dict)][:3]
+
+        context = (
+            "BUSINESS: " + _sv(business_data,"business_name") +
+            " | Industry: " + (industry or _sv(business_data,"industry")) +
+            " | City: " + city + "\n\n"
+
+            "=== KPI ENGINE (Predicted) ===\n"
+            + ("NOT AVAILABLE\n" if not has_kpi else
+               "Primary KPI: " + _sv(prim_kpi,"metric") + " → " + _sv(prim_kpi,"target") + "\n"
+               "Predicted CTR: " + _exp("ctr") + " | CPC: " + _exp("cpc") + " | CPA: " + _exp("cpa") +
+               " | ROAS: " + _exp("roas") + " | Revenue: " + _exp("revenue_potential") + "\n"
+               "CAC: " + _sv(cac_ltv,"estimated_cac") + " | LTV: " + _sv(cac_ltv,"estimated_ltv") +
+               " | LTV:CAC " + _sv(cac_ltv,"ltv_cac_ratio") + "\n"
+            ) + "\n"
+
+            "=== PERFORMANCE INTELLIGENCE (Actual) ===\n"
+            + ("NOT AVAILABLE\n" if not has_perf else
+               "Health: " + str(health) + "/100 | Trend: " + str(trend) + "\n"
+               "Actual: CTR " + _sv(am,"ctr") + " | CPC " + _sv(am,"cpc") +
+               " | Cost " + _sv(am,"cost") + " | Conv " + str(am.get("conversions","?")) +
+               " | CPA " + _sv(am,"cpa") + " | ROAS " + _sv(am,"roas") + "\n"
+               "Top insight: " + str(top_ins) + "\n"
+               "Biggest problem: " + str(big_prob) + "\n"
+               + ("Good campaigns: " + ", ".join(good_camps) + "\n" if good_camps else "")
+               + ("Poor campaigns: " + ", ".join(poor_camps) + "\n" if poor_camps else "")
+            ) + "\n"
+
+            "=== AI OPTIMIZER ===\n"
+            + ("NOT AVAILABLE\n" if not has_opt else
+               "Scale: " + "; ".join(opt_works) + "\n"
+               "Pause: " + "; ".join(opt_pause) + "\n"
+               "Verdict: " + str(optimizer_data.get("overall_verdict","N/A")) + "\n"
+            ) + "\n"
+
+            "=== OFFER & AUDIENCE ===\n"
+            "Recommended offer: " + _sv(offer_data,"recommended_offer")[:200] + "\n"
+            "Lead magnet: " + _sv(offer_data,"lead_magnet")[:150] + "\n"
+            "Best opportunity audience: " + _sv(opportunity_data,"highest_roi_audience")[:150] + "\n"
+        )
+
+        no_perf_note = "" if has_perf else (
+            "NOTE: No performance data available — base revenue_summary on KPI predictions, "
+            "set actual values to 'N/A', focus on prediction_vs_actual using predicted vs benchmark.\n"
+        )
+
+        prompt = (
+            "You are a senior marketing strategist producing a final campaign results report for an Indian business.\n"
+            "Analyse all the data below and produce a comprehensive Result Center report.\n\n"
+            + context + "\n"
+            + no_perf_note + "\n"
+            "Return ONLY valid JSON (no markdown) with this EXACT schema:\n"
+            "{\n"
+            '  "campaign_verdict": "success/partial/needs_work",\n'
+            '  "overall_score": 72,\n'
+            '  "prediction_vs_actual": [\n'
+            '    {"metric":"CTR","predicted":"' + _exp("ctr") + '","actual":"' + _sv(am,"ctr") + '","verdict":"below/on_track/above","learning":"what this tells us"},\n'
+            '    {"metric":"CPC","predicted":"' + _exp("cpc") + '","actual":"' + _sv(am,"cpc") + '","verdict":"below/on_track/above","learning":"..."},\n'
+            '    {"metric":"CPA","predicted":"' + _exp("cpa") + '","actual":"' + _sv(am,"cpa") + '","verdict":"below/on_track/above","learning":"..."},\n'
+            '    {"metric":"ROAS","predicted":"' + _exp("roas") + '","actual":"' + _sv(am,"roas") + '","verdict":"below/on_track/above","learning":"..."},\n'
+            '    {"metric":"Conversions","predicted":"' + _exp("conversions") + '","actual":"' + str(am.get("conversions","N/A")) + '","verdict":"below/on_track/above","learning":"..."}\n'
+            '  ],\n'
+            '  "what_worked": [\n'
+            '    {"what":"...","why":"specific data reason","keep_doing":"..."},\n'
+            '    {"what":"...","why":"...","keep_doing":"..."}\n'
+            '  ],\n'
+            '  "what_failed": [\n'
+            '    {"what":"...","why":"specific data reason","fix_next_time":"..."},\n'
+            '    {"what":"...","why":"...","fix_next_time":"..."}\n'
+            '  ],\n'
+            '  "revenue_summary": {\n'
+            '    "total_spend": "' + _sv(am,"cost") + '",\n'
+            '    "total_leads": 0,\n'
+            '    "total_conversions": ' + str(am.get("conversions",0)) + ',\n'
+            '    "revenue_generated": "RS ...",\n'
+            '    "roas": "' + _sv(am,"roas") + '",\n'
+            '    "roi": "0%"\n'
+            '  },\n'
+            '  "best_performing": {\n'
+            '    "audience":"best audience segment from data",\n'
+            '    "creative":"best creative format or hook",\n'
+            '    "platform":"Google/Meta/etc",\n'
+            '    "campaign":"' + (good_camps[0] if good_camps else "N/A") + '"\n'
+            '  },\n'
+            '  "key_learnings": ["learning 1","learning 2","learning 3","learning 4","learning 5"],\n'
+            '  "next_campaign_recommendations": [\n'
+            '    {"recommendation":"...","reason":"specific data reason","expected_improvement":"..."},\n'
+            '    {"recommendation":"...","reason":"...","expected_improvement":"..."},\n'
+            '    {"recommendation":"...","reason":"...","expected_improvement":"..."}\n'
+            '  ],\n'
+            '  "growth_memory_packet": {\n'
+            '    "industry":"' + industry + '",\n'
+            '    "business_type":"derived from memory",\n'
+            '    "budget_range":"RS X,XXX - RS X,XXX/month",\n'
+            '    "winning_audience":"most effective audience segment",\n'
+            '    "winning_platform":"Google/Meta/etc",\n'
+            '    "winning_offer":"best performing offer",\n'
+            '    "avg_cpl":"RS ...",\n'
+            '    "avg_roas":"0x",\n'
+            '    "confidence":75\n'
+            '  },\n'
+            '  "next_actions": [\n'
+            '    {"priority":1,"action":"most important next action","deadline":"this week/this month","expected_impact":"..."},\n'
+            '    {"priority":2,"action":"...","deadline":"...","expected_impact":"..."},\n'
+            '    {"priority":3,"action":"...","deadline":"...","expected_impact":"..."}\n'
+            '  ]\n'
+            '}\n\n'
+            "Rules:\n"
+            "- Replace overall_score with an integer 0-100 (based on how closely actual matched predicted).\n"
+            "- Replace revenue_summary.total_leads and total_conversions with actual integers.\n"
+            "- Use RS prefix for all rupee values (post-processing will replace with ₹).\n"
+            "- growth_memory_packet must be anonymised — no business name, no URL, no PII.\n"
+            "- Minimum 2 items in what_worked, what_failed, next_campaign_recommendations.\n"
+            "- Minimum 5 key_learnings, minimum 3 next_actions.\n"
+            "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless.\n"
+            "- Return ONLY the JSON. Nothing else."
+        )
+
+        logger.info(f"[RESULT] GPT-4o call (prompt_len={len(prompt)})")
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2800,
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content.strip()
+        logger.info(f"[RESULT] GPT responded (len={len(raw)})")
+        result_obj = json.loads(raw)
+
+        # RS → ₹ in all string values
+        def _fix_rs(obj):
+            if isinstance(obj, str):  return obj.replace("RS ", "₹").replace("RS", "₹")
+            if isinstance(obj, dict): return {k: _fix_rs(v) for k, v in obj.items()}
+            if isinstance(obj, list): return [_fix_rs(v) for v in obj]
+            return obj
+        result_obj = _fix_rs(result_obj)
+
+        # Save result_memory
+        save_to_memory("result", norm_key, {
+            "result_data":   result_obj,
+            "overall_score": float(result_obj.get("overall_score", 0) or 0),
+        })
+
+        # Save growth_memory (anonymous)
+        gmp = result_obj.get("growth_memory_packet", {})
+        if gmp:
+            await asyncio.to_thread(_save_growth_memory, gmp)
+
+        logger.info(f"[RESULT] Done: key={norm_key!r} score={result_obj.get('overall_score')} verdict={result_obj.get('campaign_verdict')}")
+
+        return {
+            "success":     True,
+            "memory_used": True,
+            "business_key": norm_key,
+            "result":      result_obj,
+        }
+
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[RESULT] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
