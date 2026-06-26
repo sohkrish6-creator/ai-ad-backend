@@ -192,6 +192,15 @@ CREATE TABLE IF NOT EXISTS kpi_memory (
     created_at   TEXT,
     updated_at   TEXT
 );
+CREATE TABLE IF NOT EXISTS performance_memory (
+    id               BIGSERIAL PRIMARY KEY,
+    business_key     TEXT UNIQUE NOT NULL,
+    performance_data TEXT,
+    date_range       TEXT,
+    overall_health   REAL,
+    created_at       TEXT,
+    updated_at       TEXT
+);
 """
 
 def _create_memory_tables():
@@ -202,7 +211,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -248,6 +257,7 @@ _MEMORY_TABLES = {
     "visibility":  "visibility_memory",
     "outreach":    "outreach_memory",
     "kpi":         "kpi_memory",
+    "performance": "performance_memory",
 }
 
 def _json_val(v):
@@ -3798,4 +3808,353 @@ RULES:
         "memory_used":  True,
         "business_key": norm_key,
         "kpi":          kpi,
+    }
+
+
+# ── Module 20: Performance Intelligence ──────────────────────────────────────
+
+class PerformanceIntelligenceRequest(BaseModel):
+    url:        str = ""
+    industry:   str = ""
+    city:       str = "Jaipur"
+    date_range: str = "30d"
+
+def _parse_days(date_range: str) -> int:
+    mapping = {"7d": 7, "30d": 30, "90d": 90}
+    return mapping.get(date_range.lower(), 30)
+
+def _fetch_gads_performance(days: int) -> dict:
+    """Run Google Ads aggregate query — returns raw metrics dict or error."""
+    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    try:
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        end     = date.today()
+        start   = end - timedelta(days=days)
+        query   = f"""
+            SELECT
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr,
+                metrics.average_cpc
+            FROM customer
+            WHERE segments.date BETWEEN '{start}' AND '{end}'
+        """
+        response          = service.search(customer_id=customer_id, query=query)
+        total_impressions = 0
+        total_clicks      = 0
+        total_cost_micros = 0
+        total_conversions = 0.0
+        for row in response:
+            total_impressions  += row.metrics.impressions
+            total_clicks       += row.metrics.clicks
+            total_cost_micros  += row.metrics.cost_micros
+            total_conversions  += row.metrics.conversions
+
+        total_cost = total_cost_micros / 1_000_000
+        ctr        = (total_clicks / total_impressions * 100) if total_impressions else 0.0
+        avg_cpc    = (total_cost / total_clicks)             if total_clicks      else 0.0
+        cpa        = (total_cost / total_conversions)        if total_conversions else 0.0
+        return {
+            "connected":    True,
+            "impressions":  total_impressions,
+            "clicks":       total_clicks,
+            "cost_inr":     round(total_cost, 2),
+            "conversions":  round(total_conversions, 2),
+            "ctr_pct":      round(ctr, 2),
+            "avg_cpc_inr":  round(avg_cpc, 2),
+            "cpa_inr":      round(cpa, 2),
+            "start_date":   str(start),
+            "end_date":     str(end),
+        }
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[PERF-INTEL] GAds aggregate error: {errors}")
+        return {"connected": False, "error": str(errors)}
+    except Exception as ex:
+        logger.error(f"[PERF-INTEL] GAds aggregate unexpected: {ex}")
+        return {"connected": False, "error": str(ex)}
+
+def _fetch_gads_campaigns(days: int) -> list:
+    """Per-campaign breakdown — returns list or []."""
+    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    end   = date.today()
+    start = end - timedelta(days=days)
+    try:
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        query   = f"""
+            SELECT
+                campaign.id,
+                campaign.name,
+                campaign.status,
+                metrics.impressions,
+                metrics.clicks,
+                metrics.cost_micros,
+                metrics.conversions,
+                metrics.ctr
+            FROM campaign
+            WHERE segments.date BETWEEN '{start}' AND '{end}'
+              AND metrics.impressions > 0
+            ORDER BY metrics.cost_micros DESC
+            LIMIT 20
+        """
+        rows      = list(service.search(customer_id=customer_id, query=query))
+        campaigns = []
+        for row in rows:
+            cost = row.metrics.cost_micros / 1_000_000
+            imp  = row.metrics.impressions
+            clk  = row.metrics.clicks
+            conv = row.metrics.conversions
+            campaigns.append({
+                "campaign_id": str(row.campaign.id),
+                "name":        row.campaign.name,
+                "status":      row.campaign.status.name,
+                "impressions": imp,
+                "clicks":      clk,
+                "cost_inr":    round(cost, 2),
+                "conversions": round(conv, 2),
+                "ctr_pct":     round(clk / imp * 100, 2) if imp else 0.0,
+                "avg_cpc_inr": round(cost / clk, 2)      if clk else 0.0,
+            })
+        return campaigns
+    except Exception as ex:
+        logger.error(f"[PERF-INTEL] GAds campaigns error: {ex}")
+        return []
+
+@app.post("/performance-intelligence")
+async def performance_intelligence(request: PerformanceIntelligenceRequest):
+    industry   = (request.industry or "").strip()
+    city       = (request.city     or "Jaipur").strip()
+    date_range = (request.date_range or "30d").strip()
+    days       = _parse_days(date_range)
+    _bk_src    = (request.url or "").strip()
+    norm_key   = derive_business_key(_bk_src, industry, city)
+
+    logger.info(f"[PERF-INTEL] key={norm_key!r} date_range={date_range!r} days={days}")
+
+    # ── Fetch memory (expected KPIs) + real Google Ads data in parallel ──────
+    memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+
+    perf_data, campaign_rows = await asyncio.gather(
+        asyncio.to_thread(_fetch_gads_performance, days),
+        asyncio.to_thread(_fetch_gads_campaigns,  days),
+    )
+
+    google_ads_connected = perf_data.get("connected", False)
+
+    # ── Pull expected KPIs from kpi_memory if available ──────────────────────
+    _kpi_mem = memory.get("kpi", {})
+    if isinstance(_kpi_mem, str):
+        try: _kpi_mem = json.loads(_kpi_mem)
+        except: _kpi_mem = {}
+    _kpi_data = _kpi_mem.get("kpi_data", {})
+    if isinstance(_kpi_data, str):
+        try: _kpi_data = json.loads(_kpi_data)
+        except: _kpi_data = {}
+    _pm_expected = _kpi_data.get("predicted_metrics", {})
+    if isinstance(_pm_expected, str):
+        try: _pm_expected = json.loads(_pm_expected)
+        except: _pm_expected = {}
+
+    # ── Build GPT context ────────────────────────────────────────────────────
+    _bm = memory.get("business", {})
+    def _sv(d, k, default=""):
+        v = d.get(k, default) if isinstance(d, dict) else default
+        return str(v or default)
+
+    imp  = perf_data.get("impressions", 0)
+    clk  = perf_data.get("clicks", 0)
+    cost = perf_data.get("cost_inr", 0.0)
+    conv = perf_data.get("conversions", 0.0)
+    ctr  = perf_data.get("ctr_pct", 0.0)
+    cpc  = perf_data.get("avg_cpc_inr", 0.0)
+    cpa  = perf_data.get("cpa_inr", 0.0)
+    roas = round(conv / cost, 2) if cost and conv else 0.0
+
+    def _exp(key):
+        m = _pm_expected.get(key, {})
+        if isinstance(m, dict): return m.get("value", "N/A")
+        return str(m) if m else "N/A"
+
+    campaign_summary = "\n".join(
+        f"  • {c['name']} ({c['status']}): {c['impressions']:,} impr / {c['clicks']} clk / ₹{c['cost_inr']} / {c['conversions']} conv / CTR {c['ctr_pct']}%"
+        for c in campaign_rows[:8]
+    ) or "  No campaign data found."
+
+    context = f"""
+BUSINESS: {_sv(_bm, 'business_name')} | Industry: {industry} | City: {city}
+ANALYSIS PERIOD: Last {days} days ({perf_data.get('start_date', 'N/A')} → {perf_data.get('end_date', 'N/A')})
+GOOGLE ADS CONNECTED: {google_ads_connected}
+
+ACTUAL GOOGLE ADS METRICS:
+- Impressions: {imp:,}
+- Clicks: {clk}
+- CTR: {ctr}%
+- Avg CPC: ₹{cpc}
+- Total Cost: ₹{cost}
+- Conversions: {conv}
+- CPA: ₹{cpa}
+- ROAS: {roas}x
+
+EXPECTED (from KPI predictions):
+- CTR: {_exp('ctr')}
+- CPC: {_exp('cpc')}
+- CPL/CPA: {_exp('cpa')}
+- ROAS: {_exp('roas')}
+- Impressions: {_exp('impressions')}
+- Clicks: {_exp('clicks')}
+- Conversions: {_exp('conversions')}
+
+CAMPAIGN BREAKDOWN:
+{campaign_summary}
+"""
+
+    zero_spend = (cost == 0 and imp == 0)
+
+    prompt = f"""You are a senior Google Ads performance analyst for an Indian digital marketing agency.
+Analyse the following campaign performance data and return a JSON report.
+
+{context}
+
+{"NOTE: Google Ads shows zero spend and zero impressions. The account may have no active campaigns yet, or the date range returned no data." if zero_spend else ""}
+
+Return ONLY valid JSON (no markdown) with this EXACT schema:
+{{
+  "date_range": "{date_range} ({days} days)",
+  "actual_metrics": {{
+    "impressions": {imp},
+    "clicks": {clk},
+    "ctr": "{ctr}%",
+    "cpc": "₹{cpc}",
+    "cost": "₹{cost}",
+    "conversions": {conv},
+    "cpa": "₹{cpa}",
+    "roas": "{roas}x"
+  }},
+  "expected_vs_actual": [
+    {{
+      "metric": "CTR",
+      "expected": "{_exp('ctr')}",
+      "actual": "{ctr}%",
+      "status": "below/on_track/above",
+      "gap": "numeric gap with sign",
+      "action": "specific action to take based on this gap — no generic advice"
+    }},
+    {{
+      "metric": "CPC",
+      "expected": "{_exp('cpc')}",
+      "actual": "₹{cpc}",
+      "status": "below/on_track/above",
+      "gap": "numeric gap",
+      "action": "specific action"
+    }},
+    {{
+      "metric": "Conversions",
+      "expected": "{_exp('conversions')}",
+      "actual": "{conv}",
+      "status": "below/on_track/above",
+      "gap": "numeric gap",
+      "action": "specific action"
+    }},
+    {{
+      "metric": "ROAS",
+      "expected": "{_exp('roas')}",
+      "actual": "{roas}x",
+      "status": "below/on_track/above",
+      "gap": "numeric gap",
+      "action": "specific action"
+    }},
+    {{
+      "metric": "Cost",
+      "expected": "N/A",
+      "actual": "₹{cost}",
+      "status": "on_track",
+      "gap": "0",
+      "action": "budget pacing assessment for this spend level"
+    }}
+  ],
+  "campaign_breakdown": {json.dumps([
+    {{
+        "campaign_name": c["name"],
+        "status": c["status"],
+        "impressions": c["impressions"],
+        "clicks": c["clicks"],
+        "cost": f"₹{{c['cost_inr']}}",
+        "conversions": c["conversions"],
+        "ctr": f"{{c['ctr_pct']}}%",
+        "performance_rating": "good/average/poor"
+    }}
+    for c in campaign_rows[:8]
+  ], ensure_ascii=False)},
+  "top_insight": "single most important thing happening right now in 1-2 sentences — specific, data-backed",
+  "biggest_problem": "single most urgent issue to fix — specific, data-backed, no fluff",
+  "quick_wins": [
+    "specific action 1 with expected impact",
+    "specific action 2 with expected impact",
+    "specific action 3 with expected impact"
+  ],
+  "ai_analysis": "2-3 paragraphs analysing overall account performance, what is working, what needs fixing, and what the trajectory looks like. Be specific to the numbers above. No filler sentences.",
+  "overall_health": <integer 0-100 reflecting account health based on available data>,
+  "trend": "improving/stable/declining"
+}}
+
+Rules:
+- Fill campaign_breakdown[*].performance_rating as "good" (CTR >2% or conv >0), "average" (CTR 1-2%), "poor" (CTR <1% and conv=0)
+- If zero spend: set overall_health to 0, trend to "stable", top_insight to "No active campaigns found — launch a campaign to see performance data", biggest_problem to "No active spend detected in this date range", quick_wins to ["Create your first campaign in Google Ads", "Set up conversion tracking before launching", "Start with ₹500/day budget to gather initial data"]
+- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless
+- Return ONLY the JSON. Nothing else."""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2200,
+            temperature=0.3,
+        )
+        performance = json.loads(resp.choices[0].message.content.strip())
+    except Exception as _e:
+        logger.error(f"[PERF-INTEL] GPT failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    # ── Back-fill campaign_breakdown performance_rating if GPT left it blank ─
+    if not performance.get("campaign_breakdown") and campaign_rows:
+        performance["campaign_breakdown"] = []
+        for c in campaign_rows[:8]:
+            ctr_val = c.get("ctr_pct", 0)
+            conv_val = c.get("conversions", 0)
+            if ctr_val > 2 or conv_val > 0:
+                rating = "good"
+            elif ctr_val >= 1:
+                rating = "average"
+            else:
+                rating = "poor"
+            performance["campaign_breakdown"].append({
+                "campaign_name":      c["name"],
+                "status":             c["status"],
+                "impressions":        c["impressions"],
+                "clicks":             c["clicks"],
+                "cost":               f"₹{c['cost_inr']}",
+                "conversions":        c["conversions"],
+                "ctr":                f"{c['ctr_pct']}%",
+                "performance_rating": rating,
+            })
+
+    save_to_memory("performance", norm_key, {
+        "performance_data": performance,
+        "date_range":       date_range,
+        "overall_health":   float(performance.get("overall_health", 0)),
+    })
+    logger.info(f"[PERF-INTEL] Done: key={norm_key!r} health={performance.get('overall_health')} connected={google_ads_connected}")
+
+    return {
+        "success":              True,
+        "google_ads_connected": google_ads_connected,
+        "memory_used":          bool(memory),
+        "business_key":         norm_key,
+        "performance":          performance,
     }
