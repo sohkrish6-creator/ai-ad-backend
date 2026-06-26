@@ -307,6 +307,48 @@ def get_memory(business_key: str) -> dict:
             logger.error(f"[MEMORY] get_memory({table}) FAILED: {_e}")
     return result
 
+def get_memory_with_city_fallback(business_key: str, industry: str = "", city: str = "") -> tuple:
+    """
+    Returns (memory_dict, key_used).
+    1. Try exact derived key first.
+    2. If empty and city is blank: do a LIKE prefix query on business_memory to find
+       any saved key matching "url::industry::*" (any city), then load full memory
+       for that key.
+    """
+    norm_key = derive_business_key(business_key, industry, city)
+    mem = get_memory(norm_key)
+    if mem:
+        logger.info(f"[MEMORY] Exact key hit: {norm_key!r}")
+        return mem, norm_key
+
+    # Fallback: city was empty on lookup but save had a city suffix
+    if not city.strip() and industry.strip():
+        if business_key.strip():
+            _u = business_key.strip().rstrip("/").lower()
+            _u = re.sub(r'^https?://', '', _u).rstrip("/")
+            prefix = f"{_u}::{industry.strip().lower()}::"
+        else:
+            prefix = f"{industry.strip().lower()}::"
+
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT business_key FROM business_memory WHERE business_key LIKE :p ORDER BY updated_at DESC LIMIT 1"),
+                    {"p": prefix + "%"}
+                ).first()
+            if row:
+                fallback_key = row[0]
+                logger.info(f"[MEMORY] City fallback: {norm_key!r} → {fallback_key!r}")
+                mem = get_memory(fallback_key)
+                if mem:
+                    return mem, fallback_key
+        except Exception as _e:
+            logger.warning(f"[MEMORY] City fallback query failed: {_e}")
+
+    logger.info(f"[MEMORY] No memory found for key={norm_key!r} (with city fallback)")
+    return {}, norm_key
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -2758,9 +2800,9 @@ class OpportunityEngineRequest(BaseModel):
 
 @app.post("/opportunity-engine")
 async def opportunity_engine(request: OpportunityEngineRequest):
-    norm_key = derive_business_key(request.business_key, request.industry, request.city)
-    logger.info(f"[MEMORY][opportunity-engine] LOOKUP key: {norm_key!r} | business_key={request.business_key!r} industry={request.industry!r} city={request.city!r}")
-    memory   = get_memory(norm_key)
+    logger.info(f"[MEMORY][opportunity-engine] LOOKUP | business_key={request.business_key!r} industry={request.industry!r} city={request.city!r}")
+    memory, norm_key = get_memory_with_city_fallback(request.business_key, request.industry, request.city)
+    logger.info(f"[MEMORY][opportunity-engine] resolved key={norm_key!r} memory_tables={list(memory.keys())}")
 
     if not memory:
         return {
@@ -2898,9 +2940,9 @@ class OfferIntelligenceRequest(BaseModel):
 
 @app.post("/offer-intelligence")
 async def offer_intelligence(request: OfferIntelligenceRequest):
-    norm_key = derive_business_key(request.business_key, request.industry, request.city)
-    logger.info(f"[MEMORY][offer-intelligence] LOOKUP key: {norm_key!r} | business_key={request.business_key!r} industry={request.industry!r} city={request.city!r}")
-    memory   = get_memory(norm_key)
+    logger.info(f"[MEMORY][offer-intelligence] LOOKUP | business_key={request.business_key!r} industry={request.industry!r} city={request.city!r}")
+    memory, norm_key = get_memory_with_city_fallback(request.business_key, request.industry, request.city)
+    logger.info(f"[MEMORY][offer-intelligence] resolved key={norm_key!r} memory_tables={list(memory.keys())}")
 
     if not memory:
         return {
