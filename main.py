@@ -5032,6 +5032,68 @@ def _gads_customer_id():
     return _genv("GOOGLE_ADS_CUSTOMER_ID")
 
 
+@app.get("/google-ads/test-connection")
+async def gads_test_connection():
+    """Verify Google Ads connectivity and surface account details for debugging."""
+    import google.ads.googleads as _gads_pkg
+    customer_id   = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    dev_token     = _genv("GOOGLE_ADS_DEVELOPER_TOKEN")
+    api_version   = getattr(_gads_pkg, "__version__", "unknown")
+
+    # Detect library default API version from the module path
+    try:
+        from google.ads.googleads import __version__ as _lib_ver
+        # google-ads 31.x => v19, 30.x => v18, 29.x => v17, etc.
+        _major = int(_lib_ver.split(".")[0])
+        _inferred_api = f"v{_major - 12}"   # rough mapping: 31-12=19
+    except Exception:
+        _inferred_api = "unknown"
+
+    result = {
+        "customer_id":            customer_id or None,
+        "developer_token_prefix": (dev_token[:5] + "…") if dev_token else None,
+        "library_version":        api_version,
+        "api_version_inferred":   _inferred_api,
+        "connected":              False,
+        "campaigns_found":        0,
+        "campaigns_sample":       [],
+        "error":                  None,
+    }
+
+    if not customer_id:
+        result["error"] = "GOOGLE_ADS_CUSTOMER_ID env var not set"
+        return result
+
+    try:
+        def _test_sync():
+            client  = get_google_ads_client()
+            service = client.get_service("GoogleAdsService")
+            query = """
+                SELECT campaign.id, campaign.name, campaign.status
+                FROM campaign
+                ORDER BY campaign.id DESC
+                LIMIT 5
+            """
+            rows = list(service.search(customer_id=customer_id, query=query))
+            return [
+                {"id": str(r.campaign.id), "name": r.campaign.name, "status": r.campaign.status.name}
+                for r in rows
+            ]
+
+        campaigns = await asyncio.to_thread(_test_sync)
+        result["connected"]       = True
+        result["campaigns_found"] = len(campaigns)
+        result["campaigns_sample"] = campaigns
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        result["error"] = "; ".join(errors)
+    except Exception as ex:
+        result["error"] = str(ex)
+
+    return result
+
+
+
 def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type: str,
                           start_date: str, end_date: str, customer_id: str):
     """Synchronous: create CampaignBudget + Campaign + AdGroup. Returns dict."""
