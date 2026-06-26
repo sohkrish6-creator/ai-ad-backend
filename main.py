@@ -202,6 +202,13 @@ CREATE TABLE IF NOT EXISTS performance_memory (
     created_at       TEXT,
     updated_at       TEXT
 );
+CREATE TABLE IF NOT EXISTS optimizer_memory (
+    id             BIGSERIAL PRIMARY KEY,
+    business_key   TEXT UNIQUE NOT NULL,
+    optimizer_data TEXT,
+    created_at     TEXT,
+    updated_at     TEXT
+);
 """
 
 def _create_memory_tables():
@@ -212,7 +219,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -259,6 +266,7 @@ _MEMORY_TABLES = {
     "outreach":    "outreach_memory",
     "kpi":         "kpi_memory",
     "performance": "performance_memory",
+    "optimizer":   "optimizer_memory",
 }
 
 def _json_val(v):
@@ -4142,3 +4150,255 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
             "error":     str(_outer_e),
             "traceback": tb,
         }
+
+
+# ── Module 21: AI Optimizer ───────────────────────────────────────────────────
+
+class AIOptimizerRequest(BaseModel):
+    url:      str = ""
+    industry: str = ""
+    city:     str = "Jaipur"
+
+@app.post("/ai-optimizer")
+async def ai_optimizer(request: AIOptimizerRequest):
+    try:
+        industry = (request.industry or "").strip()
+        city     = (request.city     or "Jaipur").strip()
+        _bk_src  = (request.url     or "").strip()
+
+        logger.info(f"[AI-OPT] url={request.url!r} industry={industry!r} city={city!r}")
+
+        memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+        logger.info(f"[AI-OPT] key={norm_key!r} tables={list(memory.keys())}")
+
+        # ── Extract KPI + Performance memory ─────────────────────────────────
+        def _load_json_field(mem_dict, table_key, field_key):
+            raw = (mem_dict.get(table_key) or {})
+            if isinstance(raw, str):
+                try: raw = json.loads(raw)
+                except: raw = {}
+            val = raw.get(field_key, {})
+            if isinstance(val, str):
+                try: return json.loads(val)
+                except: return {}
+            return val or {}
+
+        kpi_data         = _load_json_field(memory, "kpi",         "kpi_data")
+        performance_data = _load_json_field(memory, "performance",  "performance_data")
+        business_data    = memory.get("business", {}) or {}
+        audience_data    = memory.get("audience",  {}) or {}
+        offer_data       = _load_json_field(memory, "offer",        "offer_data")
+        campaign_data    = memory.get("campaign",  {}) or {}
+        market_data      = memory.get("market",    {}) or {}
+
+        has_kpi  = bool(kpi_data)
+        has_perf = bool(performance_data)
+
+        if not has_kpi and not has_perf:
+            return {
+                "success":     False,
+                "memory_used": False,
+                "message":     "No KPI or performance data found. Run KPI Engine then Performance Intelligence first.",
+            }
+
+        # ── Safe string extractor ─────────────────────────────────────────────
+        def _sv(d, *keys, dfl="N/A"):
+            cur = d
+            for k in keys:
+                if not isinstance(cur, dict): return dfl
+                cur = cur.get(k, dfl)
+            return str(cur or dfl)
+
+        # ── KPI expected metrics ──────────────────────────────────────────────
+        pm_exp    = kpi_data.get("predicted_metrics", {}) or {}
+        primary   = kpi_data.get("primary_kpi", {})       or {}
+        cac_ltv   = kpi_data.get("cac_ltv", {})           or {}
+        budget_bk = kpi_data.get("budget_breakdown", {})  or {}
+        sec_kpis  = kpi_data.get("secondary_kpis", [])    or []
+
+        def _exp(key):
+            m = pm_exp.get(key, {})
+            if isinstance(m, dict): return m.get("value", "N/A")
+            return str(m) if m else "N/A"
+
+        # ── Performance actual metrics ────────────────────────────────────────
+        am       = performance_data.get("actual_metrics", {})    or {}
+        eva      = performance_data.get("expected_vs_actual", []) or []
+        camp_bk  = performance_data.get("campaign_breakdown", []) or []
+        qw       = performance_data.get("quick_wins", [])         or []
+        health   = performance_data.get("overall_health", "N/A")
+        trend    = performance_data.get("trend", "N/A")
+        top_ins  = performance_data.get("top_insight", "")
+        big_prob = performance_data.get("biggest_problem", "")
+
+        # ── Summarise below-target metrics from expected_vs_actual ────────────
+        below_metrics = [
+            e["metric"] + " (expected " + str(e.get("expected","?")) + ", actual " + str(e.get("actual","?")) + ", gap " + str(e.get("gap","?")) + ")"
+            for e in (eva if isinstance(eva, list) else [])
+            if isinstance(e, dict) and e.get("status") == "below"
+        ]
+        above_metrics = [
+            e["metric"] + " (" + str(e.get("actual","?")) + " vs expected " + str(e.get("expected","?")) + ")"
+            for e in (eva if isinstance(eva, list) else [])
+            if isinstance(e, dict) and e.get("status") == "above"
+        ]
+
+        poor_campaigns = [
+            c.get("campaign_name","?") + " (CTR " + str(c.get("ctr","?")) + ", cost " + str(c.get("cost","?")) + ", conv " + str(c.get("conversions","?")) + ")"
+            for c in (camp_bk if isinstance(camp_bk, list) else [])
+            if isinstance(c, dict) and c.get("performance_rating") == "poor"
+        ]
+        good_campaigns = [
+            c.get("campaign_name","?") + " (CTR " + str(c.get("ctr","?")) + ", conv " + str(c.get("conversions","?")) + ")"
+            for c in (camp_bk if isinstance(camp_bk, list) else [])
+            if isinstance(c, dict) and c.get("performance_rating") == "good"
+        ]
+
+        no_campaigns = (
+            not camp_bk
+            or (isinstance(am, dict) and str(am.get("cost","0")).replace("RS","").replace("₹","").strip() in ("0","0.0",""))
+        )
+
+        def _jstr(obj):
+            try: return json.dumps(obj, ensure_ascii=False)[:400]
+            except: return str(obj)[:400]
+
+        context = (
+            "BUSINESS: " + _sv(business_data, "business_name") +
+            " | Industry: " + (industry or _sv(business_data, "industry")) +
+            " | City: " + city + "\n\n"
+
+            "=== KPI ENGINE (Expected) ===\n"
+            + ("NOT AVAILABLE\n" if not has_kpi else (
+                "Primary KPI: " + _sv(primary, "metric") + " target " + _sv(primary, "target") + "\n"
+                "Budget: " + _sv(budget_bk, "recommended_total") +
+                " (Google: " + _sv(budget_bk, "google_ads") +
+                " / Meta: " + _sv(budget_bk, "meta_ads") +
+                " / Remarketing: " + _sv(budget_bk, "remarketing") + ")\n"
+                "Expected CTR: " + _exp("ctr") + " | CPC: " + _exp("cpc") + " | CPA: " + _exp("cpa") + " | ROAS: " + _exp("roas") + "\n"
+                "Expected Leads: " + _exp("leads") + " | Conversions: " + _exp("conversions") + " | Revenue: " + _exp("revenue_potential") + "\n"
+                "CAC: " + _sv(cac_ltv, "estimated_cac") + " | LTV: " + _sv(cac_ltv, "estimated_ltv") + " | LTV:CAC " + _sv(cac_ltv, "ltv_cac_ratio") + "\n"
+            )) + "\n"
+
+            "=== PERFORMANCE INTELLIGENCE (Actual) ===\n"
+            + ("NOT AVAILABLE\n" if not has_perf else (
+                "Health: " + str(health) + "/100 | Trend: " + str(trend) + "\n"
+                "Actual: CTR " + _sv(am, "ctr") + " | CPC " + _sv(am, "cpc") + " | Cost " + _sv(am, "cost") +
+                " | Conv " + str(am.get("conversions","?")) + " | CPA " + _sv(am, "cpa") + " | ROAS " + _sv(am, "roas") + "\n"
+                "Top Insight: " + str(top_ins or "N/A") + "\n"
+                "Biggest Problem: " + str(big_prob or "N/A") + "\n"
+                + ("BELOW TARGET: " + "; ".join(below_metrics) + "\n" if below_metrics else "")
+                + ("ABOVE TARGET: " + "; ".join(above_metrics) + "\n" if above_metrics else "")
+                + ("POOR CAMPAIGNS: " + "; ".join(poor_campaigns) + "\n" if poor_campaigns else "")
+                + ("GOOD CAMPAIGNS: " + "; ".join(good_campaigns) + "\n" if good_campaigns else "")
+                + ("Quick wins flagged: " + "; ".join(qw[:3]) + "\n" if qw else "")
+                + ("NOTE: No active campaign spend detected.\n" if no_campaigns else "")
+            )) + "\n"
+
+            "=== AUDIENCE & OFFER ===\n"
+            "Target segments: " + _sv(audience_data, "segments")[:200] + "\n"
+            "Recommended offer: " + _sv(offer_data, "recommended_offer")[:200] + "\n"
+            "Lead magnet: " + _sv(offer_data, "lead_magnet")[:200] + "\n\n"
+
+            "=== MARKET ===\n"
+            "Competition level: " + _sv(market_data, "competition_level") + "\n"
+            "Market gap: " + _sv(market_data, "market_gap")[:200] + "\n"
+        )
+
+        missing_note = ""
+        if not has_kpi:
+            missing_note = "NOTE: KPI Engine data not available — base recommendations on performance data + industry benchmarks.\n"
+        elif not has_perf:
+            missing_note = "NOTE: Performance data not available — base recommendations on KPI targets + pre-launch best practices.\n"
+
+        prompt = (
+            "You are a senior Google Ads + Meta Ads optimization strategist for an Indian digital marketing agency.\n"
+            "Based on the data below, generate a detailed, actionable optimization plan.\n\n"
+            + context + "\n"
+            + missing_note + "\n"
+            "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
+            "{\n"
+            '  "overall_verdict": "campaigns need urgent attention / on track / performing well",\n'
+            '  "health_change": "improving / stable / declining",\n'
+            '  "pause_recommendations": [\n'
+            '    {"what":"campaign or ad type to pause","why":"specific data reason","expected_saving":"RS X/month","urgency":"immediate/this week/monitor"}\n'
+            '  ],\n'
+            '  "scale_recommendations": [\n'
+            '    {"what":"what to scale","why":"specific data reason","how_much":"increase budget by X%","expected_impact":"..."}\n'
+            '  ],\n'
+            '  "audience_recommendations": [\n'
+            '    {"current":"current targeting","problem":"specific issue","recommended_change":"what to change","expected_improvement":"..."}\n'
+            '  ],\n'
+            '  "creative_recommendations": [\n'
+            '    {"issue":"specific issue from data","recommendation":"what to do","format":"image/video/carousel","hook_suggestion":"opening line for the ad"}\n'
+            '  ],\n'
+            '  "budget_recommendations": {\n'
+            '    "current_total": "RS ...",\n'
+            '    "recommended_total": "RS ...",\n'
+            '    "reallocation": [\n'
+            '      {"platform":"Google/Meta/Remarketing","current":"RS ...","recommended":"RS ...","reason":"specific reason"}\n'
+            '    ]\n'
+            '  },\n'
+            '  "keyword_recommendations": [\n'
+            '    {"action":"add/remove/modify","keyword":"...","reason":"..."}\n'
+            '  ],\n'
+            '  "this_week_actions": [\n'
+            '    {"priority":1,"action":"most impactful action","expected_impact":"...","time_to_implement":"e.g. 30 mins"},\n'
+            '    {"priority":2,"action":"...","expected_impact":"...","time_to_implement":"..."},\n'
+            '    {"priority":3,"action":"...","expected_impact":"...","time_to_implement":"..."},\n'
+            '    {"priority":4,"action":"...","expected_impact":"...","time_to_implement":"..."},\n'
+            '    {"priority":5,"action":"...","expected_impact":"...","time_to_implement":"..."}\n'
+            '  ],\n'
+            '  "next_test": {\n'
+            '    "what_to_test":"...","hypothesis":"...","how_to_measure":"...","duration":"e.g. 2 weeks"\n'
+            '  },\n'
+            '  "confidence": 75\n'
+            '}\n\n'
+            "Rules:\n"
+            "- Every recommendation must cite SPECIFIC numbers from the data above, not generic advice.\n"
+            "- Use RS as prefix for Indian Rupees (e.g. RS 5,000).\n"
+            "- this_week_actions must be ordered by impact (highest first, priority 1 = most impactful).\n"
+            "- If no active campaigns: focus pause_recommendations on pre-launch setup; scale on budget allocation plan.\n"
+            "- Minimum 2 items in pause, scale, audience, creative, keyword lists.\n"
+            "- Minimum 5 this_week_actions.\n"
+            "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless.\n"
+            "- Return ONLY the JSON. Nothing else."
+        )
+
+        logger.info(f"[AI-OPT] Sending to GPT-4o (prompt_len={len(prompt)})")
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2800,
+            temperature=0.4,
+        )
+        raw = resp.choices[0].message.content.strip()
+        logger.info(f"[AI-OPT] GPT responded (len={len(raw)})")
+        optimizer = json.loads(raw)
+
+        # Replace RS → ₹ in all string values
+        def _fix_rs(obj):
+            if isinstance(obj, str):  return obj.replace("RS ", "₹").replace("RS", "₹")
+            if isinstance(obj, dict): return {k: _fix_rs(v) for k, v in obj.items()}
+            if isinstance(obj, list): return [_fix_rs(v) for v in obj]
+            return obj
+        optimizer = _fix_rs(optimizer)
+
+        save_to_memory("optimizer", norm_key, {"optimizer_data": optimizer})
+        logger.info(f"[AI-OPT] Done: key={norm_key!r} confidence={optimizer.get('confidence')}")
+
+        return {
+            "success":     True,
+            "memory_used": True,
+            "business_key": norm_key,
+            "has_kpi":     has_kpi,
+            "has_perf":    has_perf,
+            "optimizer":   optimizer,
+        }
+
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[AI-OPT] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
