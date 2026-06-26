@@ -3418,11 +3418,13 @@ RULES:
 # ── Module 16: Outreach AI ────────────────────────────────────────────────────
 
 class OutreachAIRequest(BaseModel):
-    business_key:  str
+    url:           str = ""
     industry:      str = ""
     city:          str = "Jaipur"
     target_name:   str = ""
     outreach_goal: str = "get meeting"
+    # kept for backward compat but no longer the primary key source
+    business_key:  str = ""
 
 @app.post("/outreach-ai")
 async def outreach_ai(request: OutreachAIRequest):
@@ -3431,11 +3433,11 @@ async def outreach_ai(request: OutreachAIRequest):
     goal     = (request.outreach_goal or "get meeting").strip()
     target   = (request.target_name   or "").strip()
 
-    # ── Load ALL memory ──────────────────────────────────────────────────────
-    memory, norm_key = get_memory_with_city_fallback(
-        request.business_key, industry, city
-    )
-    logger.info(f"[OUTREACH-AI] key={norm_key!r} tables={list(memory.keys())}")
+    # ── Derive key the same way every other module does ──────────────────────
+    # Priority: url > business_key > industry-only
+    _bk_src = (request.url or request.business_key or "").strip()
+    memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+    logger.info(f"[OUTREACH-AI] url={request.url!r} key={norm_key!r} tables={list(memory.keys())}")
 
     if not memory:
         return {
