@@ -3436,8 +3436,11 @@ async def outreach_ai(request: OutreachAIRequest):
     # ── Derive key the same way every other module does ──────────────────────
     # Priority: url > business_key > industry-only
     _bk_src = (request.url or request.business_key or "").strip()
+    _preview_key = derive_business_key(_bk_src, industry, city)
+    logger.info(f"[OUTREACH-AI] INPUT url={request.url!r} industry={industry!r} city={city!r}")
+    logger.info(f"[OUTREACH-AI] Derived key (before fallback): {_preview_key!r}")
     memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
-    logger.info(f"[OUTREACH-AI] url={request.url!r} key={norm_key!r} tables={list(memory.keys())}")
+    logger.info(f"[OUTREACH-AI] Resolved key={norm_key!r} tables_found={list(memory.keys())}")
 
     if not memory:
         return {
