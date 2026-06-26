@@ -218,16 +218,17 @@ def _json_val(v):
         return json.dumps(v, ensure_ascii=False)
     return v
 
-def _normalize_biz_key(url: str, industry: str = "", city: str = "") -> str:
+def derive_business_key(url: str, industry: str = "", city: str = "") -> str:
     """
-    Produce a stable, protocol-free business key.
+    Single shared key-derivation function used by ALL endpoints (save + lookup).
 
-    Non-B2B (no target industry):  "sohscape.com"
-    B2B (url + target industry):   "sohscape.com::hospitality::jaipur"
-    Industry-only (no url):        "hospitality::jaipur"
+    Non-B2B (url only, no industry):       "sohscape.com"
+    B2B (url + target industry + city):    "sohscape.com::hospitality::jaipur"
+    Industry-only mode (no url):           "hospitality::jaipur"
 
-    Passing industry="" always gives the plain-URL key so non-B2B lookups
-    from Opportunity Engine / Offer Intelligence still hit the right row.
+    Rule: industry must be the TARGET industry (what Marketing Brain's
+    target_industry field was set to). Leave it empty for non-B2B lookups
+    so the plain-URL key is used.
     """
     if url and url.strip():
         k = url.strip().rstrip("/").lower()
@@ -241,6 +242,9 @@ def _normalize_biz_key(url: str, industry: str = "", city: str = "") -> str:
     _ind = (industry or "").strip().lower()
     _cit = (city or "").strip().lower()
     return f"{_ind}::{_cit}"
+
+# Keep old name as alias so any leftover calls don't break
+_normalize_biz_key = derive_business_key
 
 def save_to_memory(table_key: str, business_key: str, data: dict) -> tuple:
     """
@@ -953,8 +957,8 @@ For {request.target_industry} businesses in {request.target_city}, include:
     )
 
     # ── Memory: derive key + fetch existing knowledge ────────────────────────
-    _mem_key = _normalize_biz_key(request.url, request.target_industry, request.target_city)
-    logger.info(f"[MEMORY] business_key derived as: {_mem_key!r}")
+    _mem_key = derive_business_key(request.url, request.target_industry, request.target_city)
+    logger.info(f"[MEMORY][full-report] SAVE key: {_mem_key!r} | url={request.url!r} target_industry={request.target_industry!r} city={request.target_city!r}")
     _prior_memory = get_memory(_mem_key)
     memory_used = bool(_prior_memory)
 
@@ -1303,6 +1307,29 @@ For {request.target_industry} businesses in {request.target_city}, include:
         _segs = _aud.get("validated_segments") or _aud.get("segments") or []
         _ok4, _err4 = save_to_memory("audience", _mem_key, {"segments": _segs or None})
     logger.info(f"[MEMORY] audience save ({'B2B target segs' if _b2b else 'BI segs'}): {'OK' if _ok4 else 'FAIL ' + str(_err4)}")
+
+    # ── Auto-purge stale plain-URL key in B2B mode ────────────────────────────
+    # When running B2B, the correct data lives at the B2B key (url::industry::city).
+    # Any old row at the plain URL key (url only) has wrong audience data from
+    # pre-fix runs. Delete it so Opportunity Engine / Offer Intelligence can't
+    # accidentally read it when the user forgets to pass the target industry.
+    if _b2b and request.url.strip():
+        _stale_key = derive_business_key(request.url, "", "")
+        if _stale_key != _mem_key:
+            _purged = []
+            for _tbl in _MEMORY_TABLES.values():
+                try:
+                    with engine.connect() as conn:
+                        result = conn.execute(
+                            text(f"DELETE FROM {_tbl} WHERE business_key = :bk"), {"bk": _stale_key}
+                        )
+                        conn.commit()
+                        if result.rowcount:
+                            _purged.append(_tbl)
+                except Exception as _de:
+                    logger.warning(f"[MEMORY] Could not purge stale key {_stale_key!r} from {_tbl}: {_de}")
+            if _purged:
+                logger.info(f"[MEMORY] Purged stale plain-URL key {_stale_key!r} from: {_purged}")
 
     return {
         "success": True,
@@ -2615,11 +2642,37 @@ async def google_ads_daily(days: int = 30):
         return {"success": False, "error": str(ex)}
 
 @app.get("/memory")
-async def read_memory(business_key: str):
-    """Return all stored memory. Normalizes the key (strips https://)."""
-    normalized = _normalize_biz_key(business_key)
+async def read_memory(business_key: str, industry: str = "", city: str = ""):
+    """
+    Return stored memory. For B2B keys pass industry + city as query params.
+    e.g. /memory?business_key=sohscape.com&industry=Hospitality&city=Jaipur
+    """
+    normalized = derive_business_key(business_key, industry, city)
     mem = get_memory(normalized)
     return {"success": bool(mem), "business_key_raw": business_key, "business_key_normalized": normalized, "memory": mem}
+
+@app.delete("/memory/clear")
+async def clear_memory(business_key: str, industry: str = "", city: str = ""):
+    """
+    Delete all memory rows for a given business_key across all tables.
+    Use this to clear stale data. For B2B keys pass industry + city.
+    e.g. DELETE /memory/clear?business_key=sohscape.com
+         DELETE /memory/clear?business_key=sohscape.com&industry=Hospitality&city=Jaipur
+    """
+    key_to_delete = derive_business_key(business_key, industry, city)
+    deleted = {}
+    for table_key, table in _MEMORY_TABLES.items():
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(f"DELETE FROM {table} WHERE business_key = :bk"), {"bk": key_to_delete}
+                )
+                conn.commit()
+            deleted[table] = result.rowcount
+        except Exception as _e:
+            deleted[table] = f"ERROR: {_e}"
+    logger.info(f"[MEMORY] Manual clear for key={key_to_delete!r}: {deleted}")
+    return {"success": True, "key_deleted": key_to_delete, "rows_deleted": deleted}
 
 @app.get("/memory/selftest")
 async def memory_selftest():
@@ -2692,7 +2745,8 @@ class OpportunityEngineRequest(BaseModel):
 
 @app.post("/opportunity-engine")
 async def opportunity_engine(request: OpportunityEngineRequest):
-    norm_key = _normalize_biz_key(request.business_key, request.industry, request.city)
+    norm_key = derive_business_key(request.business_key, request.industry, request.city)
+    logger.info(f"[MEMORY][opportunity-engine] LOOKUP key: {norm_key!r} | business_key={request.business_key!r} industry={request.industry!r} city={request.city!r}")
     memory   = get_memory(norm_key)
 
     if not memory:
@@ -2831,7 +2885,8 @@ class OfferIntelligenceRequest(BaseModel):
 
 @app.post("/offer-intelligence")
 async def offer_intelligence(request: OfferIntelligenceRequest):
-    norm_key = _normalize_biz_key(request.business_key, request.industry, request.city)
+    norm_key = derive_business_key(request.business_key, request.industry, request.city)
+    logger.info(f"[MEMORY][offer-intelligence] LOOKUP key: {norm_key!r} | business_key={request.business_key!r} industry={request.industry!r} city={request.city!r}")
     memory   = get_memory(norm_key)
 
     if not memory:
