@@ -805,6 +805,13 @@ async def fetch_place_details(place_id: str) -> dict:
         logger.warning(f"[PLACES] fetch_place_details failed for {place_id}: {_e}")
         return {}
 
+def _fix_rs(obj):
+    """Replace 'RS' placeholder with ₹ in all string values of a JSON object."""
+    if isinstance(obj, str):  return obj.replace("RS ", "₹").replace("RS", "₹")
+    if isinstance(obj, dict): return {k: _fix_rs(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [_fix_rs(v) for v in obj]
+    return obj
+
 async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
         return []
@@ -4196,12 +4203,6 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         logger.info(f"[PERF-INTEL] GPT responded (len={len(raw_resp)})")
         performance = json.loads(raw_resp)
 
-        # ── Post-process: replace RS with ₹ symbol in string values ──────────
-        def _fix_rs(obj):
-            if isinstance(obj, str):  return obj.replace("RS", "₹")
-            if isinstance(obj, dict): return {k: _fix_rs(v) for k, v in obj.items()}
-            if isinstance(obj, list): return [_fix_rs(v) for v in obj]
-            return obj
         performance = _fix_rs(performance)
 
         # ── Back-fill campaign_breakdown if GPT returned empty ────────────────
@@ -4472,11 +4473,6 @@ async def ai_optimizer(request: AIOptimizerRequest):
         optimizer = json.loads(raw)
 
         # Replace RS → ₹ in all string values
-        def _fix_rs(obj):
-            if isinstance(obj, str):  return obj.replace("RS ", "₹").replace("RS", "₹")
-            if isinstance(obj, dict): return {k: _fix_rs(v) for k, v in obj.items()}
-            if isinstance(obj, list): return [_fix_rs(v) for v in obj]
-            return obj
         optimizer = _fix_rs(optimizer)
 
         save_to_memory("optimizer", norm_key, {"optimizer_data": optimizer})
@@ -4755,11 +4751,6 @@ async def result_center(request: ResultCenterRequest):
         result_obj = json.loads(raw)
 
         # RS → ₹ in all string values
-        def _fix_rs(obj):
-            if isinstance(obj, str):  return obj.replace("RS ", "₹").replace("RS", "₹")
-            if isinstance(obj, dict): return {k: _fix_rs(v) for k, v in obj.items()}
-            if isinstance(obj, list): return [_fix_rs(v) for v in obj]
-            return obj
         result_obj = _fix_rs(result_obj)
 
         # Save result_memory
