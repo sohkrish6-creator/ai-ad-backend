@@ -219,13 +219,28 @@ def _json_val(v):
     return v
 
 def _normalize_biz_key(url: str, industry: str = "", city: str = "") -> str:
-    """Produce a stable, protocol-free business key so saving and lookup always match."""
+    """
+    Produce a stable, protocol-free business key.
+
+    Non-B2B (no target industry):  "sohscape.com"
+    B2B (url + target industry):   "sohscape.com::hospitality::jaipur"
+    Industry-only (no url):        "hospitality::jaipur"
+
+    Passing industry="" always gives the plain-URL key so non-B2B lookups
+    from Opportunity Engine / Offer Intelligence still hit the right row.
+    """
     if url and url.strip():
         k = url.strip().rstrip("/").lower()
-        k = re.sub(r'^https?://', '', k)   # strip http:// or https://
+        k = re.sub(r'^https?://', '', k)
         k = k.rstrip("/")
+        if industry and industry.strip():
+            _ti = industry.strip().lower()
+            _tc = (city or "").strip().lower()
+            return f"{k}::{_ti}::{_tc}"
         return k
-    return f"{industry}::{city}".lower()
+    _ind = (industry or "").strip().lower()
+    _cit = (city or "").strip().lower()
+    return f"{_ind}::{_cit}"
 
 def save_to_memory(table_key: str, business_key: str, data: dict) -> tuple:
     """
@@ -1212,34 +1227,55 @@ For {request.target_industry} businesses in {request.target_city}, include:
         db.rollback()
 
     # ── Memory Save ───────────────────────────────────────────────────────────
-    logger.info(f"[MEMORY] Starting saves for key={_mem_key!r}")
+    logger.info(f"[MEMORY] Starting saves for key={_mem_key!r} b2b={bool(request.target_industry)}")
     _dna    = bi_data.get("business_dna", {})           if bi_data else {}
     _opp    = bi_data.get("opportunity", {})             if bi_data else {}
     _aud    = bi_data.get("audience_intelligence", {})   if bi_data else {}
     _thr    = bi_data.get("threat_intelligence", {})     if bi_data else {}
     _scores = bi_data.get("scores", {})                  if bi_data else {}
 
+    _b2b = bool(request.target_industry)
+    _ti  = request.target_industry or ""
+    _tc  = request.target_city or ""
+
+    # business_memory: agency's own DNA + note the B2B target context
+    _biz_positioning = (
+        f"B2B campaign targeting {_ti} businesses in {_tc}"
+        if _b2b else _dna.get("positioning_statement")
+    )
     _ok1, _err1 = save_to_memory("business", _mem_key, {
         "business_name":     _dna.get("business_name") or request.business_type,
         "industry":          _dna.get("detected_industry") or request.business_type,
-        "city":              request.target_city,
+        "city":              _tc,
         "business_dna":      _dna or None,
         "uvp":               _dna.get("value_proposition") or _dna.get("uvp"),
-        "positioning":       _dna.get("positioning_statement"),
+        "positioning":       _biz_positioning,
         "brand_score":       _scores.get("brand_strength"),
         "trust_score":       _scores.get("trust_score"),
         "opportunity_score": _scores.get("opportunity_score"),
     })
     logger.info(f"[MEMORY] business save: {'OK' if _ok1 else 'FAIL ' + str(_err1)}")
 
-    _ok2, _err2 = save_to_memory("market", _mem_key, {
-        "market_size":       str(_opp.get("market_size", "") or ""),
-        "growth":            str(_opp.get("market_growth", "") or ""),
-        "trends":            _opp.get("trending_opportunities") or None,
-        "seasonality":       _opp.get("seasonal_patterns") or None,
-        "competition_level": str(_thr.get("competition_level") or _scores.get("market_saturation") or ""),
-        "market_gap":        str(_opp.get("market_gap") or _opp.get("market_opportunity_reason") or ""),
-    })
+    # market_memory: in B2B mode, describe the target industry's market
+    if _b2b:
+        _ok2, _err2 = save_to_memory("market", _mem_key, {
+            "market_size":       f"{_ti} businesses in {_tc}",
+            "growth":            "Active B2B market",
+            "competition_level": "Medium — most agencies use generic pitches",
+            "market_gap":        (
+                f"{_ti} businesses in {_tc} are underserved — competitors use generic "
+                f"pitches not tailored to {_ti}-specific pain points, seasonality, and buying cycles"
+            ),
+        })
+    else:
+        _ok2, _err2 = save_to_memory("market", _mem_key, {
+            "market_size":       str(_opp.get("market_size", "") or ""),
+            "growth":            str(_opp.get("market_growth", "") or ""),
+            "trends":            _opp.get("trending_opportunities") or None,
+            "seasonality":       _opp.get("seasonal_patterns") or None,
+            "competition_level": str(_thr.get("competition_level") or _scores.get("market_saturation") or ""),
+            "market_gap":        str(_opp.get("market_gap") or _opp.get("market_opportunity_reason") or ""),
+        })
     logger.info(f"[MEMORY] market save: {'OK' if _ok2 else 'FAIL ' + str(_err2)}")
 
     _comp_list = []
@@ -1253,9 +1289,20 @@ For {request.target_industry} businesses in {request.target_city}, include:
     _ok3, _err3 = save_to_memory("competitor", _mem_key, {"competitors": list(dict.fromkeys(_comp_list))[:10]})
     logger.info(f"[MEMORY] competitor save: {'OK' if _ok3 else 'FAIL ' + str(_err3)}")
 
-    _segs = _aud.get("validated_segments") or _aud.get("segments") or []
-    _ok4, _err4 = save_to_memory("audience", _mem_key, {"segments": _segs or None})
-    logger.info(f"[MEMORY] audience save: {'OK' if _ok4 else 'FAIL ' + str(_err4)}")
+    # audience_memory:
+    # B2B mode → save the TARGET INDUSTRY's decision-maker segments (who the agency sells TO).
+    # Non-B2B  → save the business's own BI audience segments.
+    if _b2b:
+        _b2b_segs = [
+            f"{_ti} Owner / Founder in {_tc} — primary decision maker, controls budget, signs contracts",
+            f"{_ti} General Manager / Operations Head in {_tc} — day-to-day contact, influences vendor selection",
+            f"{_ti} Marketing In-charge in {_tc} — manages external agencies, evaluates ROI",
+        ]
+        _ok4, _err4 = save_to_memory("audience", _mem_key, {"segments": _b2b_segs})
+    else:
+        _segs = _aud.get("validated_segments") or _aud.get("segments") or []
+        _ok4, _err4 = save_to_memory("audience", _mem_key, {"segments": _segs or None})
+    logger.info(f"[MEMORY] audience save ({'B2B target segs' if _b2b else 'BI segs'}): {'OK' if _ok4 else 'FAIL ' + str(_err4)}")
 
     return {
         "success": True,
