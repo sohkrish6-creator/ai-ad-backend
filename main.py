@@ -158,6 +158,15 @@ CREATE TABLE IF NOT EXISTS offer_memory (
     created_at   TEXT,
     updated_at   TEXT
 );
+CREATE TABLE IF NOT EXISTS website_memory (
+    id            BIGSERIAL PRIMARY KEY,
+    business_key  TEXT UNIQUE NOT NULL,
+    url           TEXT,
+    audit_data    TEXT,
+    overall_score REAL,
+    created_at    TEXT,
+    updated_at    TEXT
+);
 """
 
 def _create_memory_tables():
@@ -168,7 +177,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory"]
+                           "offer_memory", "website_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -210,6 +219,7 @@ _MEMORY_TABLES = {
     "campaign":    "campaign_memory",
     "opportunity": "opportunity_memory",
     "offer":       "offer_memory",
+    "website":     "website_memory",
 }
 
 def _json_val(v):
@@ -3061,4 +3071,152 @@ Respond ONLY with valid JSON — no markdown, no explanation:
         "memory_used":  True,
         "business_key": norm_key,
         "offer":        offer,
+    }
+
+
+# ── Module 14: Website Intelligence ──────────────────────────────────────────
+
+class WebsiteIntelligenceRequest(BaseModel):
+    url:          str
+    business_key: str = ""
+    industry:     str = ""
+    city:         str = ""
+
+@app.post("/website-intelligence")
+async def website_intelligence(request: WebsiteIntelligenceRequest):
+    url = (request.url or "").strip()
+    if not url:
+        return {"success": False, "error": "URL is required"}
+
+    # Derive memory key (use explicit business_key if provided, else derive from url)
+    _bk_src = request.business_key.strip() or url
+    norm_key = derive_business_key(_bk_src, request.industry, request.city)
+    logger.info(f"[WEBSITE-INTEL] url={url!r} key={norm_key!r}")
+
+    # Load prior memory for richer context
+    memory_used = False
+    memory_context = ""
+    _mem = get_memory(norm_key)
+    if _mem:
+        memory_used = True
+        _bm = _mem.get("business", {})
+        _mm = _mem.get("market", {})
+        _am = _mem.get("audience", {})
+        _segs = _am.get("segments", [])
+        if isinstance(_segs, str):
+            try: _segs = json.loads(_segs)
+            except: _segs = [_segs]
+        memory_context = f"""
+PREVIOUSLY KNOWN ABOUT THIS BUSINESS:
+- Name: {_bm.get("business_name", "Unknown")} | Industry: {_bm.get("industry", "")} | City: {_bm.get("city", "")}
+- UVP: {_bm.get("uvp", "")}
+- Positioning: {_bm.get("positioning", "")}
+- Market gap: {_mm.get("market_gap", "")}
+- Target audience segments: {", ".join(str(s) for s in _segs[:3]) if _segs else "Not known"}
+Use this to judge whether the website speaks to the right audience with the right message.
+"""
+
+    # Crawl
+    crawled = await fetch_firecrawl(url)
+    if not crawled:
+        crawled = f"[Crawl returned empty — analyse based on URL and any context available]"
+    crawled_trimmed = crawled[:7000]
+
+    prompt = f"""You are an expert website conversion auditor. Analyse the website content below and return a detailed, actionable audit as a JSON object.
+
+WEBSITE URL: {url}
+{memory_context}
+--- CRAWLED WEBSITE CONTENT ---
+{crawled_trimmed}
+--- END OF CONTENT ---
+
+Return ONLY valid JSON (no markdown, no prose outside JSON) matching this exact schema:
+{{
+  "overall_score": <integer 0-100>,
+  "homepage": {{
+    "headline_clarity": <integer 0-100>,
+    "value_prop_clear": <true|false>,
+    "cta_above_fold": <true|false>,
+    "issues": ["specific issue found in actual content", ...],
+    "fixes":  ["exact fix with example copy or element name", ...]
+  }},
+  "trust_signals": {{
+    "score": <integer 0-100>,
+    "found":   ["list of trust elements actually present on site"],
+    "missing": ["list of trust elements absent but needed"],
+    "fixes":   ["specific additions with placement recommendations"]
+  }},
+  "conversion": {{
+    "score": <integer 0-100>,
+    "form_present": <true|false>,
+    "cta_count": <integer>,
+    "cta_quality": "<weak|medium|strong>",
+    "issues": ["specific conversion problems found"],
+    "fixes":  ["specific conversion improvements with examples"]
+  }},
+  "content": {{
+    "score": <integer 0-100>,
+    "blog_present": <true|false>,
+    "portfolio_present": <true|false>,
+    "issues": ["specific content gaps or problems"],
+    "fixes":  ["specific content additions or rewrites needed"]
+  }},
+  "speed_seo": {{
+    "score": <integer 0-100>,
+    "mobile_friendly": <true|false>,
+    "meta_description": <true|false>,
+    "issues": ["specific SEO or technical issues"],
+    "fixes":  ["specific technical fixes"]
+  }},
+  "priority_fixes": [
+    "Fix 1 — highest conversion impact (be specific, reference actual page element)",
+    "Fix 2",
+    "Fix 3",
+    "Fix 4",
+    "Fix 5"
+  ],
+  "quick_wins": [
+    "Win 1 — can be done TODAY, no dev needed",
+    "Win 2",
+    "Win 3"
+  ],
+  "overall_verdict": "One sentence naming the single biggest problem holding this website back from converting visitors."
+}}
+
+RULES:
+- Every issue and fix must reference something SPECIFIC found (or absent) on this actual website — no generic advice.
+- Priority fixes must be ordered by conversion impact (revenue impact first), not implementation difficulty.
+- Quick wins must genuinely be doable TODAY — copy changes, a WhatsApp button, a testimonial added.
+- overall_score is a weighted average: homepage 25%, trust_signals 25%, conversion 30%, content 10%, speed_seo 10%.
+- BANNED words in all text: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer, Dive in.
+- Return ONLY the JSON object. No explanation outside it."""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2200,
+            temperature=0.3,
+        )
+        raw   = resp.choices[0].message.content.strip()
+        audit = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[WEBSITE-INTEL] GPT call failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    save_to_memory("website", norm_key, {
+        "url":           url,
+        "audit_data":    audit,
+        "overall_score": float(audit.get("overall_score", 0)),
+    })
+    logger.info(f"[WEBSITE-INTEL] Done: key={norm_key!r} score={audit.get('overall_score')}")
+
+    return {
+        "success":      True,
+        "url":          url,
+        "memory_used":  memory_used,
+        "business_key": norm_key,
+        "audit":        audit,
     }
