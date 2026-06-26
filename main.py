@@ -167,6 +167,15 @@ CREATE TABLE IF NOT EXISTS website_memory (
     created_at    TEXT,
     updated_at    TEXT
 );
+CREATE TABLE IF NOT EXISTS visibility_memory (
+    id               BIGSERIAL PRIMARY KEY,
+    business_key     TEXT UNIQUE NOT NULL,
+    url              TEXT,
+    visibility_data  TEXT,
+    overall_score    REAL,
+    created_at       TEXT,
+    updated_at       TEXT
+);
 """
 
 def _create_memory_tables():
@@ -177,7 +186,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory"]
+                           "offer_memory", "website_memory", "visibility_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -220,6 +229,7 @@ _MEMORY_TABLES = {
     "opportunity": "opportunity_memory",
     "offer":       "offer_memory",
     "website":     "website_memory",
+    "visibility":  "visibility_memory",
 }
 
 def _json_val(v):
@@ -3219,4 +3229,179 @@ RULES:
         "memory_used":  memory_used,
         "business_key": norm_key,
         "audit":        audit,
+    }
+
+
+# ── Module 15: Visibility Intelligence (SEO + AEO + GEO) ─────────────────────
+
+class VisibilityIntelligenceRequest(BaseModel):
+    url:          str
+    industry:     str = ""
+    city:         str = ""
+    business_key: str = ""
+
+@app.post("/visibility-intelligence")
+async def visibility_intelligence(request: VisibilityIntelligenceRequest):
+    url = (request.url or "").strip()
+    if not url:
+        return {"success": False, "error": "URL is required"}
+
+    _bk_src  = request.business_key.strip() or url
+    norm_key = derive_business_key(_bk_src, request.industry, request.city)
+    industry = request.industry.strip() or "business"
+    city     = request.city.strip()     or "India"
+    logger.info(f"[VISIBILITY-INTEL] url={url!r} key={norm_key!r} industry={industry!r} city={city!r}")
+
+    # ── Memory context ──────────────────────────────────────────────────────
+    memory_used    = False
+    memory_context = ""
+    _mem = get_memory(norm_key)
+    if _mem:
+        memory_used = True
+        _bm  = _mem.get("business", {})
+        _mm  = _mem.get("market",   {})
+        _wm  = _mem.get("website",  {})
+        memory_context = f"""
+PREVIOUSLY KNOWN:
+- Business: {_bm.get("business_name", "")} | Industry: {_bm.get("industry", "")} | City: {_bm.get("city", "")}
+- UVP: {_bm.get("uvp", "")}
+- Market gap: {_mm.get("market_gap", "")}
+- Website audit score: {_wm.get("overall_score", "not yet audited")}
+"""
+
+    # ── Parallel data fetch ─────────────────────────────────────────────────
+    crawled_task = fetch_firecrawl(url)
+    tavily_task  = fetch_tavily(f"{industry} {city} SEO keywords ranking 2026")
+    crawled, tavily_data = await asyncio.gather(crawled_task, tavily_task)
+
+    crawled_trimmed = (crawled or "")[:5000]
+    tavily_trimmed  = (tavily_data or "")[:2000]
+
+    # ── GPT-4o ─────────────────────────────────────────────────────────────
+    prompt = f"""You are an expert in SEO, AEO (Answer Engine Optimisation), and GEO (Generative Engine Optimisation).
+Analyse the website content and live keyword data below and return a comprehensive visibility audit as a JSON object.
+
+BUSINESS URL: {url}
+INDUSTRY: {industry}
+CITY: {city}
+{memory_context}
+
+--- CRAWLED WEBSITE CONTENT ---
+{crawled_trimmed if crawled_trimmed else '[Crawl returned empty — infer from URL and context]'}
+--- END CRAWLED CONTENT ---
+
+--- LIVE KEYWORD / MARKET DATA (Tavily) ---
+{tavily_trimmed if tavily_trimmed else '[No live data — use industry knowledge]'}
+--- END LIVE DATA ---
+
+Return ONLY a valid JSON object matching this EXACT schema (no markdown, no text outside JSON):
+{{
+  "overall_visibility_score": <integer 0-100>,
+  "seo": {{
+    "score": <integer 0-100>,
+    "current_keywords": ["keywords the site currently seems to target — based on actual content"],
+    "missing_keywords": ["high-value keywords NOT targeted but should be"],
+    "recommended_keywords": [
+      {{"keyword": "...", "intent": "informational|transactional|local", "priority": "high|medium|low"}},
+      {{"keyword": "...", "intent": "...", "priority": "..."}},
+      {{"keyword": "...", "intent": "...", "priority": "..."}},
+      {{"keyword": "...", "intent": "...", "priority": "..."}},
+      {{"keyword": "...", "intent": "...", "priority": "..."}},
+      {{"keyword": "...", "intent": "...", "priority": "..."}}
+    ],
+    "on_page_issues": ["specific issues found in crawled content"],
+    "content_gaps": ["topics competitors cover that this site doesn't address at all"],
+    "quick_wins": ["SEO fix 1 — do this week", "SEO fix 2", "SEO fix 3"],
+    "schema_needed": ["LocalBusiness", "FAQ", "Service", "Review", "etc based on site type"]
+  }},
+  "aeo": {{
+    "score": <integer 0-100>,
+    "what_is_aeo": "Answer Engine Optimisation — appearing in Google featured snippets, People Also Ask boxes, and voice search results",
+    "current_status": "one sentence on how well this site currently answers questions (based on crawled content)",
+    "recommended_questions": [
+      "Question 1 real users search related to this business",
+      "Question 2",
+      "Question 3",
+      "Question 4",
+      "Question 5"
+    ],
+    "content_format_needed": ["FAQ page", "How-to guides", "Definition pages", "Comparison pages", "etc"],
+    "quick_wins": ["AEO action 1 — do this week", "AEO action 2", "AEO action 3"]
+  }},
+  "geo": {{
+    "score": <integer 0-100>,
+    "what_is_geo": "Generative Engine Optimisation — making your business appear in answers from ChatGPT, Gemini, Perplexity, and other AI assistants",
+    "current_status": "one sentence on how likely this business appears in AI assistant answers right now",
+    "recommended_actions": [
+      "Specific GEO action 1",
+      "Specific GEO action 2",
+      "Specific GEO action 3",
+      "Specific GEO action 4",
+      "Specific GEO action 5"
+    ],
+    "content_needed": ["types of content AI assistants cite — e.g. data-backed articles, expert guides, press mentions"],
+    "quick_wins": ["GEO action 1 — this week", "GEO action 2", "GEO action 3"]
+  }},
+  "content_strategy": {{
+    "score": <integer 0-100>,
+    "recommended_topics": [
+      "Topic 1 — high SEO+AEO+GEO value",
+      "Topic 2", "Topic 3", "Topic 4", "Topic 5", "Topic 6", "Topic 7", "Topic 8"
+    ],
+    "content_calendar_hint": "which topics to publish first and why — reference search volume timing or seasonal intent",
+    "internal_linking": ["Internal linking opportunity 1", "opportunity 2", "opportunity 3"]
+  }},
+  "local_seo": {{
+    "score": <integer 0-100>,
+    "google_business_profile": "present|missing|unknown",
+    "local_keywords": [
+      "local keyword 1 — specific to {industry} in {city}",
+      "local keyword 2", "local keyword 3", "local keyword 4", "local keyword 5"
+    ],
+    "citation_opportunities": ["directory 1", "directory 2", "directory 3", "directory 4"],
+    "quick_wins": ["local SEO win 1 — this week", "local SEO win 2", "local SEO win 3"]
+  }},
+  "priority_actions": [
+    "Action 1 — highest ROI (be specific, reference actual gap)",
+    "Action 2", "Action 3", "Action 4", "Action 5"
+  ],
+  "overall_verdict": "One sentence naming the single biggest visibility gap holding this business back."
+}}
+
+RULES:
+- All keywords must be SPECIFIC to {industry} in {city} — no generic terms like "marketing services".
+- AEO questions must reflect real user searches, not generic FAQ content.
+- GEO actions must be practical and achievable without a developer.
+- Every on_page_issue must reference something specific in the crawled content.
+- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer.
+- Return ONLY the JSON object. No explanation outside it."""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2800,
+            temperature=0.3,
+        )
+        raw        = resp.choices[0].message.content.strip()
+        visibility = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[VISIBILITY-INTEL] GPT call failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    save_to_memory("visibility", norm_key, {
+        "url":             url,
+        "visibility_data": visibility,
+        "overall_score":   float(visibility.get("overall_visibility_score", 0)),
+    })
+    logger.info(f"[VISIBILITY-INTEL] Done: key={norm_key!r} score={visibility.get('overall_visibility_score')}")
+
+    return {
+        "success":      True,
+        "url":          url,
+        "memory_used":  memory_used,
+        "business_key": norm_key,
+        "visibility":   visibility,
     }
