@@ -176,6 +176,13 @@ CREATE TABLE IF NOT EXISTS visibility_memory (
     created_at       TEXT,
     updated_at       TEXT
 );
+CREATE TABLE IF NOT EXISTS outreach_memory (
+    id            BIGSERIAL PRIMARY KEY,
+    business_key  TEXT UNIQUE NOT NULL,
+    outreach_data TEXT,
+    created_at    TEXT,
+    updated_at    TEXT
+);
 """
 
 def _create_memory_tables():
@@ -186,7 +193,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -230,6 +237,7 @@ _MEMORY_TABLES = {
     "offer":       "offer_memory",
     "website":     "website_memory",
     "visibility":  "visibility_memory",
+    "outreach":    "outreach_memory",
 }
 
 def _json_val(v):
@@ -3404,4 +3412,187 @@ RULES:
         "memory_used":  memory_used,
         "business_key": norm_key,
         "visibility":   visibility,
+    }
+
+
+# ── Module 16: Outreach AI ────────────────────────────────────────────────────
+
+class OutreachAIRequest(BaseModel):
+    business_key:  str
+    industry:      str = ""
+    city:          str = "Jaipur"
+    target_name:   str = ""
+    outreach_goal: str = "get meeting"
+
+@app.post("/outreach-ai")
+async def outreach_ai(request: OutreachAIRequest):
+    industry = (request.industry or "").strip()
+    city     = (request.city     or "Jaipur").strip()
+    goal     = (request.outreach_goal or "get meeting").strip()
+    target   = (request.target_name   or "").strip()
+
+    # ── Load ALL memory ──────────────────────────────────────────────────────
+    memory, norm_key = get_memory_with_city_fallback(
+        request.business_key, industry, city
+    )
+    logger.info(f"[OUTREACH-AI] key={norm_key!r} tables={list(memory.keys())}")
+
+    if not memory:
+        return {
+            "success":     False,
+            "memory_used": False,
+            "message":     (
+                "No memory found for this business. "
+                "Run Marketing Brain first with the same URL + industry to build memory."
+            ),
+        }
+
+    # ── Build rich context string from all tables ────────────────────────────
+    _bm   = memory.get("business", {})
+    _mm   = memory.get("market",   {})
+    _cm   = memory.get("competitor", {})
+    _am   = memory.get("audience",  {})
+    _opm  = memory.get("opportunity", {})
+    _ofm  = memory.get("offer",     {})
+    _wm   = memory.get("website",   {})
+    _vm   = memory.get("visibility", {})
+
+    def _safe_list(val):
+        if isinstance(val, list): return val
+        if isinstance(val, str):
+            try:   return json.loads(val)
+            except: return [val] if val else []
+        return []
+
+    _segs       = _safe_list(_am.get("segments"))
+    _competitors = _safe_list(_cm.get("competitors"))
+    _opp_data   = _opm.get("opportunity_data") or {}
+    _offer_data = _ofm.get("offer_data") or {}
+    if isinstance(_opp_data, str):
+        try: _opp_data = json.loads(_opp_data)
+        except: _opp_data = {}
+    if isinstance(_offer_data, str):
+        try: _offer_data = json.loads(_offer_data)
+        except: _offer_data = {}
+
+    context = f"""
+BUSINESS CONTEXT (from memory):
+- Business / Agency: {_bm.get("business_name", "Sohscape")} | UVP: {_bm.get("uvp", "")}
+- Positioning: {_bm.get("positioning", "")}
+- Industry being targeted: {industry or _bm.get("industry", "")}
+- City: {city}
+- Outreach goal: {goal}
+{f"- Specific target: {target}" if target else ""}
+
+MARKET INTELLIGENCE:
+- Market size: {_mm.get("market_size", "")}
+- Key gap: {_mm.get("market_gap", "")}
+- Competition level: {_mm.get("competition_level", "")}
+
+COMPETITORS (to differentiate from):
+{", ".join(_competitors[:5]) if _competitors else "Not specified"}
+
+TARGET AUDIENCE SEGMENTS:
+{chr(10).join(f"• {s}" for s in _segs[:3]) if _segs else "Business owners / decision makers in " + industry}
+
+BEST OPPORTUNITY (from Opportunity Engine):
+- Highest ROI audience: {_opp_data.get("highest_roi_audience", "")}
+- Best offer: {_opp_data.get("recommended_offer", "")}
+- Best platform: {_opp_data.get("best_platform", "")}
+
+RECOMMENDED OFFER (from Offer Intelligence):
+- Offer: {_offer_data.get("recommended_offer", "")}
+- Lead magnet: {_offer_data.get("lead_magnet", "")}
+- Guarantee: {_offer_data.get("guarantee", "")}
+- CTA: {_offer_data.get("cta", "")}
+
+WEBSITE STATUS:
+- Audit score: {_wm.get("overall_score", "not audited")}
+"""
+
+    # ── GPT-4o ───────────────────────────────────────────────────────────────
+    prompt = f"""You are a senior B2B sales copywriter specialising in Indian market outreach for digital marketing agencies.
+Generate a complete, personalised outreach kit based on the business context below. Every message must feel written for a real human, not a template.
+
+{context}
+
+Return ONLY a valid JSON object matching this EXACT schema (no markdown, no text outside JSON):
+{{
+  "cold_email": {{
+    "subject": "subject line — curiosity-driven, under 8 words, no clickbait",
+    "body": "email body — under 150 words, 3 short paragraphs, reference specific {industry} pain point, end with one soft ask",
+    "ps_line": "P.S. one sentence with social proof or urgency",
+    "why_it_works": "one sentence explaining the psychology behind this email"
+  }},
+  "linkedin_message": {{
+    "connection_request": "connection note — STRICTLY under 300 characters, mention a specific observation about their business or industry",
+    "follow_up_message": "message to send after they accept — 3-4 sentences, reference what they do, propose a specific micro-commitment",
+    "why_it_works": "one sentence"
+  }},
+  "whatsapp": {{
+    "message_1_pain": "First WhatsApp — lead with their pain point, 3-4 lines, end with 'Reply AUDIT to get a free audit'",
+    "message_2_proof": "Second WhatsApp (send 2 days later if no reply) — lead with a result or case study, 3-4 lines, end with 'Reply AUDIT'",
+    "follow_up_day3": "Day 3 follow-up — very short, casual Hinglish, 2 lines max, different angle",
+    "follow_up_day7": "Day 7 final follow-up — breakup message, 2 lines, create scarcity or FOMO"
+  }},
+  "instagram_dm": {{
+    "opener": "STRICTLY 3 lines max — start with a specific observation about their account or post, casual Hinglish, end with a soft question",
+    "follow_up": "Follow-up DM if no reply in 3 days — 2 lines, reference the opener, add light social proof",
+    "why_it_works": "one sentence"
+  }},
+  "call_script": {{
+    "opener_10sec": "10-second cold call opener — introduce yourself, name the specific pain, ask one yes/no question",
+    "pain_question": "The single best discovery question to reveal their marketing pain — open-ended",
+    "value_statement": "30-second value pitch after they share pain — specific, no fluff, reference results",
+    "close": "Meeting booking close — specific day/time suggestion, make it easy to say yes"
+  }},
+  "objection_handling": [
+    {{"objection": "We already have someone", "response": "specific response referencing {industry} context — acknowledge + differentiate + propose small next step"}},
+    {{"objection": "No budget right now", "response": "specific response — reframe ROI for {industry} business, offer a low-risk entry point"}},
+    {{"objection": "Not interested", "response": "pattern-interrupt response — ask one question that reveals their actual concern"}},
+    {{"objection": "Send me details / Send a proposal", "response": "response that gets a meeting instead of sending to a black hole"}}
+  ],
+  "follow_up_sequence": {{
+    "day1": "Same day after first contact — what to send/say",
+    "day3": "Day 3 touch — different channel or angle",
+    "day7": "Day 7 — add value (share a tip, insight, or quick audit finding)",
+    "day14": "Day 14 — final attempt, clear close or let them go gracefully"
+  }},
+  "proposal_opener": "First paragraph of a proposal — personalised, reference their specific situation, state the transformation without using banned words, under 80 words",
+  "confidence": <integer 0-100 — how personalised this kit is based on available memory>
+}}
+
+RULES:
+- WhatsApp and Instagram must mix Hindi/Hinglish naturally — like a real Jaipur agency owner would write. NOT robotic translation.
+- Cold email body must be UNDER 150 words. Count carefully.
+- LinkedIn connection_request STRICTLY under 300 characters. Count carefully.
+- Instagram opener STRICTLY 3 lines. No more.
+- Call script opener must be deliverable in under 10 seconds.
+- Every objection response must reference the specific {industry} context.
+- BANNED words in all copy: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Game-changer, Dive in.
+- Return ONLY the JSON object. Nothing outside it."""
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=2800,
+            temperature=0.5,
+        )
+        raw      = resp.choices[0].message.content.strip()
+        outreach = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[OUTREACH-AI] GPT call failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    save_to_memory("outreach", norm_key, {"outreach_data": outreach})
+    logger.info(f"[OUTREACH-AI] Done: key={norm_key!r} confidence={outreach.get('confidence')}")
+
+    return {
+        "success":      True,
+        "memory_used":  True,
+        "business_key": norm_key,
+        "outreach":     outreach,
     }
