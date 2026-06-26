@@ -2620,6 +2620,19 @@ def get_google_ads_client():
     )
     return GoogleAdsClient.load_from_dict(config)
 
+@app.get("/google-ads/debug2")
+async def google_ads_debug2():
+    """Show exact login_customer_id being used."""
+    login = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
+    cust = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    return {
+        "login_customer_id_raw": login,
+        "customer_id_raw": cust,
+        "login_len": len(login),
+        "cust_len": len(cust),
+        "login_repr": repr(login),
+    }
+
 @app.get("/google-ads/debug")
 async def google_ads_debug():
     """Check Google Ads env vars — sensitive values hidden, IDs masked to last 4 digits."""
