@@ -305,22 +305,22 @@ def derive_business_key(url: str, industry: str = "", city: str = "") -> str:
     B2B (url + target industry + city):    "sohscape.com::hospitality::jaipur"
     Industry-only mode (no url):           "hospitality::jaipur"
 
-    Rule: industry must be the TARGET industry (what Marketing Brain's
-    target_industry field was set to). Leave it empty for non-B2B lookups
-    so the plain-URL key is used.
+    City always defaults to "jaipur" when blank so keys are ALWAYS complete
+    and consistent regardless of whether the frontend sent city="" or city="Jaipur".
     """
+    # City default: ALWAYS "jaipur" when blank — prevents key mismatches
+    _tc = (city or "").strip().lower() or "jaipur"
+
     if url and url.strip():
         k = url.strip().rstrip("/").lower()
         k = re.sub(r'^https?://', '', k)
         k = k.rstrip("/")
         if industry and industry.strip():
             _ti = industry.strip().lower()
-            _tc = (city or "").strip().lower()
             return f"{k}::{_ti}::{_tc}"
         return k
     _ind = (industry or "").strip().lower()
-    _cit = (city or "").strip().lower()
-    return f"{_ind}::{_cit}"
+    return f"{_ind}::{_tc}"
 
 # Keep old name as alias so any leftover calls don't break
 _normalize_biz_key = derive_business_key
@@ -389,10 +389,9 @@ def get_memory(business_key: str) -> dict:
 def get_memory_with_city_fallback(business_key: str, industry: str = "", city: str = "") -> tuple:
     """
     Returns (memory_dict, key_used).
-    1. Try exact derived key first.
-    2. If empty and city is blank: do a LIKE prefix query on business_memory to find
-       any saved key matching "url::industry::*" (any city), then load full memory
-       for that key.
+    1. Try exact derived key (city defaults to 'jaipur' in derive_business_key).
+    2. If miss: try the legacy blank-city key (data saved before the city-default fix).
+    3. If still miss: LIKE prefix query to find any key matching url::industry::*
     """
     norm_key = derive_business_key(business_key, industry, city)
     mem = get_memory(norm_key)
@@ -400,15 +399,28 @@ def get_memory_with_city_fallback(business_key: str, industry: str = "", city: s
         logger.info(f"[MEMORY] Exact key hit: {norm_key!r}")
         return mem, norm_key
 
-    # Fallback: city was empty on lookup but save had a city suffix
-    if not city.strip() and industry.strip():
+    # Legacy fallback 1: key was saved with empty city suffix (pre-fix data)
+    if industry.strip():
+        if business_key.strip():
+            _u = business_key.strip().rstrip("/").lower()
+            _u = re.sub(r'^https?://', '', _u).rstrip("/")
+            legacy_key = f"{_u}::{industry.strip().lower()}::"
+        else:
+            legacy_key = f"{industry.strip().lower()}::"
+        if legacy_key != norm_key:
+            mem = get_memory(legacy_key)
+            if mem:
+                logger.info(f"[MEMORY] Legacy blank-city fallback: {norm_key!r} → {legacy_key!r}")
+                return mem, legacy_key
+
+    # Legacy fallback 2: LIKE prefix scan — finds any city suffix
+    if industry.strip():
         if business_key.strip():
             _u = business_key.strip().rstrip("/").lower()
             _u = re.sub(r'^https?://', '', _u).rstrip("/")
             prefix = f"{_u}::{industry.strip().lower()}::"
         else:
             prefix = f"{industry.strip().lower()}::"
-
         try:
             with engine.connect() as conn:
                 row = conn.execute(
@@ -417,14 +429,14 @@ def get_memory_with_city_fallback(business_key: str, industry: str = "", city: s
                 ).first()
             if row:
                 fallback_key = row[0]
-                logger.info(f"[MEMORY] City fallback: {norm_key!r} → {fallback_key!r}")
+                logger.info(f"[MEMORY] LIKE fallback: {norm_key!r} → {fallback_key!r}")
                 mem = get_memory(fallback_key)
                 if mem:
                     return mem, fallback_key
         except Exception as _e:
-            logger.warning(f"[MEMORY] City fallback query failed: {_e}")
+            logger.warning(f"[MEMORY] LIKE fallback query failed: {_e}")
 
-    logger.info(f"[MEMORY] No memory found for key={norm_key!r} (with city fallback)")
+    logger.info(f"[MEMORY] No memory found for key={norm_key!r}")
     return {}, norm_key
 
 
@@ -4491,6 +4503,7 @@ async def result_center(request: ResultCenterRequest):
         logger.info(f"[RESULT] url={request.url!r} industry={industry!r} city={city!r}")
 
         memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+        logger.info(f"[RESULT-CENTER] LOOKUP key: '{norm_key}'")
         logger.info(f"[RESULT] key={norm_key!r} tables={list(memory.keys())}")
 
         if not memory:
