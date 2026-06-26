@@ -5061,12 +5061,11 @@ def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type
         camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
         camp.manual_cpc.enhanced_cpc_enabled = False
 
-    # Dates
+    # Note: start_date / end_date are NOT set on the Campaign object.
+    # The Google Ads API rejects unknown fields for Campaign; dates can be
+    # managed in the Google Ads dashboard after creation.
     if not start_date:
-        start_date = (date.today() + timedelta(days=1)).strftime("%Y%m%d")
-    camp.start_date = start_date
-    if end_date:
-        camp.end_date = end_date
+        start_date = date.today().strftime("%Y%m%d")
 
     campaign_resp = campaign_service.mutate_campaigns(customer_id=customer_id, operations=[campaign_op])
     campaign_rn   = campaign_resp.results[0].resource_name
