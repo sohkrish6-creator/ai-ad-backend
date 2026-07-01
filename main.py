@@ -5232,6 +5232,11 @@ def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type
         camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
         camp.manual_cpc.enhanced_cpc_enabled = False
 
+    # Required by Google Ads API v16+ for EU DSA compliance.
+    camp.contains_eu_political_advertising = (
+        client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
+    )
+
     # Note: start_date / end_date are NOT set on the Campaign object.
     # The Google Ads API rejects unknown fields for Campaign; dates can be
     # managed in the Google Ads dashboard after creation.
