@@ -812,6 +812,41 @@ def _fix_rs(obj):
     if isinstance(obj, list): return [_fix_rs(v) for v in obj]
     return obj
 
+_BANNED_WORD_MAP = {
+    "Transform ":    "Improve ", "transform ":    "improve ",
+    "Transform\n":   "Improve\n","transform\n":   "improve\n",
+    "Elevate ":      "Strengthen ","elevate ":    "strengthen ",
+    "Elevate\n":     "Strengthen\n","elevate\n":  "strengthen\n",
+    "Unlock ":       "Access ","unlock ":         "access ",
+    "Unlock\n":      "Access\n","unlock\n":        "access\n",
+    "Revolutionize ":"Modernize ","revolutionize ":"modernize ",
+    "Empower ":      "Help ","empower ":           "help ",
+    "Empowering ":   "Helping ","empowering ":     "helping ",
+    "Seamless ":     "Simple ","seamless ":        "simple ",
+    "Seamlessly ":   "Smoothly ","seamlessly ":    "smoothly ",
+    "Leverage ":     "Use ","leverage ":           "use ",
+    "Leveraging ":   "Using ","leveraging ":       "using ",
+    "Utilize ":      "Use ","utilize ":            "use ",
+    "Boost your ":   "Grow your ","boost your ":   "grow your ",
+    "Maximize ":     "Increase ","maximize ":      "increase ",
+    "Take your business to new heights": "grow your business",
+    "take your business to new heights": "grow your business",
+    "Unleash ":      "Release ","unleash ":        "release ",
+    "Game-changer":  "strong tool","game-changer": "strong tool",
+    "Game changer":  "strong tool","game changer":  "strong tool",
+    "Dive in":       "Start","dive in":            "start",
+}
+
+def _clean_banned_words(text: str) -> str:
+    """Post-processing: replace banned buzzwords with plain alternatives.
+    Logs a warning for each hit so prompt engineers can track leakage.
+    """
+    for bad, good in _BANNED_WORD_MAP.items():
+        if bad in text:
+            logger.warning(f"[BANNED-WORD] '{bad.strip()}' found in AI output — replacing")
+            text = text.replace(bad, good)
+    return text
+
 async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
         return []
@@ -1151,8 +1186,11 @@ For {request.target_industry} businesses in {request.target_city}, include:
         f"CRITICAL: The business you are analyzing is the one at {_analyzed_url}. "
         f"Do NOT call it Adsoh or Sohscape. "
         f"Use the actual business name detected from the website content.\n"
-        "BANNED WORDS — never use these in any copy or analysis: "
-        "Elevate, Transform, Unlock, unleash, dive in, game-changer, revolutionize, seamless, empower.\n\n"
+        "BANNED WORDS — ZERO TOLERANCE. Never use ANY of these in copy, headlines, hooks, or analysis: "
+        "Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, "
+        "Unleash, Game-changer, Dive in, Take your business to new heights.\n"
+        "CRITICAL FINAL CHECK: Before outputting your response, scan every sentence. "
+        "If you find any banned word above, rewrite that sentence completely using plain, direct language.\n\n"
     )
 
     # ── Memory: derive key + fetch existing knowledge ────────────────────────
@@ -1359,12 +1397,16 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "ABHI YEH KARO:\n1. []\n2. []\n3. []"
     )
 
-    section_a, section_b, section_c, ad_guide = await asyncio.gather(
+    section_a_raw, section_b_raw, section_c_raw, ad_guide_raw = await asyncio.gather(
         run_ai(prompt_a, 2000),
         run_ai(prompt_b, 2000),
         run_ai(prompt_c, 2500),
         run_ai(prompt_guide, 1000),
     )
+    section_a = _clean_banned_words(section_a_raw)
+    section_b = _clean_banned_words(section_b_raw)
+    section_c = _clean_banned_words(section_c_raw)
+    ad_guide  = _clean_banned_words(ad_guide_raw)
 
     # ── Split each grouped output into individual sections ────────────────
     def split_by_headers(text, headers):
@@ -1601,10 +1643,15 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         for k, v in request.sections.items() if v
     ])
 
+    _now          = datetime.now()
+    _month_short  = _now.strftime("%b%Y")    # e.g. Jul2026
+    _month_long   = _now.strftime("%B %Y")   # e.g. July 2026
+
     prompt = (
         f"You are a senior media buyer building a ready-to-paste campaign launch kit.\n"
         f"Business: {biz_label} | City: {city_label} | Total Monthly Budget: Rs {bdgt}\n"
-        f"Goal: {request.goal} | Language: {request.language}\n\n"
+        f"Goal: {request.goal} | Language: {request.language}\n"
+        f"CURRENT DATE: {_month_long} — use this for ALL campaign names and date references.\n\n"
         f"MARKETING BRAIN OUTPUT (extract specific details — audience pain points, competitors, positioning — and use them in every asset below):\n"
         f"{sections_summary}\n\n"
         "RULES — READ BEFORE GENERATING:\n"
@@ -1612,15 +1659,17 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "2. Ad Copy formula: Hook (problem/desire specific to this audience) + Body (specific benefit with proof or number) + CTA (one exact action).\n"
         "3. Every CTA must be one of: 'WhatsApp pe FREE AUDIT bhejo', 'Form bharo — free consultation lo', 'Call karo abhi', 'Link mein appointment book karo'.\n"
         "4. Audience targeting: Use EXACT job titles (not 'business owners'), specific interest combinations, behaviors that signal buying intent.\n"
-        "5. No markdown bold or bullets. Plain text only. Use --- to separate sub-sections. Use exact rupee amounts.\n\n"
+        "5. No markdown bold or bullets. Plain text only. Use --- to separate sub-sections. Use exact rupee amounts.\n"
+        "6. BANNED WORDS — ZERO TOLERANCE: Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, Game-changer, Unleash. If any found, rewrite.\n"
+        f"7. Campaign names MUST use current month/year: {_month_short}. NEVER hardcode old dates like Nov2023 or Jun2024.\n\n"
         "=== META ADS LAUNCH KIT ===\n"
-        f"Campaign Name: [exact name — include business type + city + goal, e.g. 'Jaipur_Coaching_Leads_June26']\n"
+        f"Campaign Name: [exact name — format: CityType_Industry_Goal_{_month_short}, e.g. Jaipur_Coaching_Leads_{_month_short}]\n"
         f"Objective: [exact Meta objective — Leads / Traffic / Engagement / Sales — state which and why]\n"
         f"Daily Budget: Rs {int(meta_bdgt / 30)} per day (Rs {meta_bdgt}/month — 50% of total)\n"
         "---\n"
         "AUDIENCE SETTINGS\n"
         f"Location: {city_label} + [exact radius in km — justify the radius for this business type]\n"
-        "Age: [specific range based on audience intel — not just '18-45']\n"
+        "Age: [28-55 for B2B/decision-maker audiences; 22-45 only for direct-to-consumer. Justify the range.]\n"
         "Gender: [All / Men / Women + one-line justification from audience data]\n"
         "Job Titles to target (Meta Detailed Targeting — copy-paste these):\n"
         "1. [exact job title or role]\n2. [exact job title]\n3. [exact job title]\n"
@@ -1629,6 +1678,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "Behaviors (2-3 that indicate buying intent for this business):\n"
         "1. [behavior]\n2. [behavior]\n3. [behavior if relevant]\n"
         "Exclude: [specific audience to exclude — e.g. existing customers, competitors, students]\n"
+        "Placements: Automatic placements recommended. Exclude: Audience Network (low quality), Right Column (low CTR).\n"
         "---\n"
         "AD VARIATION 1 — PAIN ANGLE\n"
         "Primary Text: [4-5 lines. Open with their specific pain. Close with exact CTA: 'WhatsApp pe FREE AUDIT bhejo']\n"
@@ -1636,27 +1686,31 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "Description: [max 30 chars — action-oriented]\n"
         "CTA Button: [exact Meta button label]\n"
         "---\n"
-        "AD VARIATION 2 — PROOF ANGLE\n"
-        "Primary Text: [4-5 lines. Open with a specific result ('Jaipur ke 30+ businesses ne...'). Close with exact CTA]\n"
-        "Headline: [max 40 chars — include specific result or number]\n"
+        "AD VARIATION 2 — PROOF ANGLE (numbers, results, credibility — must be distinct from Ad 1)\n"
+        "Primary Text: [4-5 lines. Open with a specific result ('Jaipur ke 30+ businesses ne X result paya in 60 days'). No generic claims. Close with exact CTA]\n"
+        "Headline: [max 40 chars — include specific result or number — different from Ad 1]\n"
         "Description: [max 30 chars]\n"
         "CTA Button: [exact Meta button label]\n"
         "---\n"
-        "AD VARIATION 3 — OFFER ANGLE\n"
-        "Primary Text: [4-5 lines. Lead with the specific offer/free audit. Create urgency. Close with exact CTA]\n"
-        "Headline: [max 40 chars — state the offer clearly]\n"
+        "AD VARIATION 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal — must be distinct from Ads 1 and 2)\n"
+        "Primary Text: [4-5 lines. Reference a real urgency — seasonal, limited spots this month, competitor gaining ground. Close with exact CTA]\n"
+        "Headline: [max 40 chars — state urgency clearly — different from Ads 1 and 2]\n"
         "Description: [max 30 chars]\n"
         "CTA Button: [exact Meta button label]\n"
         "---\n"
         "CREATIVE DIRECTION\n"
         "Image/Video for Variation 1: [specific shot — who appears, what's shown, what text overlay]\n"
         "Image/Video for Variation 2: [specific shot — result visual, screenshot, or testimonial format]\n"
-        "Placements: [exact placements — Feed / Stories / Reels — justify each]\n\n"
+        "Image/Video for Variation 3: [urgency creative — countdown, limited-spots visual, or seasonal angle]\n\n"
         "=== GOOGLE ADS LAUNCH KIT ===\n"
-        f"Campaign Name: [exact name — include location + intent, e.g. 'Jaipur_Coaching_Search_Leads']\n"
+        f"Campaign Name: [exact name — format: City_Industry_Search_{_month_short}, e.g. Jaipur_Coaching_Search_{_month_short}]\n"
         "Campaign Type: Search\n"
         f"Daily Budget: Rs {int(google_bdgt / 30)} per day (Rs {google_bdgt}/month — 40% of total)\n"
-        "Bid Strategy: [exact strategy — Target CPA / Maximize Conversions / Manual CPC — state which and why for this goal]\n"
+        "Bid Strategy:\n"
+        "  Launch phase (first 2 weeks, before conversion data): Manual CPC or Maximize Clicks\n"
+        "  After 30 conversions: Switch to Maximize Conversions or Target CPA\n"
+        "  Recommended starting bid: [Rs X-Y per click for this industry — give specific range]\n"
+        "  Reason: [one sentence why this strategy fits the goal]\n"
         "---\n"
         "KEYWORDS (15 minimum — mix of match types, include local + intent keywords)\n"
         "[exact match] keyword 1\n[exact match] keyword 2\n[exact match] keyword 3\n"
@@ -1669,55 +1723,137 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "NEGATIVE KEYWORDS (10 minimum)\n"
         "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n9. []\n10. []\n"
         "---\n"
-        "AD 1 — BENEFIT ANGLE\n"
+        "AD 1 — BENEFIT ANGLE (what they get — specific outcome)\n"
         "Headline 1: [max 30 chars — include number or benefit]\n"
         "Headline 2: [max 30 chars — include city or specific offer]\n"
         "Headline 3: [max 30 chars — CTA or urgency]\n"
-        "Description 1: [max 90 chars — specific benefit. Last sentence = CTA]\n"
-        "Description 2: [max 90 chars — social proof or differentiator. Last sentence = CTA]\n"
+        "Description 1: [80-90 chars MANDATORY — specific benefit with number or proof. Last sentence = CTA. Count characters.]\n"
+        "Description 2: [80-90 chars MANDATORY — social proof or differentiator. Last sentence = CTA. Count characters.]\n"
         "---\n"
-        "AD 2 — OFFER ANGLE\n"
-        "Headline 1: [max 30 chars — state the free offer or audit]\n"
-        "Headline 2: [max 30 chars — include 'Free' + specific value like '₹5000 worth']\n"
+        "AD 2 — PROOF ANGLE (numbers, results, credibility — completely different from Ad 1)\n"
+        "Headline 1: [max 30 chars — specific result number, e.g. '47 Leads in 30 Days']\n"
+        "Headline 2: [max 30 chars — who got the result, e.g. 'Jaipur Hotels Trust Us']\n"
         "Headline 3: [max 30 chars — CTA]\n"
-        "Description 1: [max 90 chars — what they get in the audit. Last sentence = CTA]\n"
-        "Description 2: [max 90 chars — why act now. Last sentence = CTA]\n"
+        "Description 1: [80-90 chars MANDATORY — state the specific result and who achieved it. Last sentence = CTA.]\n"
+        "Description 2: [80-90 chars MANDATORY — credibility signal (years, clients, industry). Last sentence = CTA.]\n"
+        "---\n"
+        "AD 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal — different from Ads 1 and 2)\n"
+        "Headline 1: [max 30 chars — urgency signal, e.g. 'July: 2 Spots Left']\n"
+        "Headline 2: [max 30 chars — what they lose by waiting]\n"
+        "Headline 3: [max 30 chars — CTA]\n"
+        "Description 1: [80-90 chars MANDATORY — real urgency tied to season/capacity/competitor. Last sentence = CTA.]\n"
+        "Description 2: [80-90 chars MANDATORY — risk of delay + risk-free first step. Last sentence = CTA.]\n"
+        "NOTE on 'Free': For Google Ads prefer 'Complimentary', 'No-cost', 'On us' over 'Free' to avoid ad policy flags.\n"
         "---\n"
         "AD EXTENSIONS\n"
-        f"Sitelinks (3 — link to specific pages, not homepage):\n"
-        "Sitelink 1: [Label] | [Page description]\n"
-        "Sitelink 2: [Label] | [Page description]\n"
-        "Sitelink 3: [Label] | [Page description]\n"
-        "Callouts (3 — short USPs, max 25 chars each): [phrase], [phrase], [phrase]\n\n"
+        "Sitelinks (6 — link to specific pages, not homepage. Each with 2 description lines, max 35 chars each):\n"
+        "Sitelink 1: [Label] | Desc1: [max 35 chars] | Desc2: [max 35 chars]\n"
+        "Sitelink 2: [Label] | Desc1: [max 35 chars] | Desc2: [max 35 chars]\n"
+        "Sitelink 3: [Label] | Desc1: [max 35 chars] | Desc2: [max 35 chars]\n"
+        "Sitelink 4: [Label] | Desc1: [max 35 chars] | Desc2: [max 35 chars]\n"
+        "Sitelink 5: [Label] | Desc1: [max 35 chars] | Desc2: [max 35 chars]\n"
+        "Sitelink 6: [Label] | Desc1: [max 35 chars] | Desc2: [max 35 chars]\n"
+        "Callouts (6 — short USPs, max 25 chars each):\n"
+        "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n"
+        "Structured Snippets (4 — header + 3-4 values each):\n"
+        "1. Header: Services | Values: [val1], [val2], [val3], [val4]\n"
+        "2. Header: [relevant header] | Values: [val1], [val2], [val3]\n"
+        "3. Header: [relevant header] | Values: [val1], [val2], [val3]\n"
+        "4. Header: [relevant header] | Values: [val1], [val2], [val3]\n"
+        "Call Extension: [business phone placeholder — user to fill before going live]\n"
+        "Location Extension: Connect Google Business Profile in Google Ads settings for automatic location extension.\n"
+        "Lead Form Extension: Recommended for lead gen goals — create a native lead form in Google Ads > Extensions.\n\n"
         "=== REMARKETING KIT ===\n"
         f"Daily Budget: Rs {int(remarketing_bdgt / 30)} per day (Rs {remarketing_bdgt}/month — 10% of total)\n"
+        "HOW TO BUILD AUDIENCES:\n"
+        "Meta: Audiences > Create > Website Custom Audience (requires Meta Pixel installed)\n"
+        "Google: Google Ads > Audience Manager > Website visitors (requires Google Ads tag + GA4)\n"
+        "Exclusion: Always exclude 'Purchased / Converted' audience from cold audiences to avoid waste.\n"
         "---\n"
-        "AUDIENCE 1 — Homepage Visitors (bounced without converting)\n"
-        f"Trigger: Visited {biz_label} website but did NOT visit contact/booking page. Visited in last 30 days.\n"
-        "Ad Message: [reference what they saw — the service/product. Show social proof. End with specific CTA]\n"
-        "Primary Text: [3-4 lines specific to warm audience who already knows the brand]\n"
-        "Headline: [max 40 chars — reminder + specific offer]\n"
-        "---\n"
-        "AUDIENCE 2 — Service/Pricing Page Visitors (high intent)\n"
-        f"Trigger: Visited pricing or specific service page but did NOT convert. Last 14 days.\n"
-        "Ad Message: [they showed high intent — address the hesitation. Offer a risk-free first step]\n"
-        "Primary Text: [3-4 lines — handle objection, offer free trial/audit/call]\n"
+        "AUDIENCE 1 — Cold Visitors (homepage, no service page — bounced)\n"
+        f"Trigger: Visited {biz_label} homepage but did NOT visit contact/pricing/booking page. Last 30 days.\n"
+        "Frequency Cap: 2 impressions/day, 7 impressions/week per person.\n"
+        "Day 1-3 message — reference what they SAW:\n"
+        f"Primary Text: [3-4 lines. Reference that they visited the {biz_label} page — what specific service did they see? Show one specific result/proof. End with exact CTA.]\n"
+        "Headline: [max 40 chars — reminder + specific service they viewed]\n"
+        "Day 4-7 message — address hesitation:\n"
+        f"Primary Text: [3-4 lines. Acknowledge they're comparing options. Address the main objection for {city_label} {request.industry if hasattr(request, 'industry') else 'businesses'}. Offer risk-free step.]\n"
         "Headline: [max 40 chars — address the hesitation directly]\n"
         "---\n"
-        "AUDIENCE 3 — Engaged Social Media Users\n"
-        "Trigger: Watched 50%+ of a video ad OR liked/commented/saved a post in last 60 days.\n"
-        "Ad Message: [they engaged but didn't click — give them a reason to act now with urgency or offer]\n"
-        "Primary Text: [3-4 lines — create urgency, limited spots or time-sensitive offer]\n"
-        "Headline: [max 40 chars — urgency + specific offer]\n"
+        "AUDIENCE 2 — Warm (service/pricing page visited, high intent)\n"
+        f"Trigger: Visited specific service or pricing page but did NOT submit form/call. Last 14 days.\n"
+        "Frequency Cap: 3 impressions/day, 10 impressions/week per person.\n"
+        "Day 1-3 message — handle the hesitation:\n"
+        "Primary Text: [3-4 lines. They saw the price/service — what stopped them? Address that specific objection. Offer a no-risk first step (free audit, free call). End with exact CTA.]\n"
+        "Headline: [max 40 chars — address the hesitation, e.g. 'Soch rahe ho? 15-min free call lo']\n"
+        "Day 4-14 message — create real urgency:\n"
+        f"Primary Text: [3-4 lines. Create real urgency — limited spots for {_now.strftime('%B')}, competitor gaining ground, seasonal window closing. NO generic 'Act Now'. End with exact CTA.]\n"
+        f"Headline: [max 40 chars — real urgency tied to {_now.strftime('%B')} or capacity]\n"
+        "---\n"
+        "AUDIENCE 3 — Hot Leads (engaged social — 50%+ video watch or liked/commented/saved)\n"
+        "Trigger: Watched 50%+ of video ad OR liked/commented/saved a post in last 60 days.\n"
+        "Frequency Cap: 4 impressions/day, 14 impressions/week per person.\n"
+        "Sequential retargeting:\n"
+        f"Days 1-3: [Reference EXACTLY what they engaged with — which video or post type. Connect it to a specific result for {city_label} businesses.]\n"
+        f"Days 4-7: [Aapke competitors {city_label} mein aage ja rahe hain — reference a real seasonal or competitive urgency. Limited spots angle.]\n"
+        f"Days 8-14: [Final push — strongest offer, most specific urgency. e.g. '{_now.strftime('%B')} mein sirf 2 clients accept kar rahe hain — spot bachi hai kya?']\n"
+        "Headline (Days 1-3): [max 40 chars — reference what they engaged with]\n"
+        "Headline (Days 4-14): [max 40 chars — real urgency, spot/time limited]\n\n"
+        "=== TRACKING SETUP ===\n"
+        "--- META PIXEL ---\n"
+        "Base Pixel: Install on ALL pages via header script or GTM.\n"
+        "Custom Events to Track:\n"
+        "1. PageView — fires automatically on every page\n"
+        "2. ViewContent — fire on Services/Portfolio pages (shows service interest)\n"
+        "3. Lead — fire on thank-you page after form submission\n"
+        "4. Contact — fire on WhatsApp button click + Call button click\n"
+        "5. CompleteRegistration — fire when audit/consultation is booked\n"
+        "Custom Conversions: Create in Meta Events Manager using the Lead and Contact events above.\n"
+        "Verify with: Meta Pixel Helper Chrome extension\n"
+        "---\n"
+        "--- GOOGLE ADS TAG ---\n"
+        "Global Site Tag: Install on ALL pages (or use GTM).\n"
+        "Conversion Actions to Create in Google Ads:\n"
+        "1. Form Submission — track thank-you page URL as conversion\n"
+        "2. Phone Calls — enable call tracking in Google Ads > Tools > Conversions\n"
+        "3. WhatsApp Clicks — track as click event via GTM tag\n"
+        "4. Audit Booking — track confirmation page or calendar booking event\n"
+        "Import GA4 conversions into Google Ads for unified attribution.\n"
+        "---\n"
+        "--- GTM SETUP ---\n"
+        "Container: Create one GTM container, install on all pages.\n"
+        "Triggers needed: Page View, Form Submit, Button Click (WhatsApp/Call), Thank You Page\n"
+        "Variables needed: Click URL, Click Text, Page URL\n"
+        "Tags to fire: Meta Pixel base + events, Google Ads Conversion, GA4 Event\n"
+        "---\n"
+        "--- GA4 EVENTS ---\n"
+        "Recommended custom events: generate_lead, contact_click, whatsapp_click, audit_request\n"
+        "Mark as conversions in GA4 > Configure > Events > toggle Conversion\n"
+        "Link GA4 to Google Ads for import: Google Ads > Tools > Linked accounts > Google Analytics\n\n"
+        "=== LANDING PAGE CHECKLIST ===\n"
+        "For every ad in this kit, verify the landing page has:\n"
+        "[ ] Headline matches or directly supports the ad headline (message match)\n"
+        "[ ] The exact offer from the ad is visible above the fold (e.g. 'Free Audit' ad → form says 'Get Your Free Audit')\n"
+        "[ ] Trust signals above fold: client count, testimonial, or logo\n"
+        "[ ] Single primary CTA — same action as the ad CTA\n"
+        "[ ] WhatsApp button + Form visible without scrolling on mobile\n"
+        "[ ] Phone number clickable on mobile\n"
+        "[ ] Page loads under 3 seconds (test at PageSpeed Insights)\n"
+        "[ ] Mobile-optimized layout (test at Google Mobile-Friendly Test)\n"
+        "[ ] Thank-you page exists (needed for conversion tracking)\n"
+        "[ ] No exit pop-ups that fire immediately (kills ad quality score)\n"
+        "CRITICAL FINAL CHECK: Scan every word in your output above. "
+        "FORBIDDEN: Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, Game-changer, Unleash. "
+        "If ANY found — rewrite that sentence completely before returning."
     )
 
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
-        max_tokens=4500,
+        max_tokens=5500,
     )
-    full_text = resp.choices[0].message.content.strip()
+    full_text = _clean_banned_words(resp.choices[0].message.content.strip())
 
     def extract_kit(text, start_marker, end_marker=None):
         start = text.find(start_marker)
@@ -1731,13 +1867,17 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
 
     meta_kit        = extract_kit(full_text, "=== META ADS LAUNCH KIT ===",   "=== GOOGLE ADS LAUNCH KIT ===")
     google_kit      = extract_kit(full_text, "=== GOOGLE ADS LAUNCH KIT ===", "=== REMARKETING KIT ===")
-    remarketing_kit = extract_kit(full_text, "=== REMARKETING KIT ===")
+    remarketing_kit = extract_kit(full_text, "=== REMARKETING KIT ===",       "=== TRACKING SETUP ===")
+    tracking_kit    = extract_kit(full_text, "=== TRACKING SETUP ===",        "=== LANDING PAGE CHECKLIST ===")
+    lp_checklist    = extract_kit(full_text, "=== LANDING PAGE CHECKLIST ===")
 
     return {
-        "success": True,
-        "meta_kit": meta_kit or full_text,
-        "google_kit": google_kit,
+        "success":        True,
+        "meta_kit":       meta_kit or full_text,
+        "google_kit":     google_kit,
         "remarketing_kit": remarketing_kit,
+        "tracking_kit":   tracking_kit,
+        "lp_checklist":   lp_checklist,
     }
 
 
@@ -1780,19 +1920,23 @@ async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db))
 
     site = await fetch(request.url)
 
+    _current_month_yr = datetime.now().strftime("%B %Y")
     prompt = (
         "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
-        "HUMAN WRITING: Yeh AI buzzwords KABHI mat use kar: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform your.\n"
-        "LANGUAGE: " + request.language + "\n\n"
+        "BANNED WORDS — ZERO TOLERANCE: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform, leverage, maximize, utilize, boost your.\n"
+        "Agar yeh koi bhi word aaye toh sentence dobara likho. Plain aur direct language use karo.\n"
+        "LANGUAGE: " + request.language + "\n"
+        f"CURRENT DATE: {_current_month_yr}\n\n"
         "BRAND WEBSITE:\n" + site[:1500] + "\n\nPROMOTE: " + request.offer + "\nPLATFORM: " + request.platform + "\nINDUSTRY: " + request.business_type + "\n\n"
-        "3 alag ad creative banao. Koi asterisk mat use kar.\n\n"
-        "CREATIVE 1: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
-        "CREATIVE 2: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
-        "CREATIVE 3: [angle]\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n"
+        "3 alag ad creative banao — DISTINCT angles (Benefit / Proof / Urgency). Koi asterisk mat use kar.\n\n"
+        "CREATIVE 1 — BENEFIT ANGLE (what they get, specific outcome):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
+        "CREATIVE 2 — PROOF ANGLE (numbers, results, credibility — no generic claims):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
+        "CREATIVE 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal urgency):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
+        "CRITICAL FINAL CHECK: Scan every word. If Transform, Elevate, Unlock, Seamless, Empower, Leverage, Boost, Maximize found — rewrite completely."
     )
 
     ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
-    creative_text = ai_response.choices[0].message.content
+    creative_text = _clean_banned_words(ai_response.choices[0].message.content)
     try:
         report = ReportModel(report_type="ad-creative", title=request.url, input_data=json.dumps({"url": request.url, "business_type": request.business_type, "offer": request.offer, "platform": request.platform}), result_data=json.dumps({"creative": creative_text}), created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
         db.add(report)
