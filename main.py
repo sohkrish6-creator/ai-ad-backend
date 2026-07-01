@@ -2601,19 +2601,24 @@ def _genv(key: str) -> str:
     return val.strip().strip('"').strip("'")
 
 def get_google_ads_client():
+    # login_customer_id MUST be the MCC/manager account (3879422819).
+    # Strip dashes in case the env var was entered as 387-942-2819.
+    _login_raw = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID").replace("-", "").replace(" ", "")
+    login_customer_id = _login_raw or "3879422819"   # fallback to known MCC ID
+
     config = {
         "developer_token":   _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
         "client_id":         _genv("GOOGLE_ADS_CLIENT_ID"),
         "client_secret":     _genv("GOOGLE_ADS_CLIENT_SECRET"),
         "refresh_token":     _genv("GOOGLE_ADS_REFRESH_TOKEN"),
-        "login_customer_id": _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID").strip() or "3879422819",
+        "login_customer_id": str(login_customer_id),   # must be str, not int
         "use_proto_plus":    True,
     }
-    # Log config shape so we can verify login_customer_id is present (secrets masked)
+    _masked_login = login_customer_id[:-4] + "XXXX" if len(login_customer_id) > 4 else "XXXX"
     logger.info(
         f"[GOOGLE ADS] Building client — "
-        f"login_customer_id={config['login_customer_id']} "
-        f"developer_token=****{config['developer_token'][-4:]} "
+        f"login_customer_id={_masked_login} (from_env={bool(_login_raw)}) "
+        f"developer_token=****{config['developer_token'][-4:] if config['developer_token'] else '????'} "
         f"client_id_set={bool(config['client_id'])} "
         f"secret_set={bool(config['client_secret'])} "
         f"refresh_token_set={bool(config['refresh_token'])}"
@@ -2622,15 +2627,31 @@ def get_google_ads_client():
 
 @app.get("/google-ads/debug2")
 async def google_ads_debug2():
-    """Show exact login_customer_id being used."""
-    login = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
-    cust = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    """Show exact values used to build GoogleAdsClient — for verifying Render env vars."""
+    login_raw   = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
+    login_clean = login_raw.replace("-", "").replace(" ", "")
+    cust_raw    = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    dev_token   = _genv("GOOGLE_ADS_DEVELOPER_TOKEN")
     return {
-        "login_customer_id_raw": login,
-        "customer_id_raw": cust,
-        "login_len": len(login),
-        "cust_len": len(cust),
-        "login_repr": repr(login),
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": {
+            "raw_repr":       repr(login_raw),
+            "len":            len(login_raw),
+            "cleaned":        login_clean,
+            "is_set":         bool(login_raw),
+            "effective_value": login_clean or "3879422819 (hardcoded fallback)",
+        },
+        "GOOGLE_ADS_CUSTOMER_ID": {
+            "raw_repr": repr(cust_raw),
+            "len":      len(cust_raw),
+            "is_set":   bool(cust_raw),
+        },
+        "GOOGLE_ADS_DEVELOPER_TOKEN": {
+            "is_set":  bool(dev_token),
+            "prefix":  (dev_token[:5] + "…") if dev_token else None,
+        },
+        "client_id_set":      bool(_genv("GOOGLE_ADS_CLIENT_ID")),
+        "client_secret_set":  bool(_genv("GOOGLE_ADS_CLIENT_SECRET")),
+        "refresh_token_set":  bool(_genv("GOOGLE_ADS_REFRESH_TOKEN")),
     }
 
 @app.get("/google-ads/debug")
