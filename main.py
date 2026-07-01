@@ -5270,12 +5270,21 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         return {"success": True, **result}
 
     except GoogleAdsException as ex:
-        errors = [e.message for e in ex.failure.errors]
-        logger.error(f"[GADS-CREATE] API error: {errors}")
-        return {"success": False, "error": "; ".join(errors)}
+        error_details = []
+        for error in ex.failure.errors:
+            detail = {
+                "error_code": str(error.error_code),
+                "message":    error.message,
+                "field":      None,
+            }
+            if error.location:
+                detail["field"] = str(error.location.field_path_elements)
+            error_details.append(detail)
+        logger.error(f"[GADS-CREATE EXACT ERROR] {error_details}")
+        return {"success": False, "errors": error_details}
     except Exception as _e:
         tb = _traceback.format_exc()
-        logger.error(f"[GADS-CREATE] ERROR: {_e}\n{tb}")
+        logger.error(f"[GADS-CREATE UNEXPECTED ERROR] {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
 
 
