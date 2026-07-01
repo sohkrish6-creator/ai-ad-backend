@@ -5592,3 +5592,197 @@ async def gads_add_keywords(request: AddKeywordsRequest):
         tb = _traceback.format_exc()
         logger.error(f"[GADS-KW] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CRICKET COMMUNITY ADS — STANDALONE MODULE
+#  Isolated from all other modules. Own table, own save/load, own endpoint.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Isolated memory table ────────────────────────────────────────────────────
+_CRICKET_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS cricket_ads_memory (
+    id           BIGSERIAL PRIMARY KEY,
+    business_key TEXT UNIQUE NOT NULL,
+    ads_data     TEXT,
+    created_at   TEXT,
+    updated_at   TEXT
+);
+"""
+
+def _create_cricket_table():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(_CRICKET_TABLE_DDL))
+            conn.commit()
+        logger.info("[CRICKET] cricket_ads_memory table ready")
+    except Exception as _e:
+        logger.warning(f"[CRICKET] Table create failed: {_e}")
+
+try:
+    _create_cricket_table()
+except Exception:
+    pass
+
+
+def save_cricket_memory(business_key: str, data: dict):
+    _now = datetime.utcnow().isoformat()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO cricket_ads_memory (business_key, ads_data, created_at, updated_at) "
+                "VALUES (:k, :d, :ca, :ua) "
+                "ON CONFLICT(business_key) DO UPDATE SET ads_data=:d, updated_at=:ua"
+            ), {"k": business_key, "d": json.dumps(data), "ca": _now, "ua": _now})
+        logger.info(f"[CRICKET] Saved memory for key={business_key!r}")
+    except Exception as _e:
+        logger.warning(f"[CRICKET] Save failed: {_e}")
+
+
+def get_cricket_memory(business_key: str) -> dict | None:
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT ads_data FROM cricket_ads_memory WHERE business_key=:k"),
+                {"k": business_key}
+            ).fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+    except Exception as _e:
+        logger.warning(f"[CRICKET] Load failed: {_e}")
+    return None
+
+
+# ── Pydantic model ───────────────────────────────────────────────────────────
+class CricketAdsRequest(BaseModel):
+    url:           str
+    whatsapp_link: str = ""
+    city:          str = "India"
+
+
+# ── Endpoint ─────────────────────────────────────────────────────────────────
+@app.post("/cricket-ads-intelligence")
+async def cricket_ads_intelligence(request: CricketAdsRequest):
+    """
+    Standalone Cricket Community Ads intelligence module.
+    Crawls the landing page, fetches live cricket context via Tavily,
+    then calls GPT-4o once to produce a full campaign intelligence report.
+    """
+    biz_key = f"cricket::{request.url.strip().rstrip('/').lower()}::{request.city.lower()}"
+
+    # ── 1. Crawl landing page ────────────────────────────────────────────────
+    site_content = ""
+    if FIRECRAWL_API_KEY and request.url:
+        site_content = await fetch_firecrawl(request.url)
+    if not site_content:
+        # Lightweight httpx fallback
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as _hc:
+                _r = await _hc.get(request.url, headers={"User-Agent": "Mozilla/5.0"})
+                _html = _r.text
+                _html = re.sub(r"<script[^>]*>.*?</script>", "", _html, flags=re.I | re.S)
+                _html = re.sub(r"<style[^>]*>.*?</style>",  "", _html, flags=re.I | re.S)
+                site_content = re.sub(r"<[^>]+>", " ", _html)
+                site_content = re.sub(r"\s+", " ", site_content).strip()[:2000]
+        except Exception:
+            site_content = "(Could not fetch website content)"
+
+    # ── 2. Tavily: live cricket season context ───────────────────────────────
+    cricket_context = ""
+    if TAVILY_API_KEY:
+        _q = (
+            f"Current cricket season India {datetime.now().strftime('%B %Y')}: "
+            "IPL matches, international series, World Cup schedule, "
+            "cricket fan engagement trends, WhatsApp cricket community growth"
+        )
+        cricket_context = await fetch_tavily(_q)
+
+    # ── 3. Build prompt ──────────────────────────────────────────────────────
+    _current_month = datetime.now().strftime("%B %Y")
+    prompt = (
+        f"You are a Google Display Ads expert specializing in sports community campaigns in India.\n"
+        f"Current date: {_current_month}\n"
+        f"City/Region: {request.city}\n"
+        f"WhatsApp Group Link: {request.whatsapp_link or '(not provided)'}\n\n"
+        f"WEBSITE CONTENT:\n{site_content[:2000]}\n\n"
+        f"LIVE CRICKET CONTEXT (use this to make audience and timing recommendations specific):\n"
+        f"{cricket_context[:1500] if cricket_context else 'No live data — use general cricket season knowledge for India.'}\n\n"
+        "TASK: Generate a complete Google Display Ads campaign intelligence report for this cricket community/news WhatsApp group.\n\n"
+        "CONTENT RULES:\n"
+        "- This is a cricket NEWS and COMMUNITY group — no gambling, no betting, no fantasy earnings, no real-money gaming.\n"
+        "- Primary conversion: WhatsApp group join via link click.\n"
+        "- Run a compliance_check but expect it to be clean for a pure community/news group.\n"
+        "- If compliance_check finds any gambling/betting/money signals in the website content, set risk_level to 'high' and list flags.\n\n"
+        "CHARACTER LIMITS — STRICT:\n"
+        "- headlines_15: each MUST be under 30 characters (Google Ads limit). Count carefully.\n"
+        "- long_headlines_5: each MUST be under 90 characters.\n"
+        "- descriptions_5: each MUST be under 90 characters and end with a CTA.\n\n"
+        "AUDIENCE RULES:\n"
+        "- Use real cricket context above for timing (e.g. if IPL is on, prioritize IPL fans segment).\n"
+        "- estimated_cpc and estimated_ctr must be realistic for Google Display in India (CPC typically ₹1-8).\n"
+        "- priority_score: 0-100 integer ranking this audience segment.\n\n"
+        "Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):\n"
+        "{\n"
+        '  "business_summary": { "offer": "...", "primary_conversion": "WhatsApp Join", "target_user": "..." },\n'
+        '  "compliance_check": {\n'
+        '    "risk_level": "low",\n'
+        '    "flags_found": [],\n'
+        '    "safe_to_advertise": true,\n'
+        '    "required_fixes": []\n'
+        '  },\n'
+        '  "audience_segments": [\n'
+        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, "reason": "..." }\n'
+        '  ],\n'
+        '  "placement_recommendations": [\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" }\n'
+        '  ],\n'
+        '  "campaign_structure": {\n'
+        '    "campaign_name": "...",\n'
+        '    "objective": "WhatsApp Joins",\n'
+        '    "campaign_type": "Display",\n'
+        '    "budget_daily": "₹...",\n'
+        '    "bidding_strategy": "...",\n'
+        '    "devices": "Mobile priority",\n'
+        '    "frequency_cap": "..."\n'
+        '  },\n'
+        '  "creative_assets": {\n'
+        '    "headlines_15": ["...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "..."],\n'
+        '    "long_headlines_5": ["...", "...", "...", "...", "..."],\n'
+        '    "descriptions_5": ["...", "...", "...", "...", "..."],\n'
+        '    "cta": "Join Now",\n'
+        '    "image_suggestions": ["...", "...", "..."]\n'
+        '  },\n'
+        '  "landing_page_audit": {\n'
+        '    "score": 0,\n'
+        '    "issues": [],\n'
+        '    "fixes": []\n'
+        '  },\n'
+        '  "launch_score": { "overall": 0, "audience": 0, "compliance": 0, "creative": 0 }\n'
+        "}"
+    )
+
+    # ── 4. GPT-4o call ───────────────────────────────────────────────────────
+    try:
+        def _call_gpt():
+            return client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+                max_tokens=3000,
+            )
+        gpt_resp = await asyncio.to_thread(_call_gpt)
+        raw_json = gpt_resp.choices[0].message.content
+        result   = json.loads(raw_json)
+    except Exception as _e:
+        logger.error(f"[CRICKET] GPT error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    # ── 5. Save to isolated cricket_ads_memory ───────────────────────────────
+    try:
+        await asyncio.to_thread(save_cricket_memory, biz_key, result)
+    except Exception as _se:
+        logger.warning(f"[CRICKET] Memory save error: {_se}")
+
+    logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r}")
+    return {"success": True, "data": result}
