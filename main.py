@@ -2654,6 +2654,75 @@ async def google_ads_debug2():
         "refresh_token_set":  bool(_genv("GOOGLE_ADS_REFRESH_TOKEN")),
     }
 
+@app.get("/google-ads/deep-debug")
+async def google_ads_deep_debug():
+    """Deep diagnostic: env var previews + list_accessible_customers to find what the token can actually reach."""
+    def preview(key):
+        v = _genv(key)
+        if not v:
+            return {"set": False, "preview": None, "len": 0}
+        return {"set": True, "preview": v[:5] + "…", "len": len(v)}
+
+    env_info = {
+        "GOOGLE_ADS_DEVELOPER_TOKEN":  preview("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "GOOGLE_ADS_CLIENT_ID":        preview("GOOGLE_ADS_CLIENT_ID"),
+        "GOOGLE_ADS_CLIENT_SECRET":    preview("GOOGLE_ADS_CLIENT_SECRET"),
+        "GOOGLE_ADS_REFRESH_TOKEN":    preview("GOOGLE_ADS_REFRESH_TOKEN"),
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": preview("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+        "GOOGLE_ADS_CUSTOMER_ID":      preview("GOOGLE_ADS_CUSTOMER_ID"),
+    }
+
+    accessible_customers = None
+    accessible_error     = None
+
+    try:
+        def _list_accessible():
+            # list_accessible_customers does NOT require login_customer_id —
+            # it returns all customer IDs the refresh token can access directly.
+            client  = get_google_ads_client()
+            svc     = client.get_service("CustomerService")
+            resp    = svc.list_accessible_customers()
+            return list(resp.resource_names)   # e.g. ["customers/2715637188", ...]
+
+        resource_names       = await asyncio.to_thread(_list_accessible)
+        accessible_customers = [rn.split("/")[-1] for rn in resource_names]
+    except GoogleAdsException as ex:
+        accessible_error = {
+            "type":   "GoogleAdsException",
+            "errors": [{"code": str(e.error_code), "message": e.message} for e in ex.failure.errors],
+        }
+    except Exception as ex:
+        accessible_error = {"type": type(ex).__name__, "message": str(ex)}
+
+    # If accessible_customers worked, also try a GAQL query on each to see
+    # which ones respond (manager accounts often won't accept campaign queries).
+    queryable = []
+    if accessible_customers:
+        def _probe(cid):
+            try:
+                client  = get_google_ads_client()
+                svc     = client.get_service("GoogleAdsService")
+                rows    = list(svc.search(customer_id=cid,
+                    query="SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1"))
+                if rows:
+                    r = rows[0]
+                    return {"customer_id": cid, "name": r.customer.descriptive_name,
+                            "is_manager": r.customer.manager, "queryable": True}
+                return {"customer_id": cid, "queryable": True, "name": None}
+            except Exception as _e:
+                return {"customer_id": cid, "queryable": False, "error": str(_e)[:120]}
+
+        probe_tasks = [asyncio.to_thread(_probe, cid) for cid in accessible_customers]
+        queryable   = await asyncio.gather(*probe_tasks)
+
+    return {
+        "env":                  env_info,
+        "accessible_customers": accessible_customers,
+        "customer_probe":       queryable,
+        "error":                accessible_error,
+    }
+
+
 @app.get("/google-ads/debug")
 async def google_ads_debug():
     """Check Google Ads env vars — sensitive values hidden, IDs masked to last 4 digits."""
