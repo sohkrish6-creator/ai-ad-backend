@@ -6521,43 +6521,67 @@ _SMART_ANALYSIS_MODULE_KEYS = [
 ]
 
 
+_SMART_ANALYSIS_BUSINESS_MODELS = ["B2B", "B2C", "D2C"]
+
+
 async def _smart_analysis_decision_layer(brain_result: dict, request: SmartAnalysisRequest) -> dict:
     """
-    One GPT-4o call: decide which modules are worth running given the
-    Marketing Brain output. Falls back to a deterministic rule-based
-    decision (mirroring the same criteria) if the AI call fails or returns
-    something unusable — the endpoint should never fail just because this
-    one judgment call had a hiccup.
+    One GPT-4o call that does two things: (1) classifies the business model
+    as B2B/B2C/D2C by actually reading Marketing Brain's business
+    understanding + audience segments — not by just checking whether the
+    industry field was filled in, since the goal is to reason about the
+    real business model even when the input signal is ambiguous or missing —
+    and (2) decides which modules are worth running given that classification.
+    Falls back to a deterministic rule-based decision (using the industry
+    field as a proxy, since Brain's own prompts already frame their output
+    deterministically around it) if the AI call fails or returns something
+    unusable — the endpoint should never fail just because this one
+    judgment call had a hiccup.
     """
     sections = brain_result.get("sections", {}) or {}
-    business_understanding = (sections.get("business_understanding") or "")[:600]
+    business_understanding = (sections.get("business_understanding") or "")[:800]
+    audience_strategy      = (sections.get("audience_strategy") or "")[:800]
     market_understanding   = (sections.get("market_understanding") or "")[:400]
-    is_b2b = bool(request.industry.strip())
     has_budget = bool(request.budget and request.budget > 0)
 
     prompt = (
-        "You are a marketing operations decision-maker. Given this business analysis summary, "
-        "decide which of the following analysis modules are worth running next. Be selective — "
-        "running an irrelevant module wastes time and API cost.\n\n"
+        "You are a marketing operations decision-maker.\n\n"
+        "STEP 1 — Classify this business's model as exactly one of: B2B, B2C, D2C.\n"
+        "- B2B: sells to OTHER BUSINESSES. The buyer is an owner/manager/director/founder of a company.\n"
+        "- B2C: sells a SERVICE or experience directly to individual consumers (e.g. salons, clinics, "
+        "restaurants, coaching, real estate agents).\n"
+        "- D2C: sells a tangible PRODUCT directly to consumers, typically via ecommerce (e.g. a jewellery "
+        "brand, fashion label, skincare brand, food product brand).\n"
+        "Base this ONLY on the actual business understanding and audience segments below — do not assume "
+        "from any other signal. If the audience segments describe job titles like Owner/Manager/Director "
+        "of a specific industry, it's B2B. If they describe consumer personas (e.g. 'value-conscious "
+        "shopper', 'wedding buyer', 'fitness enthusiast'), it's B2C or D2C — pick D2C if the business "
+        "primarily sells a physical product online, B2C if it sells a service/experience.\n\n"
         f"BUSINESS UNDERSTANDING:\n{business_understanding}\n\n"
+        f"AUDIENCE STRATEGY / SEGMENTS:\n{audience_strategy}\n\n"
         f"MARKET UNDERSTANDING:\n{market_understanding}\n\n"
+        f"(Context only — do not treat as the deciding signal: user-provided target industry field = "
+        f"{request.industry or '(blank)'})\n\n"
+        "STEP 2 — Decide which modules are worth running, given the business model you just classified. "
+        "Be selective — running an irrelevant module wastes time and API cost.\n\n"
         f"Website URL provided: {'yes' if request.url.strip() else 'no'}\n"
-        f"B2B mode (target industry given): {'yes' if is_b2b else 'no'} ({request.industry or 'none'})\n"
         f"Budget provided: {'yes' if has_budget else 'no'}\n\n"
-        "MODULES (evaluate each one):\n"
+        "ALWAYS relevant regardless of business model:\n"
         "1. opportunity_engine — market opportunity scoring. Almost always worth running.\n"
         "2. offer_intelligence — offer/pricing strategy analysis. Almost always worth running.\n"
         "3. website_intelligence — deep website audit (speed, UX, conversion signals). Worth running "
-        "if a website URL exists and the Brain summary above doesn't already show a deep technical audit.\n"
+        "if a website URL exists.\n"
         "4. visibility_intelligence — SEO/AEO/GEO search visibility audit. Worth running if this "
-        "business depends on search engines or local/map discovery to get customers.\n"
-        "5. outreach_ai — B2B outreach scripts (WhatsApp/Instagram DM/pitch). Only relevant if this is "
-        "a B2B campaign (a target industry was given).\n"
-        "6. kpi_engine — KPI targets and benchmarks. Only meaningful if a budget was provided.\n"
-        "7. prospect_discovery — finds real prospect businesses to target. Only relevant if this is "
-        "B2B AND a specific target industry was given.\n\n"
+        "business depends on search engines or local/online discovery to get customers.\n"
+        "5. kpi_engine — KPI targets and benchmarks. Only meaningful if a budget was provided.\n\n"
+        "ONLY relevant for B2B (skip entirely for B2C/D2C):\n"
+        "6. outreach_ai — cold outreach scripts (WhatsApp/Instagram DM/pitch) for reaching OTHER "
+        "BUSINESSES. Not relevant for B2C/D2C — individual consumers aren't cold-outreached like businesses.\n"
+        "7. prospect_discovery — finds real prospect BUSINESSES to target. Not relevant for B2C/D2C — "
+        "there are no 'prospect businesses' when selling directly to consumers.\n\n"
         "Return STRICT JSON only, using these exact snake_case module keys:\n"
         "{\n"
+        '  "business_model": "B2B" | "B2C" | "D2C",\n'
         '  "modules_to_run": ["opportunity_engine", "offer_intelligence"],\n'
         '  "skipped": [{"module": "module_key", "reason": "one sentence why"}]\n'
         "}"
@@ -6565,8 +6589,12 @@ async def _smart_analysis_decision_layer(brain_result: dict, request: SmartAnaly
 
     def _fallback_decision() -> dict:
         # Deterministic mirror of the same criteria stated above — used only
-        # if the AI call itself fails, so the endpoint still returns sensible
-        # results rather than erroring out over one judgment call.
+        # if the AI call itself fails. Brain's own prompts already frame
+        # their entire output deterministically around whether target_industry
+        # was given, so using it as the B2B signal here remains reasonable
+        # even without re-reading the generated text.
+        is_b2b = bool(request.industry.strip())
+        business_model = "B2B" if is_b2b else "B2C"
         run, skip = ["opportunity_engine", "offer_intelligence"], []
         if request.url.strip():
             run.append("website_intelligence")
@@ -6576,30 +6604,30 @@ async def _smart_analysis_decision_layer(brain_result: dict, request: SmartAnaly
             run.append("visibility_intelligence")
         else:
             skip.append({"module": "visibility_intelligence", "reason": "No website URL provided"})
-        if is_b2b:
-            run.append("outreach_ai")
-        else:
-            skip.append({"module": "outreach_ai", "reason": "Not a B2B campaign — no target industry given"})
         if has_budget:
             run.append("kpi_engine")
         else:
             skip.append({"module": "kpi_engine", "reason": "No budget provided"})
         if is_b2b:
-            run.append("prospect_discovery")
+            run += ["outreach_ai", "prospect_discovery"]
         else:
-            skip.append({"module": "prospect_discovery", "reason": "Not B2B with a specific industry"})
-        return {"modules_to_run": run, "skipped": skip}
+            skip.append({"module": "outreach_ai", "reason": f"Not relevant for {business_model} — consumers aren't cold-outreached like businesses"})
+            skip.append({"module": "prospect_discovery", "reason": f"Not relevant for {business_model} — no prospect businesses to find"})
+        return {"business_model": business_model, "modules_to_run": run, "skipped": skip}
 
     try:
         resp = await asyncio.to_thread(
             lambda: client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
+                max_tokens=700,
                 response_format={"type": "json_object"},
             )
         )
         data = json.loads(resp.choices[0].message.content)
+        business_model = data.get("business_model")
+        if business_model not in _SMART_ANALYSIS_BUSINESS_MODELS:
+            business_model = "B2B" if request.industry.strip() else "B2C"
         modules_to_run = [m for m in data.get("modules_to_run", []) if m in _SMART_ANALYSIS_MODULE_KEYS]
         skipped = [
             s for s in data.get("skipped", [])
@@ -6607,8 +6635,16 @@ async def _smart_analysis_decision_layer(brain_result: dict, request: SmartAnaly
         ]
         if not modules_to_run:
             raise ValueError("Decision layer returned an empty modules_to_run")
-        logger.info(f"[SMART-ANALYSIS] Decision layer: run={modules_to_run} skipped={[s['module'] for s in skipped]}")
-        return {"modules_to_run": modules_to_run, "skipped": skipped}
+        # Hard safety net: never let outreach_ai/prospect_discovery run for a
+        # non-B2B classification, even if the AI call disagreed with itself.
+        if business_model != "B2B":
+            for leaked in ("outreach_ai", "prospect_discovery"):
+                if leaked in modules_to_run:
+                    modules_to_run.remove(leaked)
+                    if not any(s.get("module") == leaked for s in skipped):
+                        skipped.append({"module": leaked, "reason": f"Not relevant for {business_model} — consumer-facing business"})
+        logger.info(f"[SMART-ANALYSIS] Decision layer: model={business_model} run={modules_to_run} skipped={[s['module'] for s in skipped]}")
+        return {"business_model": business_model, "modules_to_run": modules_to_run, "skipped": skipped}
     except Exception as _e:
         logger.warning(f"[SMART-ANALYSIS] Decision layer failed, using rule-based fallback: {_e}")
         return _fallback_decision()
@@ -6708,8 +6744,10 @@ async def smart_analysis(request: SmartAnalysisRequest):
 
     return {
         "success":            True,
+        "business_model":     decision["business_model"],
         "brain_result":       brain_result,
         "decision": {
+            "business_model":  decision["business_model"],
             "modules_run":     modules_to_run,
             "modules_skipped": decision["skipped"],
         },
