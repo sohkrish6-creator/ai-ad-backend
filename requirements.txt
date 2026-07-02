@@ -25,3 +25,4 @@ google-ads==31.0.0
 psycopg2-binary==2.9.10
 cryptography==43.0.3
 google-auth-oauthlib==1.2.1
+facebook-business==25.0.2

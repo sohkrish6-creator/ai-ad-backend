@@ -5907,6 +5907,244 @@ async def gads_add_keywords(request: AddKeywordsRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  META ADS (Facebook/Instagram) — READ-ONLY INTEGRATION
+#  Same safe pattern as Google Ads: test-connection first, read-only endpoints
+#  only. No campaign creation yet. Isolated from Google Ads / Cricket code.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_meta_ads_client():
+    """
+    Initialize the Meta Marketing API client from env vars.
+    Returns (api, ad_account_id) — ad_account_id normalized to the "act_<id>"
+    format the SDK expects. Raises RuntimeError if required env vars are missing.
+    """
+    from facebook_business.api import FacebookAdsApi
+
+    app_id       = _genv("META_APP_ID")
+    app_secret   = _genv("META_APP_SECRET")
+    access_token = _genv("META_ACCESS_TOKEN")
+    account_id   = _genv("META_AD_ACCOUNT_ID")
+
+    missing = [k for k, v in {
+        "META_APP_ID": app_id, "META_APP_SECRET": app_secret,
+        "META_ACCESS_TOKEN": access_token, "META_AD_ACCOUNT_ID": account_id,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+    if not account_id.startswith("act_"):
+        account_id = f"act_{account_id}"
+
+    api = FacebookAdsApi.init(app_id, app_secret, access_token)
+    logger.info(f"[META ADS] Client initialized — app_id={app_id[:5]}… account_id={account_id[:8]}…")
+    return api, account_id
+
+
+# https://developers.facebook.com/docs/marketing-api/reference/ad-account/#account_status
+_META_ACCOUNT_STATUS_NAMES = {
+    1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW",
+    9: "IN_GRACE_PERIOD", 100: "PENDING_CLOSURE", 101: "CLOSED",
+    201: "ANY_ACTIVE", 202: "ANY_CLOSED",
+}
+
+
+def _log_meta_error(context: str, ex) -> None:
+    # Logged in full detail up front — Google Ads debugging burned us on
+    # vague error messages, so surface message + subcode immediately here.
+    logger.error(
+        f"[META ADS] {context} FacebookRequestError: "
+        f"message={ex.api_error_message()!r} code={ex.api_error_code()} "
+        f"subcode={ex.api_error_subcode()} type={ex.api_error_type()!r}"
+    )
+
+
+@app.get("/meta-ads/test-connection")
+async def meta_ads_test_connection():
+    """Verify Meta Marketing API connectivity and surface account details for debugging."""
+    from facebook_business.adobjects.adaccount import AdAccount
+    from facebook_business.exceptions import FacebookRequestError
+
+    try:
+        _, account_id = get_meta_ads_client()
+    except RuntimeError as _e:
+        return {"connected": False, "error": str(_e)}
+
+    try:
+        def _fetch():
+            account = AdAccount(account_id)
+            return account.api_get(fields=[
+                AdAccount.Field.name,
+                AdAccount.Field.currency,
+                AdAccount.Field.timezone_name,
+                AdAccount.Field.account_status,
+            ])
+
+        info = await asyncio.to_thread(_fetch)
+        status_code = info.get(AdAccount.Field.account_status)
+        return {
+            "connected":    True,
+            "account_id":   account_id,
+            "account_name": info.get(AdAccount.Field.name),
+            "currency":     info.get(AdAccount.Field.currency),
+            "timezone":     info.get(AdAccount.Field.timezone_name),
+            "status":       _META_ACCOUNT_STATUS_NAMES.get(status_code, status_code),
+        }
+    except FacebookRequestError as ex:
+        _log_meta_error("test-connection", ex)
+        return {
+            "connected":     False,
+            "error":         ex.api_error_message(),
+            "error_code":    ex.api_error_code(),
+            "error_subcode": ex.api_error_subcode(),
+        }
+    except Exception as ex:
+        tb = _traceback.format_exc()
+        logger.error(f"[META ADS] test-connection unexpected error: {ex}\n{tb}")
+        return {"connected": False, "error": str(ex)}
+
+
+@app.get("/meta-ads/campaigns")
+async def meta_ads_campaigns():
+    """List all campaigns in the ad account (read-only)."""
+    from facebook_business.adobjects.adaccount import AdAccount
+    from facebook_business.adobjects.campaign import Campaign
+    from facebook_business.exceptions import FacebookRequestError
+
+    try:
+        _, account_id = get_meta_ads_client()
+    except RuntimeError as _e:
+        return {"success": False, "error": str(_e)}
+
+    try:
+        def _fetch():
+            account = AdAccount(account_id)
+            return list(account.get_campaigns(fields=[
+                Campaign.Field.id,
+                Campaign.Field.name,
+                Campaign.Field.status,
+                Campaign.Field.objective,
+                Campaign.Field.daily_budget,
+            ]))
+
+        rows = await asyncio.to_thread(_fetch)
+        campaigns = [{
+            "id":           c.get(Campaign.Field.id),
+            "name":         c.get(Campaign.Field.name),
+            "status":       c.get(Campaign.Field.status),
+            "objective":    c.get(Campaign.Field.objective),
+            "daily_budget": c.get(Campaign.Field.daily_budget),
+        } for c in rows]
+        return {"success": True, "campaigns": campaigns}
+    except FacebookRequestError as ex:
+        _log_meta_error("campaigns", ex)
+        return {"success": False, "error": ex.api_error_message(), "error_subcode": ex.api_error_subcode()}
+    except Exception as ex:
+        tb = _traceback.format_exc()
+        logger.error(f"[META ADS] campaigns unexpected error: {ex}\n{tb}")
+        return {"success": False, "error": str(ex)}
+
+
+@app.get("/meta-ads/performance")
+async def meta_ads_performance(date_range: str = "last_30d"):
+    """
+    Aggregated + per-campaign performance breakdown — same pattern as
+    /google-ads/performance. date_range accepts any Meta Insights date_preset
+    (e.g. last_7d, last_30d, last_90d, this_month).
+    """
+    from facebook_business.adobjects.adaccount import AdAccount
+    from facebook_business.adobjects.adsinsights import AdsInsights
+    from facebook_business.exceptions import FacebookRequestError
+
+    try:
+        _, account_id = get_meta_ads_client()
+    except RuntimeError as _e:
+        return {"success": False, "error": str(_e)}
+
+    valid_presets = {p for p in dir(AdsInsights.DatePreset) if not p.startswith("_")}
+    if date_range not in valid_presets:
+        return {"success": False, "error": f"Invalid date_range {date_range!r}. Valid: {sorted(valid_presets)}"}
+
+    try:
+        def _fetch():
+            account = AdAccount(account_id)
+            return list(account.get_insights(
+                fields=[
+                    AdsInsights.Field.campaign_id,
+                    AdsInsights.Field.campaign_name,
+                    AdsInsights.Field.impressions,
+                    AdsInsights.Field.clicks,
+                    AdsInsights.Field.spend,
+                    AdsInsights.Field.ctr,
+                    AdsInsights.Field.cpc,
+                    AdsInsights.Field.reach,
+                    AdsInsights.Field.conversions,
+                    AdsInsights.Field.date_start,
+                    AdsInsights.Field.date_stop,
+                ],
+                params={"date_preset": date_range, "level": "campaign"},
+            ))
+
+        rows = await asyncio.to_thread(_fetch)
+
+        per_campaign = []
+        total_impressions, total_clicks, total_reach = 0, 0, 0
+        total_spend = total_conversions = 0.0
+
+        for r in rows:
+            impressions = int(r.get(AdsInsights.Field.impressions, 0) or 0)
+            clicks      = int(r.get(AdsInsights.Field.clicks, 0) or 0)
+            spend       = float(r.get(AdsInsights.Field.spend, 0) or 0)
+            reach       = int(r.get(AdsInsights.Field.reach, 0) or 0)
+            # "conversions" is a list of {action_type, value} — sum values for
+            # a single aggregate number in this first read-only pass.
+            conv_actions = r.get(AdsInsights.Field.conversions) or []
+            conversions  = sum(float(a.get("value", 0)) for a in conv_actions) if isinstance(conv_actions, list) else 0.0
+
+            total_impressions += impressions
+            total_clicks      += clicks
+            total_spend       += spend
+            total_reach       += reach
+            total_conversions += conversions
+
+            per_campaign.append({
+                "campaign_id":   r.get(AdsInsights.Field.campaign_id),
+                "campaign_name": r.get(AdsInsights.Field.campaign_name),
+                "impressions":   impressions,
+                "clicks":        clicks,
+                "spend":         round(spend, 2),
+                "ctr":           r.get(AdsInsights.Field.ctr),
+                "cpc":           r.get(AdsInsights.Field.cpc),
+                "reach":         reach,
+                "conversions":   round(conversions, 2),
+            })
+
+        overall_ctr = (total_clicks / total_impressions * 100) if total_impressions else 0
+        overall_cpc = (total_spend / total_clicks) if total_clicks else 0
+
+        return {
+            "success":    True,
+            "date_range": date_range,
+            "aggregated": {
+                "impressions": total_impressions,
+                "clicks":      total_clicks,
+                "spend":       round(total_spend, 2),
+                "ctr_pct":     round(overall_ctr, 2),
+                "avg_cpc":     round(overall_cpc, 2),
+                "reach":       total_reach,
+                "conversions": round(total_conversions, 2),
+            },
+            "per_campaign": per_campaign,
+        }
+    except FacebookRequestError as ex:
+        _log_meta_error("performance", ex)
+        return {"success": False, "error": ex.api_error_message(), "error_subcode": ex.api_error_subcode()}
+    except Exception as ex:
+        tb = _traceback.format_exc()
+        logger.error(f"[META ADS] performance unexpected error: {ex}\n{tb}")
+        return {"success": False, "error": str(ex)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CRICKET COMMUNITY ADS — STANDALONE MODULE
 #  Isolated from all other modules. Own table, own save/load, own endpoint.
 # ═══════════════════════════════════════════════════════════════════════════════
