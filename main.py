@@ -5464,6 +5464,13 @@ def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type
         client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
     )
 
+    # Location targeting must mean "people physically in the target city",
+    # not "anyone searching about it" — PRESENCE_OR_INTEREST (the API default)
+    # would match e.g. someone in Delhi googling "Jaipur hotels".
+    camp.geo_target_type_setting.positive_geo_target_type = (
+        client.enums.PositiveGeoTargetTypeEnum.PRESENCE
+    )
+
     # Note: start_date / end_date are NOT set on the Campaign object.
     # The Google Ads API rejects unknown fields for Campaign; dates can be
     # managed in the Google Ads dashboard after creation.
@@ -5499,6 +5506,58 @@ def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type
         "start_date":    start_date,
         "end_date":      end_date or None,
     }
+
+
+# India (country-level) geo target constant — stable, documented by Google:
+# https://developers.google.com/google-ads/api/data/geotargets
+_INDIA_GEO_TARGET_CONSTANT = "geoTargetConstants/2356"
+
+
+def _resolve_geo_target_sync(city: str) -> tuple:
+    """
+    Synchronous: resolve a city name to a Google Ads geo target constant
+    resource name via GeoTargetConstantService. Falls back to targeting
+    all of India if the city is blank/generic or the lookup fails/misses —
+    NEVER falls all the way back to worldwide.
+    Returns (resource_name, matched_name).
+    """
+    city_clean = (city or "").strip()
+    if not city_clean or city_clean.lower() in ("india", "all india", "pan india", "national"):
+        return _INDIA_GEO_TARGET_CONSTANT, "India"
+
+    try:
+        client       = get_google_ads_client()
+        gtc_service  = client.get_service("GeoTargetConstantService")
+        gtc_request  = client.get_type("SuggestGeoTargetConstantsRequest")
+        gtc_request.locale = "en"
+        gtc_request.country_code = "IN"
+        gtc_request.location_names.names.append(city_clean)
+
+        response = gtc_service.suggest_geo_target_constants(request=gtc_request)
+        suggestions = list(response.geo_target_constant_suggestions)
+        # Prefer the most specific match (City) over broader regions
+        # (Admin Division, Country) when multiple suggestions come back.
+        suggestions.sort(key=lambda s: 0 if s.geo_target_constant.target_type == "City" else 1)
+        if suggestions:
+            gtc = suggestions[0].geo_target_constant
+            return gtc.resource_name, gtc.name
+        logger.info(f"[GADS LOCATION] No geo target suggestions for city={city_clean!r} — falling back to India")
+    except Exception as _e:
+        logger.warning(f"[GADS LOCATION] Geo target lookup failed for city={city_clean!r}: {_e}")
+
+    return _INDIA_GEO_TARGET_CONSTANT, "India (fallback)"
+
+
+def _add_location_criterion_sync(campaign_rn: str, geo_target_resource_name: str, customer_id: str):
+    """Synchronous: add a CampaignCriterion pinning the campaign to a location (Presence targeting)."""
+    client = get_google_ads_client()
+    svc    = client.get_service("CampaignCriterionService")
+    op     = client.get_type("CampaignCriterionOperation")
+    crit   = op.create
+    crit.campaign = campaign_rn
+    crit.location.geo_target_constant = geo_target_resource_name
+    resp = svc.mutate_campaign_criteria(customer_id=customer_id, operations=[op])
+    return resp.results[0].resource_name
 
 
 def _add_keywords_sync(ad_group_rn: str, keywords: list, customer_id: str):
@@ -5569,6 +5628,23 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             customer_id,
         )
 
+        # Location targeting — without this the campaign defaults to
+        # worldwide. Resolve the requested city to a geo target constant
+        # (falling back to all-of-India, never worldwide) and pin the
+        # campaign to it with Presence-only targeting.
+        location_resource_name = None
+        location_matched_name  = None
+        try:
+            location_resource_name, location_matched_name = await asyncio.to_thread(
+                _resolve_geo_target_sync, request.city
+            )
+            logger.info(f"[GADS LOCATION] Applying location target: {location_resource_name} for city: {request.city}")
+            await asyncio.to_thread(
+                _add_location_criterion_sync, result["campaign_rn"], location_resource_name, customer_id
+            )
+        except Exception as _le:
+            logger.warning(f"[GADS-CREATE] Location targeting failed: {_le}")
+
         # Pull keywords/headlines/descriptions from campaign_memory — same key
         # derivation as /campaign-launch-kit's SAVE, with city-fallback lookup
         # so a blank/mismatched city or legacy key still resolves.
@@ -5628,6 +5704,10 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         result["keywords_added"] = len(keywords_added)
         result["ad_created"]     = bool(ad_created)
         result["ad"]             = ad_created
+        result["location_target"] = {
+            "resource_name": location_resource_name,
+            "matched_name":  location_matched_name,
+        }
         result["google_ads_dashboard"] = f"https://ads.google.com/aw/campaigns?campaignId={result['campaign_id']}"
         logger.info(f"[GADS-CREATE] Done: campaign_id={result['campaign_id']}")
         return {"success": True, **result}
