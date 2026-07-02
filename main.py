@@ -6309,6 +6309,10 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
                 Campaign.Field.objective:             request.objective,
                 Campaign.Field.status:                Campaign.Status.paused,
                 Campaign.Field.special_ad_categories: [Campaign.SpecialAdCategory.none],
+                # Budget lives on the AdSet (not shared/pooled at campaign
+                # level) — Meta now requires this explicitly instead of
+                # inferring it from the absence of a campaign-level budget.
+                Campaign.Field.is_adset_budget_sharing_enabled: False,
             })
 
         campaign = await asyncio.to_thread(_create_campaign)
