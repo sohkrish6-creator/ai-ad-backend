@@ -5886,67 +5886,46 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     except Exception as _be:
         logger.warning(f"[CRICKET] creative_assets backfill skipped: {_be}")
 
-    # ── 4b. Repair pass: enforce "join" appears in at most 1 of 5 descriptions ──
-    # The prompt asks GPT to self-check this, but single-shot JSON mode doesn't
-    # reliably honor it — verify and do one targeted rewrite call if it slipped.
-    try:
-        descs = (result.get("creative_assets") or {}).get("descriptions_5") or []
-        join_count = sum(1 for d in descs if re.search(r"\bjoin\w*\b", d, re.I))
-        if len(descs) == 5 and join_count != 1:
-            def _call_fix():
-                return client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{
-                        "role": "user",
-                        "content": (
-                            "Rewrite these 5 Google Ads descriptions (each under 90 characters) so the word "
-                            "'join' (any form) appears in EXACTLY ONE of them, not zero, not more than one. "
-                            "Keep each description's original CTA angle and meaning, just change the wording/verb "
-                            "where needed so they don't all lean on 'join'. Return ONLY a JSON object: "
-                            '{"descriptions_5": ["...", "...", "...", "...", "..."]}\n\n'
-                            f"Current descriptions:\n{json.dumps(descs)}"
-                        ),
-                    }],
-                    response_format={"type": "json_object"},
-                    temperature=0.4,
-                    max_tokens=500,
-                )
-            fix_resp = await asyncio.to_thread(_call_fix)
-            fixed = json.loads(fix_resp.choices[0].message.content).get("descriptions_5")
-            if isinstance(fixed, list) and len(fixed) == 5:
-                result["creative_assets"]["descriptions_5"] = fixed
-                logger.info("[CRICKET] Repaired descriptions_5 CTA-verb repetition")
-    except Exception as _fe:
-        logger.warning(f"[CRICKET] descriptions_5 repair skipped: {_fe}")
-
-    # ── 4c. Length-enforcement pass: long_headlines_5 / descriptions_5 items must ──
+    # ── 4b. Length-enforcement pass: long_headlines_5 / descriptions_5 items must ──
     # be 70-90 characters. A soft "aim for 70-90" rewrite instruction wasn't enough in
     # testing — GPT-4o has a strong brevity bias for ad copy and undershot every time.
     # Assigning each item an explicit numeric target and asking it to expand with real
     # specifics (not filler) converges reliably; a local pad is the final guarantee.
+    # Runs BEFORE the join-count check (4c) since rewriting can reintroduce "join".
+    # Spans a range of lengths (5-26 chars) so there's always something that fits
+    # whether the gap to close is 1 character or 20.
     _LENGTH_PAD_SUFFIXES = [
-        " Don't miss out today.", " Stay in the loop daily.", " Come see what's buzzing.",
-        " Your next update awaits.", " Be part of the action.",
+        " Now.", " Today.", " Act fast.", " Find out more.", " Check it out.",
+        " Don't miss it.", " Tune in today.", " See what's new.", " Don't miss out today.",
+        " Stay in the loop daily.", " Come see what's buzzing.", " Your next update awaits.",
+        " Be part of the action.",
     ]
 
     def _pad_to_range(text: str, lo: int = 70, hi: int = 90) -> str:
         if len(text) > hi:
             trimmed = text[:hi].rsplit(" ", 1)[0]
             return trimmed if len(trimmed) >= lo else text[:hi]
-        for suffix in _LENGTH_PAD_SUFFIXES:
-            if len(text) >= lo:
+        if len(text) >= lo:
+            return text
+        base = text.rstrip()
+        if not base.endswith((".", "!", "?")):
+            base += "."
+        candidates = [base + s for s in _LENGTH_PAD_SUFFIXES if lo <= len(base + s) <= hi]
+        if candidates:
+            return max(candidates, key=len)
+        candidate = base
+        for suffix in sorted(_LENGTH_PAD_SUFFIXES, key=len):
+            if len(candidate) >= lo:
                 break
-            candidate = text.rstrip(".!") + suffix
-            if len(candidate) <= hi:
-                text = candidate
-        return text
+            if len(candidate) + len(suffix) <= hi:
+                candidate += suffix
+        return candidate
+
+    def _out_of_range(items, lo=70, hi=90):
+        return any(not (lo <= len(x) <= hi) for x in items)
 
     try:
         ca = result.get("creative_assets") or {}
-
-        def _out_of_range(items, lo=70, hi=90):
-            return any(not (lo <= len(x) <= hi) for x in items)
-
         for field, extra_rule in (
             ("long_headlines_5", ""),
             ("descriptions_5", " Keep the word 'join' (any form) in at most 1 of the 5, preserving each item's "
@@ -5992,6 +5971,42 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         result["creative_assets"] = ca
     except Exception as _le:
         logger.warning(f"[CRICKET] length-enforcement skipped: {_le}")
+
+    # ── 4c. Repair pass: enforce "join" appears in at most 1 of 5 descriptions ──
+    # Runs LAST (after backfill and length-enforcement, both of which can touch
+    # descriptions_5 wording) so it has the final word on the join-count constraint.
+    try:
+        descs = (result.get("creative_assets") or {}).get("descriptions_5") or []
+        join_count = sum(1 for d in descs if re.search(r"\bjoin\w*\b", d, re.I))
+        if len(descs) == 5 and join_count != 1:
+            def _call_fix():
+                return client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Rewrite these 5 Google Ads descriptions so the word 'join' (any form) appears in "
+                            "EXACTLY ONE of them, not zero, not more than one. Keep each description's original "
+                            "CTA angle and meaning, just change the wording/verb where needed so they don't all "
+                            "lean on 'join'. Each MUST stay between 70 and 90 characters — count carefully. "
+                            "Return ONLY a JSON object: "
+                            '{"descriptions_5": ["...", "...", "...", "...", "..."]}\n\n'
+                            f"Current descriptions:\n{json.dumps(descs)}"
+                        ),
+                    }],
+                    response_format={"type": "json_object"},
+                    temperature=0.4,
+                    max_tokens=500,
+                )
+            fix_resp = await asyncio.to_thread(_call_fix)
+            fixed = json.loads(fix_resp.choices[0].message.content).get("descriptions_5")
+            if isinstance(fixed, list) and len(fixed) == 5:
+                if _out_of_range(fixed):
+                    fixed = [_pad_to_range(x) for x in fixed]
+                result["creative_assets"]["descriptions_5"] = fixed
+                logger.info("[CRICKET] Repaired descriptions_5 CTA-verb repetition")
+    except Exception as _fe:
+        logger.warning(f"[CRICKET] descriptions_5 repair skipped: {_fe}")
 
     # ── 5. Save to isolated cricket_ads_memory ───────────────────────────────
     try:
