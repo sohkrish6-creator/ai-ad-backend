@@ -6186,10 +6186,14 @@ async def meta_ads_performance(date_range: str = "last_30d"):
 # ── Meta Ads Campaign Creation (write access — PAUSED by default) ───────────
 
 class CreateMetaCampaignRequest(BaseModel):
-    campaign_name: str
+    campaign_name: str   = ""              # auto-derived from url/industry/city if blank
     objective:     str   = "OUTCOME_LEADS"
     daily_budget:  float                   # in ₹
     business_key:  str   = ""              # if set, pull ad copy/city from campaign_memory
+    url:           str   = ""              # used with industry/city to derive business_key
+                                            # when business_key isn't passed directly
+    industry:      str   = ""
+    city:          str   = ""
     creative_id:   str   = ""              # existing Post ID (object_story_id), created manually
                                             # in Ads Manager — required to complete the Ad step
                                             # while the app is in Development Mode (see below)
@@ -6260,16 +6264,26 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
     except RuntimeError as _e:
         return {"success": False, "error": str(_e)}
 
+    # ── Resolve business_key (same derivation + city-fallback lookup as
+    # /google-ads/create-campaign) so a blank/mismatched city or legacy key
+    # still resolves to the right campaign_memory row ───────────────────────
+    lookup_source = request.business_key or request.url
+    resolved_business_key = (
+        derive_business_key(lookup_source, request.industry, request.city)
+        if lookup_source else ""
+    )
+
     # ── Pull ad copy / city / landing URL from campaign_memory ──────────────
     headline      = "Grow Your Business Today"
     primary_text  = "Reach more customers with a campaign built for results."
     description   = ""
-    city          = ""
+    city          = request.city or ""
     final_url     = ""
     final_url_is_placeholder = False
 
-    if request.business_key:
-        mem = get_memory(request.business_key)
+    if lookup_source:
+        mem, resolved_key = get_memory_with_city_fallback(lookup_source, request.industry, request.city)
+        logger.info(f"[META ADS CREATE] Memory resolved via key={resolved_key!r}")
         camp_data_raw = mem.get("campaign", {}).get("campaign_data", {}) if mem else {}
         if isinstance(camp_data_raw, str) and camp_data_raw.strip().startswith("{"):
             try:
@@ -6288,7 +6302,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
                 description = str(descriptions[1])[:30]
 
         biz = mem.get("business", {}) if mem else {}
-        city = biz.get("city", "") or ""
+        city = city or biz.get("city", "") or ""
 
         website = mem.get("website", {}) if mem else {}
         final_url = (website.get("url") or "").strip()
@@ -6296,9 +6310,21 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         if not final_url:
             # business_key is derived as "domain.com::industry::city" for
             # URL-mode businesses — reuse the domain segment as a last resort.
-            domain = request.business_key.strip().split("::")[0].strip()
+            domain = resolved_business_key.strip().split("::")[0].strip()
             if domain and "." in domain and " " not in domain:
                 final_url = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+
+    # ── Auto-derive a campaign name if the caller didn't send one ───────────
+    campaign_name = request.campaign_name.strip()
+    if not campaign_name:
+        if final_url and not final_url_is_placeholder:
+            _domain = final_url.replace("https://", "").replace("http://", "").rstrip("/")
+            campaign_name = f"{_domain} — Meta Leads"
+        elif request.industry:
+            campaign_name = f"{request.industry} — {request.city or 'India'}"
+        else:
+            campaign_name = "New Meta Campaign"
+        logger.info(f"[META ADS CREATE] Auto-derived campaign_name={campaign_name!r}")
 
     if not final_url:
         final_url = "https://example.com"
@@ -6314,7 +6340,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         def _create_campaign():
             account = AdAccount(account_id)
             return account.create_campaign(params={
-                Campaign.Field.name:                 request.campaign_name,
+                Campaign.Field.name:                 campaign_name,
                 Campaign.Field.objective:             request.objective,
                 Campaign.Field.status:                Campaign.Status.paused,
                 Campaign.Field.special_ad_categories: [Campaign.SpecialAdCategory.none],
@@ -6341,7 +6367,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         def _create_adset():
             account = AdAccount(account_id)
             return account.create_ad_set(params={
-                AdSet.Field.name:              f"{request.campaign_name} — Ad Set 1",
+                AdSet.Field.name:              f"{campaign_name} — Ad Set 1",
                 AdSet.Field.campaign_id:       campaign_id,
                 AdSet.Field.daily_budget:      int(round(request.daily_budget * 100)),  # ₹ → paise
                 AdSet.Field.billing_event:     AdSet.BillingEvent.impressions,
@@ -6391,7 +6417,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         def _create_creative():
             account = AdAccount(account_id)
             return account.create_ad_creative(params={
-                AdCreative.Field.name:            f"{request.campaign_name} — Creative",
+                AdCreative.Field.name:            f"{campaign_name} — Creative",
                 AdCreative.Field.object_story_id: request.creative_id,
             })
 
@@ -6403,7 +6429,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         def _create_ad():
             account = AdAccount(account_id)
             return account.create_ad(params={
-                Ad.Field.name:     f"{request.campaign_name} — Ad 1",
+                Ad.Field.name:     f"{campaign_name} — Ad 1",
                 Ad.Field.adset_id: adset_id,
                 Ad.Field.creative: {"creative_id": creative_id},
                 Ad.Field.status:   Ad.Status.paused,
