@@ -6339,6 +6339,9 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
                 AdSet.Field.optimization_goal: optimization_goal,
                 AdSet.Field.targeting:         targeting,
                 AdSet.Field.status:            AdSet.Status.paused,
+                # Explicit bid strategy required — "let Meta find the
+                # lowest cost" with no manual bid cap, the simplest default.
+                AdSet.Field.bid_strategy:      AdSet.BidStrategy.lowest_cost_without_cap,
             })
 
         adset = await asyncio.to_thread(_create_adset)
