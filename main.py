@@ -5718,9 +5718,44 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "- long_headlines_5: each MUST be under 90 characters.\n"
         "- descriptions_5: each MUST be under 90 characters and end with a CTA.\n\n"
         "AUDIENCE RULES:\n"
-        "- Use real cricket context above for timing (e.g. if IPL is on, prioritize IPL fans segment).\n"
+        "- You MUST return AT LEAST 6 distinct audience_segments. Do not return fewer than 6. Each must target a "
+        "genuinely different group (e.g. by age, fan type, device habit, language, city-tier, viewing occasion) — "
+        "not 6 rewordings of the same segment.\n"
+        "- You MUST return AT LEAST 5 distinct placement_recommendations, each a different real Google Display "
+        "placement type or property (e.g. specific news/sports apps, YouTube cricket channels, cricket score "
+        "widgets, mobile game placements, news aggregator apps) — not 5 rewordings of the same placement.\n"
+        "- Read the LIVE CRICKET CONTEXT above and pull out the ACTUAL current tournament name, series name, team "
+        "names, or match dates mentioned in it. Every audience_segments[].reason MUST name that specific event or "
+        "teams (e.g. 'Timed around India vs Australia T20I series' or 'Asia Cup 2026 knockout stage'). "
+        "NEVER write generic filler like 'cricket season is ongoing' or 'cricket is popular in India' — if the "
+        "live context names a tournament/match, use its actual name. If LIVE CRICKET CONTEXT is empty, say so "
+        "explicitly in one segment's reason rather than inventing a generic sentence.\n"
         "- estimated_cpc and estimated_ctr must be realistic for Google Display in India (CPC typically ₹1-8).\n"
         "- priority_score: 0-100 integer ranking this audience segment.\n\n"
+        "CREATIVE RULES — descriptions_5:\n"
+        "- Write EXACTLY 5 descriptions_5, one per CTA angle, in this exact order and each clearly using that "
+        "angle (do not reuse the same CTA wording across them):\n"
+        "  1. Urgency (e.g. limited spots/time-boxed to a live match or series)\n"
+        "  2. Benefit (concrete value the user gets by joining)\n"
+        "  3. Social proof (community size, activity level, numbers)\n"
+        "  4. Curiosity (tease what's inside without giving it away)\n"
+        "  5. Direct action (short, imperative, no hype)\n"
+        "- The word 'join' (any form, case-insensitive) may appear in AT MOST ONE of the five descriptions_5 — "
+        "not zero, not two, not five. Vary the actual verb across the other 4 (e.g. mix verbs like 'Get', 'See', "
+        "'Discover', 'Tap in', 'Follow along', 'Unlock', 'Don't miss', 'Catch every ball', 'Be part of' — pick "
+        "different ones, this list is illustrative not exhaustive).\n"
+        "- SELF-CHECK before finalizing: count how many of your 5 descriptions_5 contain the word 'join' in any "
+        "form. If the count is 0 or 2+, rewrite descriptions_5 so exactly 1 contains it. Do this check silently "
+        "and only output the final corrected JSON.\n\n"
+        "LANDING PAGE AUDIT RULES:\n"
+        "- landing_page_audit.issues and .fixes MUST quote or closely paraphrase specific text/headlines/elements "
+        "that actually appear in WEBSITE CONTENT above, and explain the specific problem with that specific text "
+        "(e.g. \"Headline reads '...' but never mentions WhatsApp or a community, so a visitor from this ad won't "
+        "know what they're joining\"). A generic issue with no quoted/paraphrased fragment from WEBSITE CONTENT "
+        "is NOT acceptable — NEVER write generic statements like 'looks good', 'no clear CTA', or 'lacks trust "
+        "signals' without tying them to something specific you actually read in WEBSITE CONTENT.\n"
+        "- If WEBSITE CONTENT above is '(Could not fetch website content)' or empty, say exactly that as the "
+        "issue instead of inventing praise or generic advice.\n\n"
         "Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):\n"
         "{\n"
         '  "business_summary": { "offer": "...", "primary_conversion": "WhatsApp Join", "target_user": "..." },\n'
@@ -5731,10 +5766,19 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "required_fixes": []\n'
         '  },\n'
         '  "audience_segments": [\n'
-        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, "reason": "..." }\n'
+        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." }\n'
         '  ],\n'
         '  "placement_recommendations": [\n'
-        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" }\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." }\n'
         '  ],\n'
         '  "campaign_structure": {\n'
         '    "campaign_name": "...",\n'
@@ -5777,6 +5821,39 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     except Exception as _e:
         logger.error(f"[CRICKET] GPT error: {_e}")
         return {"success": False, "error": str(_e)}
+
+    # ── 4b. Repair pass: enforce "join" appears in at most 1 of 5 descriptions ──
+    # The prompt asks GPT to self-check this, but single-shot JSON mode doesn't
+    # reliably honor it — verify and do one targeted rewrite call if it slipped.
+    try:
+        descs = (result.get("creative_assets") or {}).get("descriptions_5") or []
+        join_count = sum(1 for d in descs if re.search(r"\bjoin\w*\b", d, re.I))
+        if len(descs) == 5 and join_count != 1:
+            def _call_fix():
+                return client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Rewrite these 5 Google Ads descriptions (each under 90 characters) so the word "
+                            "'join' (any form) appears in EXACTLY ONE of them, not zero, not more than one. "
+                            "Keep each description's original CTA angle and meaning, just change the wording/verb "
+                            "where needed so they don't all lean on 'join'. Return ONLY a JSON object: "
+                            '{"descriptions_5": ["...", "...", "...", "...", "..."]}\n\n'
+                            f"Current descriptions:\n{json.dumps(descs)}"
+                        ),
+                    }],
+                    response_format={"type": "json_object"},
+                    temperature=0.4,
+                    max_tokens=500,
+                )
+            fix_resp = await asyncio.to_thread(_call_fix)
+            fixed = json.loads(fix_resp.choices[0].message.content).get("descriptions_5")
+            if isinstance(fixed, list) and len(fixed) == 5:
+                result["creative_assets"]["descriptions_5"] = fixed
+                logger.info("[CRICKET] Repaired descriptions_5 CTA-verb repetition")
+    except Exception as _fe:
+        logger.warning(f"[CRICKET] descriptions_5 repair skipped: {_fe}")
 
     # ── 5. Save to isolated cricket_ads_memory ───────────────────────────────
     try:
