@@ -21,6 +21,7 @@ import json
 import asyncio
 import re
 import random
+import time
 import traceback as _traceback
 import hmac
 import hashlib
@@ -6497,6 +6498,224 @@ async def meta_ads_delete_campaign(request: DeleteMetaCampaignRequest):
         tb = _traceback.format_exc()
         logger.error(f"[META ADS] delete-campaign unexpected error: {type(ex).__name__}: {ex}\n{tb}")
         return {"success": False, "error": f"{type(ex).__name__}: {ex}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SMART FULL ANALYSIS — ORCHESTRATION LAYER
+#  Runs Marketing Brain first, then an AI Decision Layer picks which other
+#  modules are worth running, then runs only those in parallel. Pure
+#  orchestration: every module call below reuses the exact same function
+#  used by that module's own HTTP endpoint — no logic is duplicated.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SmartAnalysisRequest(BaseModel):
+    url:      str
+    industry: str   = ""
+    city:     str   = "Jaipur"
+    budget:   float = 0.0
+
+
+_SMART_ANALYSIS_MODULE_KEYS = [
+    "opportunity_engine", "offer_intelligence", "website_intelligence",
+    "visibility_intelligence", "outreach_ai", "kpi_engine", "prospect_discovery",
+]
+
+
+async def _smart_analysis_decision_layer(brain_result: dict, request: SmartAnalysisRequest) -> dict:
+    """
+    One GPT-4o call: decide which modules are worth running given the
+    Marketing Brain output. Falls back to a deterministic rule-based
+    decision (mirroring the same criteria) if the AI call fails or returns
+    something unusable — the endpoint should never fail just because this
+    one judgment call had a hiccup.
+    """
+    sections = brain_result.get("sections", {}) or {}
+    business_understanding = (sections.get("business_understanding") or "")[:600]
+    market_understanding   = (sections.get("market_understanding") or "")[:400]
+    is_b2b = bool(request.industry.strip())
+    has_budget = bool(request.budget and request.budget > 0)
+
+    prompt = (
+        "You are a marketing operations decision-maker. Given this business analysis summary, "
+        "decide which of the following analysis modules are worth running next. Be selective — "
+        "running an irrelevant module wastes time and API cost.\n\n"
+        f"BUSINESS UNDERSTANDING:\n{business_understanding}\n\n"
+        f"MARKET UNDERSTANDING:\n{market_understanding}\n\n"
+        f"Website URL provided: {'yes' if request.url.strip() else 'no'}\n"
+        f"B2B mode (target industry given): {'yes' if is_b2b else 'no'} ({request.industry or 'none'})\n"
+        f"Budget provided: {'yes' if has_budget else 'no'}\n\n"
+        "MODULES (evaluate each one):\n"
+        "1. opportunity_engine — market opportunity scoring. Almost always worth running.\n"
+        "2. offer_intelligence — offer/pricing strategy analysis. Almost always worth running.\n"
+        "3. website_intelligence — deep website audit (speed, UX, conversion signals). Worth running "
+        "if a website URL exists and the Brain summary above doesn't already show a deep technical audit.\n"
+        "4. visibility_intelligence — SEO/AEO/GEO search visibility audit. Worth running if this "
+        "business depends on search engines or local/map discovery to get customers.\n"
+        "5. outreach_ai — B2B outreach scripts (WhatsApp/Instagram DM/pitch). Only relevant if this is "
+        "a B2B campaign (a target industry was given).\n"
+        "6. kpi_engine — KPI targets and benchmarks. Only meaningful if a budget was provided.\n"
+        "7. prospect_discovery — finds real prospect businesses to target. Only relevant if this is "
+        "B2B AND a specific target industry was given.\n\n"
+        "Return STRICT JSON only, using these exact snake_case module keys:\n"
+        "{\n"
+        '  "modules_to_run": ["opportunity_engine", "offer_intelligence"],\n'
+        '  "skipped": [{"module": "module_key", "reason": "one sentence why"}]\n'
+        "}"
+    )
+
+    def _fallback_decision() -> dict:
+        # Deterministic mirror of the same criteria stated above — used only
+        # if the AI call itself fails, so the endpoint still returns sensible
+        # results rather than erroring out over one judgment call.
+        run, skip = ["opportunity_engine", "offer_intelligence"], []
+        if request.url.strip():
+            run.append("website_intelligence")
+        else:
+            skip.append({"module": "website_intelligence", "reason": "No website URL provided"})
+        if request.url.strip():
+            run.append("visibility_intelligence")
+        else:
+            skip.append({"module": "visibility_intelligence", "reason": "No website URL provided"})
+        if is_b2b:
+            run.append("outreach_ai")
+        else:
+            skip.append({"module": "outreach_ai", "reason": "Not a B2B campaign — no target industry given"})
+        if has_budget:
+            run.append("kpi_engine")
+        else:
+            skip.append({"module": "kpi_engine", "reason": "No budget provided"})
+        if is_b2b:
+            run.append("prospect_discovery")
+        else:
+            skip.append({"module": "prospect_discovery", "reason": "Not B2B with a specific industry"})
+        return {"modules_to_run": run, "skipped": skip}
+
+    try:
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+                response_format={"type": "json_object"},
+            )
+        )
+        data = json.loads(resp.choices[0].message.content)
+        modules_to_run = [m for m in data.get("modules_to_run", []) if m in _SMART_ANALYSIS_MODULE_KEYS]
+        skipped = [
+            s for s in data.get("skipped", [])
+            if isinstance(s, dict) and s.get("module") in _SMART_ANALYSIS_MODULE_KEYS
+        ]
+        if not modules_to_run:
+            raise ValueError("Decision layer returned an empty modules_to_run")
+        logger.info(f"[SMART-ANALYSIS] Decision layer: run={modules_to_run} skipped={[s['module'] for s in skipped]}")
+        return {"modules_to_run": modules_to_run, "skipped": skipped}
+    except Exception as _e:
+        logger.warning(f"[SMART-ANALYSIS] Decision layer failed, using rule-based fallback: {_e}")
+        return _fallback_decision()
+
+
+@app.post("/smart-analysis")
+async def smart_analysis(request: SmartAnalysisRequest):
+    start_time = time.time()
+
+    if not request.url.strip():
+        return {"success": False, "error": "url is required"}
+
+    # ── Step 1: Marketing Brain (reuses /full-report's own function) ────────
+    full_report_req = FullReportRequest(
+        url=request.url,
+        business_type=request.industry or "Business",
+        budget=int(request.budget) if request.budget else 10000,
+        goal="Lead Generation",
+        target_industry=request.industry,
+        target_city=request.city,
+    )
+    db = SessionLocal()
+    try:
+        brain_result = await full_report(full_report_req, db)
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[SMART-ANALYSIS] Marketing Brain failed: {_e}\n{tb}")
+        return {"success": False, "error": f"Marketing Brain failed: {_e}"}
+    finally:
+        db.close()
+
+    if not brain_result.get("success"):
+        return {"success": False, "error": "Marketing Brain did not complete successfully", "brain_result": brain_result}
+
+    business_key = derive_business_key(request.url, request.industry, request.city)
+    logger.info(f"[SMART-ANALYSIS] Brain complete. business_key={business_key!r}")
+
+    # ── Step 2: Decision Layer — one GPT-4o call ─────────────────────────────
+    decision = await _smart_analysis_decision_layer(brain_result, request)
+
+    # ── Step 3: Run the chosen modules in parallel ───────────────────────────
+    module_calls = {
+        "opportunity_engine": lambda: opportunity_engine(OpportunityEngineRequest(
+            business_key=business_key, industry=request.industry, city=request.city,
+            budget=int(request.budget) if request.budget else 0,
+        )),
+        "offer_intelligence": lambda: offer_intelligence(OfferIntelligenceRequest(
+            business_key=business_key, industry=request.industry, city=request.city,
+        )),
+        "website_intelligence": lambda: website_intelligence(WebsiteIntelligenceRequest(
+            url=request.url, business_key=business_key, industry=request.industry, city=request.city,
+        )),
+        "visibility_intelligence": lambda: visibility_intelligence(VisibilityIntelligenceRequest(
+            url=request.url, industry=request.industry, city=request.city, business_key=business_key,
+        )),
+        "outreach_ai": lambda: outreach_ai(OutreachAIRequest(
+            url=request.url, industry=request.industry, city=request.city, business_key=business_key,
+        )),
+        "kpi_engine": lambda: kpi_engine(KPIEngineRequest(
+            url=request.url, industry=request.industry, city=request.city,
+            budget=request.budget, goal="Lead Generation",
+        )),
+        "prospect_discovery": lambda: prospect_discovery(ProspectDiscoveryRequest(
+            industry=request.industry, city=request.city, url=request.url,
+        )),
+    }
+    # Maps the AI's module keys to the flat result keys in the response contract
+    _RESULT_KEY_BY_MODULE = {
+        "opportunity_engine":      "opportunity",
+        "offer_intelligence":      "offer",
+        "website_intelligence":    "website",
+        "visibility_intelligence": "visibility",
+        "outreach_ai":             "outreach",
+        "kpi_engine":              "kpi",
+        "prospect_discovery":      "prospects",
+    }
+
+    modules_to_run = [m for m in decision["modules_to_run"] if m in module_calls]
+    logger.info(f"[SMART-ANALYSIS] Running {len(modules_to_run)} modules in parallel: {modules_to_run}")
+
+    results = {v: None for v in _RESULT_KEY_BY_MODULE.values()}
+    if modules_to_run:
+        outcomes = await asyncio.gather(
+            *[module_calls[m]() for m in modules_to_run],
+            return_exceptions=True,
+        )
+        for module_name, outcome in zip(modules_to_run, outcomes):
+            result_key = _RESULT_KEY_BY_MODULE[module_name]
+            if isinstance(outcome, Exception):
+                logger.error(f"[SMART-ANALYSIS] Module {module_name!r} raised: {outcome}")
+                results[result_key] = {"success": False, "error": f"{type(outcome).__name__}: {outcome}"}
+            else:
+                results[result_key] = outcome
+
+    total_time = round(time.time() - start_time, 2)
+    logger.info(f"[SMART-ANALYSIS] Done in {total_time}s")
+
+    return {
+        "success":            True,
+        "brain_result":       brain_result,
+        "decision": {
+            "modules_run":     modules_to_run,
+            "modules_skipped": decision["skipped"],
+        },
+        "results":            results,
+        "total_time_seconds": total_time,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
