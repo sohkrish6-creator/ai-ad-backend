@@ -5717,6 +5717,12 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "- headlines_15: each MUST be under 30 characters (Google Ads limit). Count carefully.\n"
         "- long_headlines_5: each MUST be under 90 characters.\n"
         "- descriptions_5: each MUST be under 90 characters and end with a CTA.\n\n"
+        "REQUIRED FIELDS — DO NOT SKIP:\n"
+        "- creative_assets.long_headlines_5 and creative_assets.descriptions_5 are REQUIRED. You MUST populate "
+        "long_headlines_5 with exactly 5 items (each 70-90 characters) and descriptions_5 with exactly 5 items "
+        "(each 70-90 characters). NEVER leave these as empty arrays — an empty array is a failed response.\n"
+        "- Keep audience_segments[].reason and placement_recommendations[].why to one concise sentence each — "
+        "this budget discipline exists so every creative_assets field below can be fully completed.\n\n"
         "AUDIENCE RULES:\n"
         "- You MUST return AT LEAST 6 distinct audience_segments. Do not return fewer than 6. Each must target a "
         "genuinely different group (e.g. by age, fan type, device habit, language, city-tier, viewing occasion) — "
@@ -5765,21 +5771,6 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "safe_to_advertise": true,\n'
         '    "required_fixes": []\n'
         '  },\n'
-        '  "audience_segments": [\n'
-        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." }\n'
-        '  ],\n'
-        '  "placement_recommendations": [\n'
-        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" },\n'
-        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
-        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
-        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
-        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." }\n'
-        '  ],\n'
         '  "campaign_structure": {\n'
         '    "campaign_name": "...",\n'
         '    "objective": "WhatsApp Joins",\n'
@@ -5796,6 +5787,21 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "cta": "Join Now",\n'
         '    "image_suggestions": ["...", "...", "..."]\n'
         '  },\n'
+        '  "audience_segments": [\n'
+        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." }\n'
+        '  ],\n'
+        '  "placement_recommendations": [\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." },\n'
+        '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." }\n'
+        '  ],\n'
         '  "landing_page_audit": {\n'
         '    "score": 0,\n'
         '    "issues": [],\n'
@@ -5813,14 +5819,69 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.4,
-                max_tokens=3000,
+                max_tokens=4096,
             )
         gpt_resp = await asyncio.to_thread(_call_gpt)
         raw_json = gpt_resp.choices[0].message.content
         result   = json.loads(raw_json)
+        logger.info(
+            f"[CRICKET] finish_reason={gpt_resp.choices[0].finish_reason!r} "
+            f"completion_tokens={gpt_resp.usage.completion_tokens}"
+        )
     except Exception as _e:
         logger.error(f"[CRICKET] GPT error: {_e}")
         return {"success": False, "error": str(_e)}
+
+    # ── 4a. Backfill pass: long_headlines_5 / descriptions_5 must never be empty ──
+    # These sit right after headlines_15 in creative_assets — if the model runs low
+    # on budget generating the (now larger) audience/placement arrays first, they can
+    # come back as empty arrays even though the JSON as a whole is valid. Detect that
+    # and do one targeted fill-in call rather than silently handing the frontend gaps.
+    try:
+        ca = result.setdefault("creative_assets", {})
+        missing = {
+            k: n for k, n in (("long_headlines_5", 5), ("descriptions_5", 5))
+            if len(ca.get(k) or []) < n
+        }
+        if missing:
+            logger.warning(f"[CRICKET] creative_assets missing/short fields: {list(missing)} — backfilling")
+
+            def _call_backfill():
+                return client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Generate Google Display Ads creative copy for this cricket community WhatsApp group.\n"
+                            f"Offer: {json.dumps(result.get('business_summary', {}))}\n"
+                            f"City/Region: {request.city}\n"
+                            f"Live cricket context: {cricket_context[:800] if cricket_context else 'general cricket season in India'}\n\n"
+                            + "".join(
+                                (
+                                    "Write exactly 5 long_headlines_5, each 70-90 characters.\n"
+                                    if k == "long_headlines_5" else
+                                    "Write exactly 5 descriptions_5, each 70-90 characters, ending with a CTA. "
+                                    "Use 5 different CTA angles (urgency, benefit, social proof, curiosity, direct "
+                                    "action) and let 'join' (any form) appear in at most 1 of the 5.\n"
+                                )
+                                for k in missing
+                            )
+                            + "Return ONLY a JSON object with exactly these keys: "
+                            + json.dumps({k: ["...", "...", "...", "...", "..."] for k in missing})
+                        ),
+                    }],
+                    response_format={"type": "json_object"},
+                    temperature=0.4,
+                    max_tokens=800,
+                )
+            fill_resp = await asyncio.to_thread(_call_backfill)
+            filled = json.loads(fill_resp.choices[0].message.content)
+            for k in missing:
+                if isinstance(filled.get(k), list) and len(filled[k]) == 5:
+                    ca[k] = filled[k]
+            result["creative_assets"] = ca
+    except Exception as _be:
+        logger.warning(f"[CRICKET] creative_assets backfill skipped: {_be}")
 
     # ── 4b. Repair pass: enforce "join" appears in at most 1 of 5 descriptions ──
     # The prompt asks GPT to self-check this, but single-shot JSON mode doesn't
