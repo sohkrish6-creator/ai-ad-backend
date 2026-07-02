@@ -17,6 +17,7 @@ import logging
 import json
 import asyncio
 import re
+import random
 import traceback as _traceback
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -5715,8 +5716,10 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "- If compliance_check finds any gambling/betting/money signals in the website content, set risk_level to 'high' and list flags.\n\n"
         "CHARACTER LIMITS — STRICT:\n"
         "- headlines_15: each MUST be under 30 characters (Google Ads limit). Count carefully.\n"
-        "- long_headlines_5: each MUST be under 90 characters.\n"
-        "- descriptions_5: each MUST be under 90 characters and end with a CTA.\n\n"
+        "- long_headlines_5: each MUST be BETWEEN 70 and 90 characters — count carefully, not just under 90. "
+        "A 40-character headline is too short and does not satisfy this field.\n"
+        "- descriptions_5: each MUST be BETWEEN 70 and 90 characters and end with a CTA — count carefully, not "
+        "just under 90. A 50-character description is too short and does not satisfy this field.\n\n"
         "REQUIRED FIELDS — DO NOT SKIP:\n"
         "- creative_assets.long_headlines_5 and creative_assets.descriptions_5 are REQUIRED. You MUST populate "
         "long_headlines_5 with exactly 5 items (each 70-90 characters) and descriptions_5 with exactly 5 items "
@@ -5915,6 +5918,80 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
                 logger.info("[CRICKET] Repaired descriptions_5 CTA-verb repetition")
     except Exception as _fe:
         logger.warning(f"[CRICKET] descriptions_5 repair skipped: {_fe}")
+
+    # ── 4c. Length-enforcement pass: long_headlines_5 / descriptions_5 items must ──
+    # be 70-90 characters. A soft "aim for 70-90" rewrite instruction wasn't enough in
+    # testing — GPT-4o has a strong brevity bias for ad copy and undershot every time.
+    # Assigning each item an explicit numeric target and asking it to expand with real
+    # specifics (not filler) converges reliably; a local pad is the final guarantee.
+    _LENGTH_PAD_SUFFIXES = [
+        " Don't miss out today.", " Stay in the loop daily.", " Come see what's buzzing.",
+        " Your next update awaits.", " Be part of the action.",
+    ]
+
+    def _pad_to_range(text: str, lo: int = 70, hi: int = 90) -> str:
+        if len(text) > hi:
+            trimmed = text[:hi].rsplit(" ", 1)[0]
+            return trimmed if len(trimmed) >= lo else text[:hi]
+        for suffix in _LENGTH_PAD_SUFFIXES:
+            if len(text) >= lo:
+                break
+            candidate = text.rstrip(".!") + suffix
+            if len(candidate) <= hi:
+                text = candidate
+        return text
+
+    try:
+        ca = result.get("creative_assets") or {}
+
+        def _out_of_range(items, lo=70, hi=90):
+            return any(not (lo <= len(x) <= hi) for x in items)
+
+        for field, extra_rule in (
+            ("long_headlines_5", ""),
+            ("descriptions_5", " Keep the word 'join' (any form) in at most 1 of the 5, preserving each item's "
+                                "existing CTA angle (urgency, benefit, social proof, curiosity, direct action)."),
+        ):
+            items = ca.get(field) or []
+            if len(items) == 5 and _out_of_range(items):
+                targets = [random.randint(74, 88) for _ in items]
+                target_lines = "\n".join(
+                    f'{i + 1}. "{item}" -> target EXACTLY {t} characters'
+                    for i, (item, t) in enumerate(zip(items, targets))
+                )
+
+                def _call_length_fix(field=field, target_lines=target_lines, extra_rule=extra_rule):
+                    return client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                f"Rewrite each of these 5 Google Ads {field.replace('_', ' ')} to hit an EXACT "
+                                "target character count by adding concrete specific detail (not filler words) — "
+                                "expand with real specifics like match/series name, community size, or benefit, "
+                                "not padding. Count characters as you write, including spaces and punctuation."
+                                f"{extra_rule}\n\n{target_lines}\n\n"
+                                f'Return ONLY a JSON object: {{"{field}": ["...", "...", "...", "...", "..."]}}'
+                            ),
+                        }],
+                        response_format={"type": "json_object"},
+                        temperature=0.4,
+                        max_tokens=600,
+                    )
+                len_resp = await asyncio.to_thread(_call_length_fix)
+                fixed = json.loads(len_resp.choices[0].message.content).get(field)
+                if isinstance(fixed, list) and len(fixed) == 5:
+                    ca[field] = fixed
+                    logger.info(f"[CRICKET] Length-enforced {field} via per-item targets")
+
+            # Deterministic final guarantee: pad/trim anything still out of range.
+            items = ca.get(field) or []
+            if len(items) == 5 and _out_of_range(items):
+                ca[field] = [_pad_to_range(x) for x in items]
+                logger.info(f"[CRICKET] Locally padded/trimmed {field} to guarantee 70-90 chars")
+        result["creative_assets"] = ca
+    except Exception as _le:
+        logger.warning(f"[CRICKET] length-enforcement skipped: {_le}")
 
     # ── 5. Save to isolated cricket_ads_memory ───────────────────────────────
     try:
