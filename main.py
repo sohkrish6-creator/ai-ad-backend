@@ -6190,6 +6190,9 @@ class CreateMetaCampaignRequest(BaseModel):
     objective:     str   = "OUTCOME_LEADS"
     daily_budget:  float                   # in ₹
     business_key:  str   = ""              # if set, pull ad copy/city from campaign_memory
+    creative_id:   str   = ""              # existing Post ID (object_story_id), created manually
+                                            # in Ads Manager — required to complete the Ad step
+                                            # while the app is in Development Mode (see below)
 
 
 def _resolve_meta_targeting_sync(city: str) -> dict:
@@ -6227,9 +6230,23 @@ def _resolve_meta_targeting_sync(city: str) -> dict:
 @app.post("/meta-ads/create-campaign")
 async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
     """
-    Create a Campaign + AdSet + AdCreative + Ad, all PAUSED by default —
-    same safe pattern as Google Ads: nothing goes live until a human
-    reviews and enables it in Ads Manager.
+    Create a Campaign + AdSet, both PAUSED by default — same safe pattern as
+    Google Ads: nothing goes live until a human reviews and enables it in
+    Ads Manager.
+
+    The Ad step is conditional on `creative_id`:
+    Meta blocks apps in Development Mode from creating NEW Page-attributed
+    ad creatives (confirmed via live testing — error_subcode 1885183, not
+    bypassable via user role, only via full App Review/Live mode). The one
+    documented workaround that doesn't require App Review: a human creates
+    the creative/post manually in Ads Manager once, and the API only
+    references that existing Post ID (object_story_id) rather than
+    originating new Page content — so:
+      - No creative_id: stop after Campaign+AdSet, return the Ad Set ID and
+        instructions to finish the Ad manually in Ads Manager.
+      - creative_id given: create the AdCreative via object_story_id
+        (referencing the existing post, not creating a new one) then the Ad —
+        completing the full automated chain.
     """
     from facebook_business.adobjects.adaccount import AdAccount
     from facebook_business.adobjects.campaign import Campaign
@@ -6242,14 +6259,6 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         _, account_id = get_meta_ads_client()
     except RuntimeError as _e:
         return {"success": False, "error": str(_e)}
-
-    page_id = _genv("META_PAGE_ID")
-    if not page_id:
-        return {
-            "success": False,
-            "error": "META_PAGE_ID not configured — ad creatives require a Facebook "
-                     "Page connected to this ad account. Add META_PAGE_ID to env vars.",
-        }
 
     # ── Pull ad copy / city / landing URL from campaign_memory ──────────────
     headline      = "Grow Your Business Today"
@@ -6349,26 +6358,47 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         created["adset_id"] = adset_id
         logger.info(f"[META ADS CREATE] AdSet created: {adset_id}")
 
+        ads_manager_link = f"https://business.facebook.com/adsmanager/manage/campaigns?act={account_id.replace('act_', '')}"
+
+        if not request.creative_id:
+            # Can't create a new ad creative while the app is in Development
+            # Mode (Meta blocks the app from originating new Page content —
+            # confirmed live, not bypassable via user role). Stop here with
+            # a clear next step instead of failing the whole request.
+            message = (
+                f"Campaign and Ad Set created successfully (PAUSED). To complete this "
+                f"campaign, manually create an ad creative in Meta Ads Manager for this "
+                f"ad set, then note its Post ID for future automated ad creation. "
+                f"Ad Set ID: {adset_id}"
+            )
+            logger.info(f"[META ADS CREATE] Stopping after AdSet (no creative_id): {message}")
+            return {
+                "success":               True,
+                "action_needed":         True,
+                "campaign_id":           campaign_id,
+                "adset_id":              adset_id,
+                "creative_id":           None,
+                "ad_id":                 None,
+                "status":                "PAUSED",
+                "targeting_used":        targeting,
+                "message":               message,
+                "meta_ads_manager_link": ads_manager_link,
+            }
+
+        # creative_id given: reference the EXISTING post via object_story_id
+        # instead of object_story_spec — this doesn't ask the app to
+        # originate new Page content, so it isn't blocked by Dev Mode.
         def _create_creative():
             account = AdAccount(account_id)
             return account.create_ad_creative(params={
-                AdCreative.Field.name: f"{request.campaign_name} — Creative",
-                AdCreative.Field.object_story_spec: {
-                    "page_id": page_id,
-                    "link_data": {
-                        "message":     primary_text,
-                        "link":        final_url,
-                        "name":        headline,
-                        "description": description,
-                        "call_to_action": {"type": "LEARN_MORE", "value": {"link": final_url}},
-                    },
-                },
+                AdCreative.Field.name:            f"{request.campaign_name} — Creative",
+                AdCreative.Field.object_story_id: request.creative_id,
             })
 
         creative = await asyncio.to_thread(_create_creative)
         creative_id = creative.get(AdCreative.Field.id)
         created["creative_id"] = creative_id
-        logger.info(f"[META ADS CREATE] AdCreative created: {creative_id}")
+        logger.info(f"[META ADS CREATE] AdCreative created from existing post {request.creative_id!r}: {creative_id}")
 
         def _create_ad():
             account = AdAccount(account_id)
@@ -6386,6 +6416,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
 
         return {
             "success":                 True,
+            "action_needed":           False,
             "campaign_id":             campaign_id,
             "adset_id":                adset_id,
             "creative_id":             creative_id,
@@ -6394,7 +6425,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
             "targeting_used":          targeting,
             "final_url":               final_url,
             "final_url_is_placeholder": final_url_is_placeholder,
-            "meta_ads_manager_link":   f"https://business.facebook.com/adsmanager/manage/campaigns?act={account_id.replace('act_', '')}",
+            "meta_ads_manager_link":   ads_manager_link,
         }
 
     except FacebookRequestError as ex:
