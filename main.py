@@ -5634,16 +5634,23 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         # campaign to it with Presence-only targeting.
         location_resource_name = None
         location_matched_name  = None
+        location_applied       = False
         try:
             location_resource_name, location_matched_name = await asyncio.to_thread(
                 _resolve_geo_target_sync, request.city
             )
-            logger.info(f"[GADS LOCATION] Applying location target: {location_resource_name} for city: {request.city}")
+        except Exception as _re:
+            logger.warning(f"[GADS-CREATE] Geo target resolution failed: {_re}")
+            location_resource_name, location_matched_name = _INDIA_GEO_TARGET_CONSTANT, "India (resolve error fallback)"
+
+        logger.info(f"[GADS LOCATION] Applying location target: {location_resource_name} for city: {request.city}")
+        try:
             await asyncio.to_thread(
                 _add_location_criterion_sync, result["campaign_rn"], location_resource_name, customer_id
             )
+            location_applied = True
         except Exception as _le:
-            logger.warning(f"[GADS-CREATE] Location targeting failed: {_le}")
+            logger.warning(f"[GADS-CREATE] Location criterion mutation failed: {_le}")
 
         # Pull keywords/headlines/descriptions from campaign_memory — same key
         # derivation as /campaign-launch-kit's SAVE, with city-fallback lookup
@@ -5707,6 +5714,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         result["location_target"] = {
             "resource_name": location_resource_name,
             "matched_name":  location_matched_name,
+            "applied":       location_applied,
         }
         result["google_ads_dashboard"] = f"https://ads.google.com/aw/campaigns?campaignId={result['campaign_id']}"
         logger.info(f"[GADS-CREATE] Done: campaign_id={result['campaign_id']}")
