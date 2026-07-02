@@ -5188,6 +5188,29 @@ class ProspectDiscoveryRequest(BaseModel):
     max_prospects:  int  = 15
 
 
+async def _retry_openai_call(fn, retries: int = 2, base_delay: float = 2.0, label: str = ""):
+    """
+    Retry a blocking OpenAI call on transient rate-limit/timeout/connection
+    errors. Needed because Smart Analysis fires up to 7 modules' GPT-4o
+    calls simultaneously via asyncio.gather — a collision that never shows
+    up when a module is called alone can intermittently throttle whichever
+    call lands last, which is what caused prospect_discovery (the heaviest,
+    latest-firing prompt) to fail sporadically only inside /smart-analysis.
+    """
+    from openai import RateLimitError, APITimeoutError, APIConnectionError
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            return await asyncio.to_thread(fn)
+        except (RateLimitError, APITimeoutError, APIConnectionError) as _e:
+            last_err = _e
+            if attempt < retries:
+                delay = base_delay * (attempt + 1)
+                logger.warning(f"[RETRY] {label} transient error (attempt {attempt+1}/{retries+1}): {_e} — retrying in {delay}s")
+                await asyncio.sleep(delay)
+    raise last_err
+
+
 @app.post("/prospect-discovery")
 async def prospect_discovery(request: ProspectDiscoveryRequest):
     try:
@@ -5314,14 +5337,15 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         )
 
         logger.info(f"[PROSPECT] Calling GPT-4o with {len(enriched)} businesses")
-        raw_resp = await asyncio.to_thread(
+        raw_resp = await _retry_openai_call(
             lambda: client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=3500,
                 temperature=0.3,
                 response_format={"type": "json_object"},
-            ).choices[0].message.content
+            ).choices[0].message.content,
+            label="prospect_discovery GPT-4o call",
         )
 
         result_obj = json.loads(raw_resp)
