@@ -6183,6 +6183,222 @@ async def meta_ads_performance(date_range: str = "last_30d"):
         return {"success": False, "error": f"{type(ex).__name__}: {ex}"}
 
 
+# ── Meta Ads Campaign Creation (write access — PAUSED by default) ───────────
+
+class CreateMetaCampaignRequest(BaseModel):
+    campaign_name: str
+    objective:     str   = "OUTCOME_LEADS"
+    daily_budget:  float                   # in ₹
+    business_key:  str   = ""              # if set, pull ad copy/city from campaign_memory
+
+
+def _resolve_meta_targeting_sync(city: str) -> dict:
+    """
+    Returns a Meta targeting spec dict. Defaults to country-level India
+    targeting; if a city is given, attempts a city-level geolocation lookup
+    via TargetingSearch and falls back to India on any miss/failure — same
+    safety pattern as the Google Ads geo-target resolver.
+    """
+    from facebook_business.adobjects.targetingsearch import TargetingSearch
+
+    india_targeting = {"geo_locations": {"countries": ["IN"]}}
+    city_clean = (city or "").strip()
+    if not city_clean or city_clean.lower() in ("india", "all india", "pan india"):
+        return india_targeting
+
+    try:
+        results = TargetingSearch.search(params={
+            "type":           TargetingSearch.TargetingSearchTypes.geolocation,
+            "location_types": ["city"],
+            "q":              city_clean,
+            "limit":          1,
+        })
+        if results:
+            key = results[0].get("key")
+            if key:
+                return {"geo_locations": {"cities": [{"key": key, "radius": 25, "distance_unit": "kilometer"}]}}
+        logger.info(f"[META ADS] No city targeting match for {city_clean!r} — falling back to India")
+    except Exception as _e:
+        logger.warning(f"[META ADS] City targeting lookup failed for city={city_clean!r}: {_e}")
+
+    return india_targeting
+
+
+@app.post("/meta-ads/create-campaign")
+async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
+    """
+    Create a Campaign + AdSet + AdCreative + Ad, all PAUSED by default —
+    same safe pattern as Google Ads: nothing goes live until a human
+    reviews and enables it in Ads Manager.
+    """
+    from facebook_business.adobjects.adaccount import AdAccount
+    from facebook_business.adobjects.campaign import Campaign
+    from facebook_business.adobjects.adset import AdSet
+    from facebook_business.adobjects.adcreative import AdCreative
+    from facebook_business.adobjects.ad import Ad
+    from facebook_business.exceptions import FacebookRequestError
+
+    try:
+        _, account_id = get_meta_ads_client()
+    except RuntimeError as _e:
+        return {"success": False, "error": str(_e)}
+
+    page_id = _genv("META_PAGE_ID")
+    if not page_id:
+        return {
+            "success": False,
+            "error": "META_PAGE_ID not configured — ad creatives require a Facebook "
+                     "Page connected to this ad account. Add META_PAGE_ID to env vars.",
+        }
+
+    # ── Pull ad copy / city / landing URL from campaign_memory ──────────────
+    headline      = "Grow Your Business Today"
+    primary_text  = "Reach more customers with a campaign built for results."
+    description   = ""
+    city          = ""
+    final_url     = ""
+    final_url_is_placeholder = False
+
+    if request.business_key:
+        mem = get_memory(request.business_key)
+        camp_data_raw = mem.get("campaign", {}).get("campaign_data", {}) if mem else {}
+        if isinstance(camp_data_raw, str) and camp_data_raw.strip().startswith("{"):
+            try:
+                camp_data_raw = json.loads(camp_data_raw)
+            except Exception:
+                camp_data_raw = {}
+        camp_data = camp_data_raw if isinstance(camp_data_raw, dict) else {}
+
+        headlines    = camp_data.get("headlines") or []
+        descriptions = camp_data.get("descriptions") or []
+        if headlines:
+            headline = str(headlines[0])[:40]
+        if descriptions:
+            primary_text = str(descriptions[0])[:125]
+            if len(descriptions) > 1:
+                description = str(descriptions[1])[:30]
+
+        biz = mem.get("business", {}) if mem else {}
+        city = biz.get("city", "") or ""
+
+        website = mem.get("website", {}) if mem else {}
+        final_url = (website.get("url") or "").strip()
+
+        if not final_url:
+            # business_key is derived as "domain.com::industry::city" for
+            # URL-mode businesses — reuse the domain segment as a last resort.
+            domain = request.business_key.strip().split("::")[0].strip()
+            if domain and "." in domain and " " not in domain:
+                final_url = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+
+    if not final_url:
+        final_url = "https://example.com"
+        final_url_is_placeholder = True
+
+    logger.info(
+        f"[META ADS CREATE] business_key={request.business_key!r} city={city!r} "
+        f"final_url={final_url!r} placeholder={final_url_is_placeholder}"
+    )
+
+    created = {}
+    try:
+        def _create_campaign():
+            account = AdAccount(account_id)
+            return account.create_campaign(params={
+                Campaign.Field.name:                 request.campaign_name,
+                Campaign.Field.objective:             request.objective,
+                Campaign.Field.status:                Campaign.Status.paused,
+                Campaign.Field.special_ad_categories: [Campaign.SpecialAdCategory.none],
+            })
+
+        campaign = await asyncio.to_thread(_create_campaign)
+        campaign_id = campaign.get(Campaign.Field.id)
+        created["campaign_id"] = campaign_id
+        logger.info(f"[META ADS CREATE] Campaign created: {campaign_id}")
+
+        targeting = await asyncio.to_thread(_resolve_meta_targeting_sync, city)
+        logger.info(f"[META ADS CREATE] Targeting resolved: {targeting}")
+
+        optimization_goal = (
+            AdSet.OptimizationGoal.lead_generation
+            if request.objective.upper() == "OUTCOME_LEADS"
+            else AdSet.OptimizationGoal.link_clicks
+        )
+
+        def _create_adset():
+            account = AdAccount(account_id)
+            return account.create_ad_set(params={
+                AdSet.Field.name:              f"{request.campaign_name} — Ad Set 1",
+                AdSet.Field.campaign_id:       campaign_id,
+                AdSet.Field.daily_budget:      int(round(request.daily_budget * 100)),  # ₹ → paise
+                AdSet.Field.billing_event:     AdSet.BillingEvent.impressions,
+                AdSet.Field.optimization_goal: optimization_goal,
+                AdSet.Field.targeting:         targeting,
+                AdSet.Field.status:            AdSet.Status.paused,
+            })
+
+        adset = await asyncio.to_thread(_create_adset)
+        adset_id = adset.get(AdSet.Field.id)
+        created["adset_id"] = adset_id
+        logger.info(f"[META ADS CREATE] AdSet created: {adset_id}")
+
+        def _create_creative():
+            account = AdAccount(account_id)
+            return account.create_ad_creative(params={
+                AdCreative.Field.name: f"{request.campaign_name} — Creative",
+                AdCreative.Field.object_story_spec: {
+                    "page_id": page_id,
+                    "link_data": {
+                        "message":     primary_text,
+                        "link":        final_url,
+                        "name":        headline,
+                        "description": description,
+                        "call_to_action": {"type": "LEARN_MORE", "value": {"link": final_url}},
+                    },
+                },
+            })
+
+        creative = await asyncio.to_thread(_create_creative)
+        creative_id = creative.get(AdCreative.Field.id)
+        created["creative_id"] = creative_id
+        logger.info(f"[META ADS CREATE] AdCreative created: {creative_id}")
+
+        def _create_ad():
+            account = AdAccount(account_id)
+            return account.create_ad(params={
+                Ad.Field.name:     f"{request.campaign_name} — Ad 1",
+                Ad.Field.adset_id: adset_id,
+                Ad.Field.creative: {"creative_id": creative_id},
+                Ad.Field.status:   Ad.Status.paused,
+            })
+
+        ad = await asyncio.to_thread(_create_ad)
+        ad_id = ad.get(Ad.Field.id)
+        created["ad_id"] = ad_id
+        logger.info(f"[META ADS CREATE] Ad created: {ad_id}")
+
+        return {
+            "success":                 True,
+            "campaign_id":             campaign_id,
+            "adset_id":                adset_id,
+            "creative_id":             creative_id,
+            "ad_id":                   ad_id,
+            "status":                  "PAUSED",
+            "targeting_used":          targeting,
+            "final_url":               final_url,
+            "final_url_is_placeholder": final_url_is_placeholder,
+            "meta_ads_manager_link":   f"https://business.facebook.com/adsmanager/manage/campaigns?act={account_id.replace('act_', '')}",
+        }
+
+    except FacebookRequestError as ex:
+        details = _log_meta_error("create-campaign", ex)
+        return {"success": False, "partial": created, **details}
+    except Exception as ex:
+        tb = _traceback.format_exc()
+        logger.error(f"[META ADS] create-campaign unexpected error: {type(ex).__name__}: {ex}\n{tb}")
+        return {"success": False, "partial": created, "error": f"{type(ex).__name__}: {ex}"}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CRICKET COMMUNITY ADS — STANDALONE MODULE
 #  Isolated from all other modules. Own table, own save/load, own endpoint.
