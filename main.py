@@ -1643,6 +1643,15 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
     Parse the AI-generated Google Ads launch kit text into structured
     keywords/headlines/descriptions for campaign_memory + push-to-Google-Ads.
     """
+    def _clean_kw(raw: str) -> str:
+        # AI output is inconsistent about wrapping the keyword itself in quotes
+        # (e.g. `[exact match] "hotel marketing Jaipur"`) regardless of the
+        # match-type prefix — strip any such wrapping so the literal quote
+        # characters never end up in the keyword text sent to Google Ads.
+        kw = raw.strip().rstrip(".")
+        kw = kw.strip('"\'“”‘’').strip()
+        return kw
+
     keywords, headlines, descriptions = [], [], []
     for line in (google_kit_text or "").split("\n"):
         line = line.strip()
@@ -1650,19 +1659,19 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
             continue
         m = re.match(r'^\[exact match\]\s*(.+)$', line, re.I)
         if m:
-            kw = m.group(1).strip().rstrip(".")
+            kw = _clean_kw(m.group(1))
             if kw:
                 keywords.append({"text": kw, "match_type": "EXACT"})
             continue
         m = re.match(r'^["“]phrase match["”]\s*(.+)$', line, re.I)
         if m:
-            kw = m.group(1).strip().rstrip(".")
+            kw = _clean_kw(m.group(1))
             if kw:
                 keywords.append({"text": kw, "match_type": "PHRASE"})
             continue
         m = re.match(r'^broad match\s*(.+)$', line, re.I)
         if m:
-            kw = re.sub(r'\s*\(include[^)]*\)', '', m.group(1), flags=re.I).strip().rstrip(".")
+            kw = _clean_kw(re.sub(r'\s*\(include[^)]*\)', '', m.group(1), flags=re.I))
             if kw:
                 keywords.append({"text": kw, "match_type": "BROAD"})
             continue
