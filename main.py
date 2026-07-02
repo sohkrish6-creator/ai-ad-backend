@@ -1652,7 +1652,7 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
         kw = kw.strip('"\'“”‘’').strip()
         return kw
 
-    keywords, headlines, descriptions = [], [], []
+    keywords, headlines, descriptions, sitelinks = [], [], [], []
     for line in (google_kit_text or "").split("\n"):
         line = line.strip()
         if not line:
@@ -1675,6 +1675,16 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
             if kw:
                 keywords.append({"text": kw, "match_type": "BROAD"})
             continue
+        m = re.match(r'^Sitelink\s*\d+\s*:\s*(.+?)\s*\|\s*Desc1\s*:\s*(.+?)\s*\|\s*Desc2\s*:\s*(.+)$', line, re.I)
+        if m:
+            link_text = m.group(1).strip()
+            if link_text and len(sitelinks) < 6:
+                sitelinks.append({
+                    "link_text":    link_text,
+                    "description1": m.group(2).strip(),
+                    "description2": m.group(3).strip(),
+                })
+            continue
         m = re.match(r'^Headline\s*\d+\s*:\s*(.+)$', line, re.I)
         if m:
             h = m.group(1).strip()
@@ -1691,6 +1701,7 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
         "keywords":     keywords[:30],
         "headlines":    headlines[:15],
         "descriptions": descriptions[:4],
+        "sitelinks":    sitelinks[:6],
     }
 
 
@@ -1777,6 +1788,10 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "  Recommended starting bid: [Rs X-Y per click for this industry — give specific range]\n"
         "  Reason: [one sentence why this strategy fits the goal]\n"
         "---\n"
+        "PRIMARY KEYWORD: Before writing anything below, decide ONE primary keyword phrase for "
+        f"this business — normally [service/industry] + {city_label}, e.g. 'hospitality marketing jaipur' "
+        "or 'hotel booking jaipur'. Reuse this exact phrase (and close variants) in the keyword-match "
+        "headlines marked below — this drives Google Ads' 'Ad Strength' relevance signal.\n"
         "KEYWORDS (15 minimum — mix of match types, include local + intent keywords)\n"
         "[exact match] keyword 1\n[exact match] keyword 2\n[exact match] keyword 3\n"
         "[exact match] keyword 4\n[exact match] keyword 5\n"
@@ -1788,15 +1803,19 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "NEGATIVE KEYWORDS (10 minimum)\n"
         "1. []\n2. []\n3. []\n4. []\n5. []\n6. []\n7. []\n8. []\n9. []\n10. []\n"
         "---\n"
+        "GOOGLE ADS RSA HEADLINES — 15 REQUIRED, NOT OPTIONAL. Google Ads rates 'Ad Strength' on how "
+        "close you get to 15 UNIQUE headlines spanning distinct angles — filling only 8-10 or reusing "
+        "the same idea in different words scores 'Poor'. Every one of the 15 below must be a genuinely "
+        "different angle (not a reword of another headline) and must fit in 30 characters:\n"
         "AD 1 — BENEFIT ANGLE (what they get — specific outcome)\n"
-        "Headline 1: [max 30 chars — include number or benefit]\n"
+        "Headline 1: [KEYWORD-MATCH — literally include the PRIMARY KEYWORD phrase + city, e.g. 'Hospitality Marketing Jaipur']\n"
         "Headline 2: [max 30 chars — include city or specific offer]\n"
         "Headline 3: [max 30 chars — CTA or urgency]\n"
         "Description 1: [80-90 chars MANDATORY — specific benefit with number or proof. Last sentence = CTA. Count characters.]\n"
         "Description 2: [80-90 chars MANDATORY — social proof or differentiator. Last sentence = CTA. Count characters.]\n"
         "---\n"
         "AD 2 — PROOF ANGLE (numbers, results, credibility — completely different from Ad 1)\n"
-        "Headline 1: [max 30 chars — specific result number, e.g. '47 Leads in 30 Days']\n"
+        "Headline 1: [KEYWORD-MATCH VARIANT — different word order/synonym of the PRIMARY KEYWORD + city, e.g. 'Jaipur Hospitality Experts', ALSO include a specific result number]\n"
         "Headline 2: [max 30 chars — who got the result, e.g. 'Jaipur Hotels Trust Us']\n"
         "Headline 3: [max 30 chars — CTA]\n"
         "Description 1: [80-90 chars MANDATORY — state the specific result and who achieved it. Last sentence = CTA.]\n"
@@ -1809,6 +1828,15 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "Description 1: [80-90 chars MANDATORY — real urgency tied to season/capacity/competitor. Last sentence = CTA.]\n"
         "Description 2: [80-90 chars MANDATORY — risk of delay + risk-free first step. Last sentence = CTA.]\n"
         "NOTE on 'Free': For Google Ads prefer 'Complimentary', 'No-cost', 'On us' over 'Free' to avoid ad policy flags.\n"
+        "---\n"
+        "ADDITIONAL RSA HEADLINES (6 more — MANDATORY, brings the total to 15. Each MUST be a completely "
+        "different angle from the 9 above and from each other — no rewording of an existing headline):\n"
+        "Headline 10: [KEYWORD-MATCH — the PRIMARY KEYWORD phrase + city, plain and direct, e.g. 'Hotel Booking Jaipur Experts']\n"
+        "Headline 11: [KEYWORD-MATCH VARIANT — a third distinct phrasing of the PRIMARY KEYWORD + city]\n"
+        "Headline 12: [KEYWORD-MATCH VARIANT — a fourth distinct phrasing, e.g. service + 'near' + city or a neighborhood in the city]\n"
+        "Headline 13: [FEATURE-FOCUSED — name one concrete deliverable/feature, not a vague benefit]\n"
+        "Headline 14: [QUESTION-FOCUSED — must end in '?', speaks to the audience's exact pain point]\n"
+        "Headline 15: [SOCIAL-PROOF-FOCUSED — a specific different proof point than Ad 2 Headline 2, e.g. a rating or review count]\n"
         "---\n"
         "AD EXTENSIONS\n"
         "Sitelinks (6 — link to specific pages, not homepage. Each with 2 description lines, max 35 chars each):\n"
@@ -1947,6 +1975,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
             "keywords":     campaign_assets["keywords"],
             "headlines":    campaign_assets["headlines"],
             "descriptions": campaign_assets["descriptions"],
+            "sitelinks":    campaign_assets["sitelinks"],
         }
     })
 
@@ -5358,6 +5387,7 @@ class CreateAdRequest(BaseModel):
     headlines:      list = []              # max 15, each max 30 chars
     descriptions:   list = []              # max 4, each max 90 chars
     final_url:      str  = ""
+    sitelinks:      list = []              # [{"link_text","description1","description2"}], max 6
 
 class AddKeywordsRequest(BaseModel):
     ad_group_id:    str
@@ -5611,6 +5641,43 @@ def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
     return {"ad_id": ad_rn.split("/")[-1], "resource_name": ad_rn, "status": "ENABLED"}
 
 
+def _create_sitelinks_sync(campaign_rn: str, sitelinks: list, customer_id: str):
+    """
+    Synchronous: create up to 6 SitelinkAssets and link them to the campaign.
+    Google Ads models sitelinks as standalone Assets linked via CampaignAsset —
+    they are not a field on the ad itself. Returns the list of linked resource names.
+    """
+    client = get_google_ads_client()
+
+    # 1. Create the Asset objects (one mutate call, one operation per sitelink)
+    asset_service = client.get_service("AssetService")
+    asset_ops = []
+    for sl in sitelinks[:6]:
+        op = client.get_type("AssetOperation")
+        asset = op.create
+        asset.sitelink_asset.link_text    = str(sl.get("link_text", ""))[:25]
+        asset.sitelink_asset.description1 = str(sl.get("description1", ""))[:35]
+        asset.sitelink_asset.description2 = str(sl.get("description2", ""))[:35]
+        asset_ops.append(op)
+    if not asset_ops:
+        return []
+    asset_resp = asset_service.mutate_assets(customer_id=customer_id, operations=asset_ops)
+    asset_resource_names = [r.resource_name for r in asset_resp.results]
+
+    # 2. Link each Asset to the campaign as a SITELINK field type
+    campaign_asset_service = client.get_service("CampaignAssetService")
+    link_ops = []
+    for asset_rn in asset_resource_names:
+        op = client.get_type("CampaignAssetOperation")
+        ca = op.create
+        ca.campaign   = campaign_rn
+        ca.asset      = asset_rn
+        ca.field_type = client.enums.AssetFieldTypeEnum.SITELINK
+        link_ops.append(op)
+    link_resp = campaign_asset_service.mutate_campaign_assets(customer_id=customer_id, operations=link_ops)
+    return [r.resource_name for r in link_resp.results]
+
+
 @app.post("/google-ads/create-campaign")
 async def gads_create_campaign(request: CreateCampaignRequest):
     try:
@@ -5659,8 +5726,9 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         business_key = derive_business_key(lookup_source, request.industry, request.city)
         logger.info(f"[GADS CREATE] LOOKUP key: '{business_key}'")
 
-        keywords_added = []
-        ad_created     = None
+        keywords_added  = []
+        ad_created      = None
+        sitelinks_added = []
         if lookup_source:
             mem, resolved_key = get_memory_with_city_fallback(lookup_source, request.industry, request.city)
             camp_data_raw = mem.get("campaign", {}).get("campaign_data", {}) if mem else {}
@@ -5708,9 +5776,22 @@ async def gads_create_campaign(request: CreateCampaignRequest):
                     f"descriptions={len(descriptions)} final_url={final_url!r}"
                 )
 
+            # Sitelinks — Google Ads' "Ad Strength" grader also checks these;
+            # without them a technically-valid RSA still scores lower.
+            sitelinks_data = camp_data.get("sitelinks", [])
+            if sitelinks_data:
+                try:
+                    sitelinks_added = await asyncio.to_thread(
+                        _create_sitelinks_sync, result["campaign_rn"], sitelinks_data, customer_id
+                    )
+                    logger.info(f"[GADS-CREATE] Added {len(sitelinks_added)} sitelinks from memory")
+                except Exception as _se:
+                    logger.warning(f"[GADS-CREATE] Sitelink creation failed: {_se}")
+
         result["keywords_added"] = len(keywords_added)
         result["ad_created"]     = bool(ad_created)
         result["ad"]             = ad_created
+        result["sitelinks_added"] = len(sitelinks_added)
         result["location_target"] = {
             "resource_name": location_resource_name,
             "matched_name":  location_matched_name,
@@ -5762,6 +5843,25 @@ async def gads_create_ad(request: CreateAdRequest):
             _create_ad_sync,
             ad_group_rn, request.headlines, request.descriptions, request.final_url, customer_id,
         )
+
+        if request.sitelinks:
+            try:
+                def _get_campaign_rn():
+                    svc = get_google_ads_client().get_service("GoogleAdsService")
+                    query = f"SELECT ad_group.campaign FROM ad_group WHERE ad_group.resource_name = '{ad_group_rn}'"
+                    rows = list(svc.search(customer_id=customer_id, query=query))
+                    return rows[0].ad_group.campaign if rows else None
+
+                campaign_rn = await asyncio.to_thread(_get_campaign_rn)
+                if campaign_rn:
+                    sitelinks_added = await asyncio.to_thread(
+                        _create_sitelinks_sync, campaign_rn, request.sitelinks, customer_id
+                    )
+                    result["sitelinks_added"] = len(sitelinks_added)
+                    logger.info(f"[GADS-AD] Added {len(sitelinks_added)} sitelinks to campaign={campaign_rn!r}")
+            except Exception as _se:
+                logger.warning(f"[GADS-AD] Sitelink creation failed: {_se}")
+
         return {"success": True, **result}
 
     except GoogleAdsException as ex:
