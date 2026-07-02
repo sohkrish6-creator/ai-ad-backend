@@ -5932,11 +5932,16 @@ def get_meta_ads_client():
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
+    account_id_raw = account_id
     if not account_id.startswith("act_"):
         account_id = f"act_{account_id}"
 
     api = FacebookAdsApi.init(app_id, app_secret, access_token)
-    logger.info(f"[META ADS] Client initialized — app_id={app_id[:5]}… account_id={account_id[:8]}…")
+    logger.info(
+        f"[META ADS] Client initialized — app_id={app_id[:5]}…(len={len(app_id)}) "
+        f"access_token={access_token[:8]}…(len={len(access_token)}) "
+        f"account_id_raw={account_id_raw!r} account_id_used={account_id}"
+    )
     return api, account_id
 
 
@@ -5948,28 +5953,63 @@ _META_ACCOUNT_STATUS_NAMES = {
 }
 
 
-def _log_meta_error(context: str, ex) -> None:
+def _meta_error_details(ex) -> dict:
+    """
+    Extract every field Meta's Graph API gives us for a FacebookRequestError.
+    error_user_title/error_user_msg are end-user-facing strings Meta includes
+    for some errors (e.g. permission/consent issues) but the SDK doesn't
+    expose via a dedicated method — pull them from the raw error body.
+    Every accessor is wrapped individually so one bad field never hides the rest.
+    """
+    def _safe(fn):
+        try:
+            return fn()
+        except Exception as _e:
+            return f"<unavailable: {_e}>"
+
+    raw_body = _safe(ex.body)
+    raw_error = raw_body.get("error", {}) if isinstance(raw_body, dict) else {}
+
+    # api_error_message() can legitimately be None (e.g. the response wasn't
+    # the expected {"error": {...}} shape) — never let "error" end up empty,
+    # fall back to the SDK's full formatted diagnostic string instead.
+    error_message = _safe(ex.api_error_message) or _safe(ex.get_message) or "Unknown Meta API error (see raw_body)"
+
+    return {
+        "error":           error_message,
+        "error_code":      _safe(ex.api_error_code),
+        "error_subcode":   _safe(ex.api_error_subcode),
+        "error_type":      _safe(ex.api_error_type),
+        "error_user_title": raw_error.get("error_user_title") if isinstance(raw_error, dict) else None,
+        "error_user_msg":   raw_error.get("error_user_msg") if isinstance(raw_error, dict) else None,
+        "http_status":     _safe(ex.http_status),
+        "fbtrace_id":      raw_error.get("fbtrace_id") if isinstance(raw_error, dict) else None,
+        "raw_body":        raw_body,
+    }
+
+
+def _log_meta_error(context: str, ex) -> dict:
     # Logged in full detail up front — Google Ads debugging burned us on
-    # vague error messages, so surface message + subcode immediately here.
-    logger.error(
-        f"[META ADS] {context} FacebookRequestError: "
-        f"message={ex.api_error_message()!r} code={ex.api_error_code()} "
-        f"subcode={ex.api_error_subcode()} type={ex.api_error_type()!r}"
-    )
+    # vague error messages, so surface every field immediately here.
+    details = _meta_error_details(ex)
+    logger.error(f"[META ADS] {context} FacebookRequestError — full details: {details}")
+    return details
 
 
 @app.get("/meta-ads/test-connection")
 async def meta_ads_test_connection():
-    """Verify Meta Marketing API connectivity and surface account details for debugging."""
+    """
+    Verify Meta Marketing API connectivity and surface account details for
+    debugging. Everything — client init AND the API call — is wrapped in one
+    try/except so the frontend always gets a well-formed {connected, error}
+    body, never a raw 500 that renders as "Unknown error".
+    """
     from facebook_business.adobjects.adaccount import AdAccount
     from facebook_business.exceptions import FacebookRequestError
 
     try:
         _, account_id = get_meta_ads_client()
-    except RuntimeError as _e:
-        return {"connected": False, "error": str(_e)}
 
-    try:
         def _fetch():
             account = AdAccount(account_id)
             return account.api_get(fields=[
@@ -5989,18 +6029,17 @@ async def meta_ads_test_connection():
             "timezone":     info.get(AdAccount.Field.timezone_name),
             "status":       _META_ACCOUNT_STATUS_NAMES.get(status_code, status_code),
         }
+    except RuntimeError as _e:
+        # Missing env vars — from get_meta_ads_client()
+        logger.error(f"[META ADS] test-connection config error: {_e}")
+        return {"connected": False, "error": str(_e)}
     except FacebookRequestError as ex:
-        _log_meta_error("test-connection", ex)
-        return {
-            "connected":     False,
-            "error":         ex.api_error_message(),
-            "error_code":    ex.api_error_code(),
-            "error_subcode": ex.api_error_subcode(),
-        }
+        details = _log_meta_error("test-connection", ex)
+        return {"connected": False, **details}
     except Exception as ex:
         tb = _traceback.format_exc()
-        logger.error(f"[META ADS] test-connection unexpected error: {ex}\n{tb}")
-        return {"connected": False, "error": str(ex)}
+        logger.error(f"[META ADS] test-connection unexpected error: {type(ex).__name__}: {ex}\n{tb}")
+        return {"connected": False, "error": f"{type(ex).__name__}: {ex}" or "Unknown error (see server logs)"}
 
 
 @app.get("/meta-ads/campaigns")
@@ -6036,12 +6075,12 @@ async def meta_ads_campaigns():
         } for c in rows]
         return {"success": True, "campaigns": campaigns}
     except FacebookRequestError as ex:
-        _log_meta_error("campaigns", ex)
-        return {"success": False, "error": ex.api_error_message(), "error_subcode": ex.api_error_subcode()}
+        details = _log_meta_error("campaigns", ex)
+        return {"success": False, **details}
     except Exception as ex:
         tb = _traceback.format_exc()
-        logger.error(f"[META ADS] campaigns unexpected error: {ex}\n{tb}")
-        return {"success": False, "error": str(ex)}
+        logger.error(f"[META ADS] campaigns unexpected error: {type(ex).__name__}: {ex}\n{tb}")
+        return {"success": False, "error": f"{type(ex).__name__}: {ex}"}
 
 
 @app.get("/meta-ads/performance")
@@ -6136,12 +6175,12 @@ async def meta_ads_performance(date_range: str = "last_30d"):
             "per_campaign": per_campaign,
         }
     except FacebookRequestError as ex:
-        _log_meta_error("performance", ex)
-        return {"success": False, "error": ex.api_error_message(), "error_subcode": ex.api_error_subcode()}
+        details = _log_meta_error("performance", ex)
+        return {"success": False, **details}
     except Exception as ex:
         tb = _traceback.format_exc()
-        logger.error(f"[META ADS] performance unexpected error: {ex}\n{tb}")
-        return {"success": False, "error": str(ex)}
+        logger.error(f"[META ADS] performance unexpected error: {type(ex).__name__}: {ex}\n{tb}")
+        return {"success": False, "error": f"{type(ex).__name__}: {ex}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
