@@ -6406,6 +6406,42 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         return {"success": False, "partial": created, "error": f"{type(ex).__name__}: {ex}"}
 
 
+class DeleteMetaCampaignRequest(BaseModel):
+    campaign_id: str
+
+
+@app.post("/meta-ads/delete-campaign")
+async def meta_ads_delete_campaign(request: DeleteMetaCampaignRequest):
+    """
+    Delete (Meta's API sets status=DELETED, a reversible soft-delete) a
+    campaign — used to clean up test/orphaned campaigns from failed or
+    exploratory create-campaign runs.
+    """
+    from facebook_business.adobjects.campaign import Campaign
+    from facebook_business.exceptions import FacebookRequestError
+
+    try:
+        get_meta_ads_client()
+    except RuntimeError as _e:
+        return {"success": False, "error": str(_e)}
+
+    try:
+        def _delete():
+            campaign = Campaign(request.campaign_id)
+            return campaign.api_delete()
+
+        await asyncio.to_thread(_delete)
+        logger.info(f"[META ADS] Deleted campaign_id={request.campaign_id}")
+        return {"success": True, "campaign_id": request.campaign_id, "status": "DELETED"}
+    except FacebookRequestError as ex:
+        details = _log_meta_error("delete-campaign", ex)
+        return {"success": False, **details}
+    except Exception as ex:
+        tb = _traceback.format_exc()
+        logger.error(f"[META ADS] delete-campaign unexpected error: {type(ex).__name__}: {ex}\n{tb}")
+        return {"success": False, "error": f"{type(ex).__name__}: {ex}"}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CRICKET COMMUNITY ADS — STANDALONE MODULE
 #  Isolated from all other modules. Own table, own save/load, own endpoint.
