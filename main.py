@@ -5863,3 +5863,261 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
 
     logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r}")
     return {"success": True, "data": result}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CRICKET AD ACCOUNTS — ISOLATED GOOGLE ADS ACCOUNT MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CRICKET_ACCOUNTS_DDL = """
+CREATE TABLE IF NOT EXISTS cricket_ad_accounts (
+    id                BIGSERIAL PRIMARY KEY,
+    account_name      TEXT NOT NULL,
+    customer_id       TEXT UNIQUE NOT NULL,
+    login_customer_id TEXT,
+    added_at          TEXT
+);
+"""
+
+def _create_cricket_accounts_table():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(_CRICKET_ACCOUNTS_DDL))
+            conn.commit()
+        logger.info("[CRICKET-ACCT] cricket_ad_accounts table ready")
+    except Exception as _e:
+        logger.warning(f"[CRICKET-ACCT] Table create failed: {_e}")
+
+try:
+    _create_cricket_accounts_table()
+except Exception:
+    pass
+
+
+def _cricket_account_ops(op: str, customer_id: str = None, data: dict = None):
+    """Single entry point for all cricket_ad_accounts DB operations."""
+    with engine.begin() as conn:
+        if op == "insert":
+            conn.execute(text(
+                "INSERT INTO cricket_ad_accounts (account_name, customer_id, login_customer_id, added_at) "
+                "VALUES (:name, :cid, :lcid, :ts) "
+                "ON CONFLICT(customer_id) DO UPDATE SET account_name=:name, login_customer_id=:lcid"
+            ), {
+                "name": data["account_name"],
+                "cid":  data["customer_id"],
+                "lcid": data.get("login_customer_id") or "",
+                "ts":   datetime.utcnow().isoformat(),
+            })
+        elif op == "list":
+            rows = conn.execute(text(
+                "SELECT account_name, customer_id, login_customer_id FROM cricket_ad_accounts ORDER BY id"
+            )).fetchall()
+            return [{"account_name": r[0], "customer_id": r[1], "login_customer_id": r[2]} for r in rows]
+        elif op == "delete":
+            conn.execute(text(
+                "DELETE FROM cricket_ad_accounts WHERE customer_id=:cid"
+            ), {"cid": customer_id})
+    return None
+
+
+def _build_cricket_client(login_customer_id: str = None):
+    """Isolated Google Ads client builder for the Cricket module.
+    Allows per-account login_customer_id override without touching get_google_ads_client().
+    """
+    lci = (login_customer_id or "").replace("-", "").replace(" ", "")
+    if not lci:
+        lci = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID").replace("-", "").replace(" ", "") or "3879422819"
+    config = {
+        "developer_token":   _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "client_id":         _genv("GOOGLE_ADS_CLIENT_ID"),
+        "client_secret":     _genv("GOOGLE_ADS_CLIENT_SECRET"),
+        "refresh_token":     _genv("GOOGLE_ADS_REFRESH_TOKEN"),
+        "login_customer_id": str(lci),
+        "use_proto_plus":    True,
+    }
+    return GoogleAdsClient.load_from_dict(config)
+
+
+def _probe_cricket_account_sync(customer_id: str, login_customer_id: str = None) -> dict:
+    """Read-only probe: tries a minimal GAQL query to verify the account is reachable."""
+    try:
+        client = _build_cricket_client(login_customer_id)
+        svc    = client.get_service("GoogleAdsService")
+        rows   = list(svc.search(
+            customer_id=customer_id,
+            query="SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1"
+        ))
+        if rows:
+            r = rows[0]
+            return {
+                "queryable":   True,
+                "name":        r.customer.descriptive_name,
+                "is_manager":  r.customer.manager,
+                "customer_id": str(r.customer.id),
+            }
+        return {"queryable": True, "name": None, "is_manager": False}
+    except GoogleAdsException as ex:
+        errs = [e.message for e in ex.failure.errors]
+        return {"queryable": False, "error": "; ".join(errs)}
+    except Exception as _e:
+        return {"queryable": False, "error": str(_e)}
+
+
+def _create_cricket_display_campaign_sync(
+    campaign_name: str, budget_daily: float,
+    customer_id: str, login_customer_id: str = None
+) -> dict:
+    """Create a PAUSED Display campaign + ad group on the specified account."""
+    client = _build_cricket_client(login_customer_id)
+    cid    = customer_id.replace("-", "")
+
+    # 1. Budget
+    bsvc  = client.get_service("CampaignBudgetService")
+    b_op  = client.get_type("CampaignBudgetOperation")
+    cb    = b_op.create
+    cb.name                = f"Cricket Budget — {campaign_name}"
+    cb.amount_micros       = int(budget_daily * 1_000_000)
+    cb.delivery_method     = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    cb.explicitly_shared   = False
+    b_resp   = bsvc.mutate_campaign_budgets(customer_id=cid, operations=[b_op])
+    budget_rn = b_resp.results[0].resource_name
+
+    # 2. Campaign
+    csvc   = client.get_service("CampaignService")
+    c_op   = client.get_type("CampaignOperation")
+    camp   = c_op.create
+    camp.name              = campaign_name
+    camp.status            = client.enums.CampaignStatusEnum.PAUSED
+    camp.campaign_budget   = budget_rn
+    camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.DISPLAY
+    camp.contains_eu_political_advertising = (
+        client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
+    )
+    c_resp     = csvc.mutate_campaigns(customer_id=cid, operations=[c_op])
+    campaign_rn = c_resp.results[0].resource_name
+    campaign_id = campaign_rn.split("/")[-1]
+
+    # 3. Ad Group
+    agsvc  = client.get_service("AdGroupService")
+    ag_op  = client.get_type("AdGroupOperation")
+    ag     = ag_op.create
+    ag.name           = f"{campaign_name} — Ad Group 1"
+    ag.campaign       = campaign_rn
+    ag.status         = client.enums.AdGroupStatusEnum.ENABLED
+    ag.type_          = client.enums.AdGroupTypeEnum.DISPLAY_STANDARD
+    ag.cpc_bid_micros = 2_000_000   # ₹2 default starting bid
+    ag_resp    = agsvc.mutate_ad_groups(customer_id=cid, operations=[ag_op])
+    ag_rn      = ag_resp.results[0].resource_name
+    ag_id      = ag_rn.split("/")[-1]
+
+    return {
+        "campaign_id":  campaign_id,
+        "campaign_rn":  campaign_rn,
+        "ad_group_id":  ag_id,
+        "ad_group_rn":  ag_rn,
+    }
+
+
+# ── Pydantic models ──────────────────────────────────────────────────────────
+class CricketAccountRequest(BaseModel):
+    account_name:      str
+    customer_id:       str
+    login_customer_id: str = ""
+
+
+class CricketPushRequest(BaseModel):
+    customer_id:       str
+    login_customer_id: str = ""
+    campaign_name:     str
+    budget_daily:      float
+    headlines:         list = []
+    long_headlines:    list = []
+    descriptions:      list = []
+    whatsapp_link:     str  = ""
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+@app.post("/cricket-ads/accounts/add")
+async def cricket_add_account(request: CricketAccountRequest):
+    cid = request.customer_id.replace("-", "").strip()
+    if not cid:
+        return {"success": False, "error": "customer_id is required"}
+
+    probe = await asyncio.to_thread(
+        _probe_cricket_account_sync, cid,
+        request.login_customer_id or None
+    )
+    if not probe.get("queryable"):
+        return {"success": False, "queryable": False, "error": probe.get("error", "Account not reachable")}
+
+    try:
+        await asyncio.to_thread(
+            _cricket_account_ops, "insert", None,
+            {
+                "account_name":      request.account_name,
+                "customer_id":       cid,
+                "login_customer_id": request.login_customer_id or "",
+            }
+        )
+    except Exception as _e:
+        return {"success": False, "error": str(_e)}
+
+    logger.info(f"[CRICKET-ACCT] Saved account {cid!r} ({request.account_name!r})")
+    return {"success": True, "queryable": True, "account": probe}
+
+
+@app.get("/cricket-ads/accounts/list")
+async def cricket_list_accounts():
+    try:
+        accounts = await asyncio.to_thread(_cricket_account_ops, "list")
+        return {"success": True, "accounts": accounts or []}
+    except Exception as _e:
+        return {"success": False, "accounts": [], "error": str(_e)}
+
+
+@app.delete("/cricket-ads/accounts/{customer_id}")
+async def cricket_delete_account(customer_id: str):
+    cid = customer_id.replace("-", "").strip()
+    try:
+        await asyncio.to_thread(_cricket_account_ops, "delete", cid)
+        return {"success": True}
+    except Exception as _e:
+        return {"success": False, "error": str(_e)}
+
+
+@app.post("/cricket-ads/push-to-google")
+async def cricket_push_to_google(request: CricketPushRequest):
+    cid   = request.customer_id.replace("-", "").strip()
+    lcid  = (request.login_customer_id or "").replace("-", "").strip() or None
+    if not cid:
+        return {"success": False, "error": "customer_id is required"}
+
+    try:
+        result = await asyncio.to_thread(
+            _create_cricket_display_campaign_sync,
+            request.campaign_name, request.budget_daily, cid, lcid
+        )
+    except GoogleAdsException as ex:
+        error_details = []
+        for err in ex.failure.errors:
+            detail = {"error_code": str(err.error_code), "message": err.message, "field": None}
+            if err.location:
+                detail["field"] = str(err.location.field_path_elements)
+            error_details.append(detail)
+        logger.error(f"[CRICKET-PUSH] API error: {error_details}")
+        return {"success": False, "errors": error_details}
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[CRICKET-PUSH] Error: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+    campaign_id = result["campaign_id"]
+    logger.info(f"[CRICKET-PUSH] Created Display campaign {campaign_id!r} on account {cid!r}")
+    return {
+        "success":              True,
+        "campaign_id":          campaign_id,
+        "ad_group_id":          result["ad_group_id"],
+        "status":               "PAUSED",
+        "google_ads_dashboard": f"https://ads.google.com/aw/campaigns?campaignId={campaign_id}",
+        "note":                 "Campaign created PAUSED. Add image assets in Google Ads dashboard before enabling.",
+    }
