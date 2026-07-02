@@ -6674,14 +6674,33 @@ async def _smart_analysis_decision_layer(brain_result: dict, request: SmartAnaly
         return _fallback_decision()
 
 
-@app.post("/smart-analysis")
-async def smart_analysis(request: SmartAnalysisRequest):
-    start_time = time.time()
+_RESULT_KEY_BY_MODULE = {
+    "opportunity_engine":      "opportunity",
+    "offer_intelligence":      "offer",
+    "website_intelligence":    "website",
+    "visibility_intelligence": "visibility",
+    "outreach_ai":             "outreach",
+    "kpi_engine":              "kpi",
+    "prospect_discovery":      "prospects",
+}
 
-    if not request.url.strip():
-        return {"success": False, "error": "url is required"}
+# Same localStorage keys each module's own page already reads on mount —
+# used to pre-load a module's page when the user clicks "View Full Report"
+# from Smart Analysis, and by the frontend directly (kept here as the single
+# source of truth so backend/frontend never drift apart).
+_RESULT_LS_KEY_BY_MODULE = {
+    "opportunity_engine":      "adsoh_opportunity_result",
+    "offer_intelligence":      "adsoh_offer_result",
+    "website_intelligence":    "adsoh_website_result",
+    "visibility_intelligence": "adsoh_visibility_result",
+    "outreach_ai":             "adsoh_outreach_result",
+    "kpi_engine":              "adsoh_kpi_result",
+    "prospect_discovery":      "adsoh_prospect_result",
+}
 
-    # ── Step 1: Marketing Brain (reuses /full-report's own function) ────────
+
+async def _smart_analysis_run_brain_and_decision(request: SmartAnalysisRequest) -> dict:
+    """Steps 1+2 only: Marketing Brain + Decision Layer. No modules run yet."""
     full_report_req = FullReportRequest(
         url=request.url,
         business_type=request.industry or "Business",
@@ -6706,47 +6725,54 @@ async def smart_analysis(request: SmartAnalysisRequest):
     business_key = derive_business_key(request.url, request.industry, request.city)
     logger.info(f"[SMART-ANALYSIS] Brain complete. business_key={business_key!r}")
 
-    # ── Step 2: Decision Layer — one GPT-4o call ─────────────────────────────
     decision = await _smart_analysis_decision_layer(brain_result, request)
+    modules_to_run = [m for m in decision["modules_to_run"] if m in _RESULT_KEY_BY_MODULE]
 
-    # ── Step 3: Run the chosen modules in parallel ───────────────────────────
+    return {
+        "success":      True,
+        "business_key": business_key,
+        "brain_result": brain_result,
+        "decision": {
+            "business_model":  decision["business_model"],
+            "modules_run":     modules_to_run,
+            "modules_skipped": decision["skipped"],
+        },
+    }
+
+
+async def _smart_analysis_run_modules(
+    url: str, industry: str, city: str, budget: float,
+    business_key: str, modules_to_run: list,
+) -> tuple:
+    """Step 3 only: run the given module list in parallel. Returns (results, total_time)."""
+    start_time = time.time()
     module_calls = {
         "opportunity_engine": lambda: opportunity_engine(OpportunityEngineRequest(
-            business_key=business_key, industry=request.industry, city=request.city,
-            budget=int(request.budget) if request.budget else 0,
+            business_key=business_key, industry=industry, city=city,
+            budget=int(budget) if budget else 0,
         )),
         "offer_intelligence": lambda: offer_intelligence(OfferIntelligenceRequest(
-            business_key=business_key, industry=request.industry, city=request.city,
+            business_key=business_key, industry=industry, city=city,
         )),
         "website_intelligence": lambda: website_intelligence(WebsiteIntelligenceRequest(
-            url=request.url, business_key=business_key, industry=request.industry, city=request.city,
+            url=url, business_key=business_key, industry=industry, city=city,
         )),
         "visibility_intelligence": lambda: visibility_intelligence(VisibilityIntelligenceRequest(
-            url=request.url, industry=request.industry, city=request.city, business_key=business_key,
+            url=url, industry=industry, city=city, business_key=business_key,
         )),
         "outreach_ai": lambda: outreach_ai(OutreachAIRequest(
-            url=request.url, industry=request.industry, city=request.city, business_key=business_key,
+            url=url, industry=industry, city=city, business_key=business_key,
         )),
         "kpi_engine": lambda: kpi_engine(KPIEngineRequest(
-            url=request.url, industry=request.industry, city=request.city,
-            budget=request.budget, goal="Lead Generation",
+            url=url, industry=industry, city=city,
+            budget=budget, goal="Lead Generation",
         )),
         "prospect_discovery": lambda: prospect_discovery(ProspectDiscoveryRequest(
-            industry=request.industry, city=request.city, url=request.url,
+            industry=industry, city=city, url=url,
         )),
     }
-    # Maps the AI's module keys to the flat result keys in the response contract
-    _RESULT_KEY_BY_MODULE = {
-        "opportunity_engine":      "opportunity",
-        "offer_intelligence":      "offer",
-        "website_intelligence":    "website",
-        "visibility_intelligence": "visibility",
-        "outreach_ai":             "outreach",
-        "kpi_engine":              "kpi",
-        "prospect_discovery":      "prospects",
-    }
 
-    modules_to_run = [m for m in decision["modules_to_run"] if m in module_calls]
+    modules_to_run = [m for m in modules_to_run if m in module_calls]
     logger.info(f"[SMART-ANALYSIS] Running {len(modules_to_run)} modules in parallel: {modules_to_run}")
 
     results = {v: None for v in _RESULT_KEY_BY_MODULE.values()}
@@ -6764,20 +6790,156 @@ async def smart_analysis(request: SmartAnalysisRequest):
                 results[result_key] = outcome
 
     total_time = round(time.time() - start_time, 2)
-    logger.info(f"[SMART-ANALYSIS] Done in {total_time}s")
+    logger.info(f"[SMART-ANALYSIS] Modules done in {total_time}s")
+    return results, total_time
 
-    return {
+
+_SMART_ANALYSIS_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS smart_analysis_history (
+    id             BIGSERIAL PRIMARY KEY,
+    business_key   TEXT,
+    url            TEXT,
+    business_model TEXT,
+    modules_run    TEXT,
+    full_result    TEXT,
+    created_at     TEXT
+);
+"""
+
+try:
+    with engine.connect() as _sah_conn:
+        _sah_ddl = _SMART_ANALYSIS_HISTORY_DDL
+        if _is_sqlite:
+            _sah_ddl = _sah_ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        _sah_conn.execute(text(_sah_ddl))
+        _sah_conn.commit()
+    logger.info("[SMART-ANALYSIS] History table created/verified")
+except Exception as _sahe:
+    logger.warning(f"[SMART-ANALYSIS] Could not create history table: {_sahe}")
+
+
+def _save_smart_analysis_history(business_key: str, url: str, business_model: str, modules_run: list, full_result: dict) -> None:
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO smart_analysis_history (business_key, url, business_model, modules_run, full_result, created_at) "
+                "VALUES (:bk, :url, :bm, :mr, :fr, :ca)"
+            ), {
+                "bk": business_key, "url": url, "bm": business_model,
+                "mr": json.dumps(modules_run), "fr": json.dumps(full_result),
+                "ca": datetime.utcnow().isoformat(),
+            })
+    except Exception as _e:
+        logger.warning(f"[SMART-ANALYSIS] Could not save history: {_e}")
+
+
+@app.post("/smart-analysis")
+async def smart_analysis(request: SmartAnalysisRequest):
+    if not request.url.strip():
+        return {"success": False, "error": "url is required"}
+
+    plan = await _smart_analysis_run_brain_and_decision(request)
+    if not plan.get("success"):
+        return plan
+
+    results, total_time = await _smart_analysis_run_modules(
+        request.url, request.industry, request.city, request.budget,
+        plan["business_key"], plan["decision"]["modules_run"],
+    )
+
+    response = {
         "success":            True,
-        "business_model":     decision["business_model"],
-        "brain_result":       brain_result,
+        "business_model":     plan["decision"]["business_model"],
+        "brain_result":       plan["brain_result"],
+        "decision":           plan["decision"],
+        "results":            results,
+        "total_time_seconds": total_time,
+    }
+    _save_smart_analysis_history(
+        plan["business_key"], request.url, plan["decision"]["business_model"],
+        plan["decision"]["modules_run"], response,
+    )
+    return response
+
+
+@app.post("/smart-analysis/plan")
+async def smart_analysis_plan(request: SmartAnalysisRequest):
+    """Runs Brain + Decision Layer only — lets the frontend show a confirm/override screen before spending time on modules."""
+    if not request.url.strip():
+        return {"success": False, "error": "url is required"}
+    return await _smart_analysis_run_brain_and_decision(request)
+
+
+class SmartAnalysisExecuteRequest(BaseModel):
+    url:             str
+    industry:        str   = ""
+    city:            str   = "Jaipur"
+    budget:          float = 0.0
+    business_key:    str
+    brain_result:    dict
+    modules_to_run:  list
+    modules_skipped: list  = []
+    business_model:  str   = "B2B"
+
+
+@app.post("/smart-analysis/execute")
+async def smart_analysis_execute(request: SmartAnalysisExecuteRequest):
+    """Runs the (possibly user-overridden) module list against an already-computed brain_result — no Brain/Decision re-run."""
+    results, total_time = await _smart_analysis_run_modules(
+        request.url, request.industry, request.city, request.budget,
+        request.business_key, request.modules_to_run,
+    )
+    response = {
+        "success":            True,
+        "business_model":     request.business_model,
+        "brain_result":       request.brain_result,
         "decision": {
-            "business_model":  decision["business_model"],
-            "modules_run":     modules_to_run,
-            "modules_skipped": decision["skipped"],
+            "business_model":  request.business_model,
+            "modules_run":     request.modules_to_run,
+            "modules_skipped": request.modules_skipped,
         },
         "results":            results,
         "total_time_seconds": total_time,
     }
+    _save_smart_analysis_history(request.business_key, request.url, request.business_model, request.modules_to_run, response)
+    return response
+
+
+@app.get("/smart-analysis/history")
+async def smart_analysis_history(limit: int = 5):
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, business_key, url, business_model, modules_run, created_at "
+                "FROM smart_analysis_history ORDER BY id DESC LIMIT :lim"
+            ), {"lim": limit}).mappings().all()
+        history = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["modules_run"] = json.loads(d["modules_run"]) if d.get("modules_run") else []
+            except Exception:
+                d["modules_run"] = []
+            history.append(d)
+        return {"success": True, "history": history}
+    except Exception as _e:
+        logger.error(f"[SMART-ANALYSIS] history list failed: {_e}")
+        return {"success": False, "error": str(_e), "history": []}
+
+
+@app.get("/smart-analysis/history/{history_id}")
+async def smart_analysis_history_detail(history_id: int):
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT full_result FROM smart_analysis_history WHERE id = :id"
+            ), {"id": history_id}).first()
+        if not row:
+            return {"success": False, "error": "Not found"}
+        return {"success": True, "result": json.loads(row[0])}
+    except Exception as _e:
+        logger.error(f"[SMART-ANALYSIS] history detail failed: {_e}")
+        return {"success": False, "error": str(_e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
