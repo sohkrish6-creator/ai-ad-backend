@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from openai import OpenAI
 import httpx
@@ -8,6 +9,8 @@ from typing import Optional
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow as _GoogleOAuthFlow
+from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -19,6 +22,10 @@ import asyncio
 import re
 import random
 import traceback as _traceback
+import hmac
+import hashlib
+import base64
+import uuid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -1630,6 +1637,54 @@ class CampaignLaunchKitRequest(BaseModel):
     language: str = "Hinglish"
     sections: dict = {}
 
+
+def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
+    """
+    Parse the AI-generated Google Ads launch kit text into structured
+    keywords/headlines/descriptions for campaign_memory + push-to-Google-Ads.
+    """
+    keywords, headlines, descriptions = [], [], []
+    for line in (google_kit_text or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'^\[exact match\]\s*(.+)$', line, re.I)
+        if m:
+            kw = m.group(1).strip().rstrip(".")
+            if kw:
+                keywords.append({"text": kw, "match_type": "EXACT"})
+            continue
+        m = re.match(r'^["“]phrase match["”]\s*(.+)$', line, re.I)
+        if m:
+            kw = m.group(1).strip().rstrip(".")
+            if kw:
+                keywords.append({"text": kw, "match_type": "PHRASE"})
+            continue
+        m = re.match(r'^broad match\s*(.+)$', line, re.I)
+        if m:
+            kw = re.sub(r'\s*\(include[^)]*\)', '', m.group(1), flags=re.I).strip().rstrip(".")
+            if kw:
+                keywords.append({"text": kw, "match_type": "BROAD"})
+            continue
+        m = re.match(r'^Headline\s*\d+\s*:\s*(.+)$', line, re.I)
+        if m:
+            h = m.group(1).strip()
+            if h and h not in headlines:
+                headlines.append(h)
+            continue
+        m = re.match(r'^Description\s*\d+\s*:\s*(.+)$', line, re.I)
+        if m:
+            d = m.group(1).strip()
+            if d and d not in descriptions:
+                descriptions.append(d)
+            continue
+    return {
+        "keywords":     keywords[:30],
+        "headlines":    headlines[:15],
+        "descriptions": descriptions[:4],
+    }
+
+
 @app.post("/campaign-launch-kit")
 async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     biz_label  = request.url or request.industry or "this business"
@@ -1872,6 +1927,20 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     tracking_kit    = extract_kit(full_text, "=== TRACKING SETUP ===",        "=== LANDING PAGE CHECKLIST ===")
     lp_checklist    = extract_kit(full_text, "=== LANDING PAGE CHECKLIST ===")
 
+    # ── Save keywords/headlines/descriptions to campaign_memory ─────────────
+    # so /google-ads/create-campaign can pull them back when the user clicks
+    # "Push to Google Ads". Must use the SAME key derivation as the lookup.
+    campaign_assets = _extract_campaign_kit_assets(google_kit)
+    business_key = derive_business_key(request.url, request.industry, request.city)
+    logger.info(f"[CAMPAIGN KIT] SAVE key: '{business_key}'")
+    save_to_memory("campaign", business_key, {
+        "campaign_data": {
+            "keywords":     campaign_assets["keywords"],
+            "headlines":    campaign_assets["headlines"],
+            "descriptions": campaign_assets["descriptions"],
+        }
+    })
+
     return {
         "success":        True,
         "meta_kit":       meta_kit or full_text,
@@ -1879,6 +1948,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "remarketing_kit": remarketing_kit,
         "tracking_kit":   tracking_kit,
         "lp_checklist":   lp_checklist,
+        "business_key":   business_key,
     }
 
 
@@ -5269,6 +5339,9 @@ class CreateCampaignRequest(BaseModel):
     start_date:     str  = ""              # YYYYMMDD; defaults to tomorrow
     end_date:       str  = ""              # YYYYMMDD; optional
     business_key:   str  = ""             # if set, pull keywords from campaign_memory
+    url:            str  = ""             # business website — used as key fallback + ad final_url
+    industry:       str  = ""             # used with city for get_memory_with_city_fallback
+    city:           str  = ""
 
 class CreateAdRequest(BaseModel):
     campaign_id:    str
@@ -5487,16 +5560,34 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             customer_id,
         )
 
-        # If business_key provided — pull keywords from campaign_memory and add them
+        # Pull keywords/headlines/descriptions from campaign_memory — same key
+        # derivation as /campaign-launch-kit's SAVE, with city-fallback lookup
+        # so a blank/mismatched city or legacy key still resolves.
+        lookup_source = request.business_key or request.url
+        business_key = derive_business_key(lookup_source, request.industry, request.city)
+        logger.info(f"[GADS CREATE] LOOKUP key: '{business_key}'")
+
         keywords_added = []
-        if request.business_key:
-            mem = get_memory(request.business_key)
-            camp_data_raw = mem.get("campaign", {}).get("campaign_data", "") if mem else ""
+        ad_created     = None
+        if lookup_source:
+            mem, resolved_key = get_memory_with_city_fallback(lookup_source, request.industry, request.city)
+            camp_data_raw = mem.get("campaign", {}).get("campaign_data", {}) if mem else {}
+            if isinstance(camp_data_raw, str) and camp_data_raw.strip().startswith("{"):
+                try:
+                    camp_data_raw = json.loads(camp_data_raw)
+                except Exception:
+                    camp_data_raw = {}
+            camp_data = camp_data_raw if isinstance(camp_data_raw, dict) else {}
+            logger.info(f"[GADS-CREATE] Memory resolved via key={resolved_key!r} campaign_data_present={bool(camp_data)}")
+
+            kw_list = camp_data.get("keywords") or camp_data.get("google_keywords") or []
             try:
-                camp_data = json.loads(camp_data_raw) if isinstance(camp_data_raw, str) and camp_data_raw.startswith("{") else {}
-                kw_list = camp_data.get("keywords", camp_data.get("google_keywords", []))
                 if isinstance(kw_list, list) and kw_list:
-                    kw_objs = [{"text": str(k), "match_type": "BROAD"} for k in kw_list[:30] if k]
+                    kw_objs = [
+                        {"text": str(k.get("text", "")), "match_type": k.get("match_type", "BROAD")}
+                        if isinstance(k, dict) else {"text": str(k), "match_type": "BROAD"}
+                        for k in kw_list[:30] if k
+                    ]
                     keywords_added = await asyncio.to_thread(
                         _add_keywords_sync, result["ad_group_rn"], kw_objs, customer_id
                     )
@@ -5504,7 +5595,30 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             except Exception as _ke:
                 logger.warning(f"[GADS-CREATE] Keyword pull failed: {_ke}")
 
+            # Auto-create the ResponsiveSearchAd from the same launch-kit data —
+            # without this, create-campaign only ever produces an empty ad group.
+            headlines    = camp_data.get("headlines", [])
+            descriptions = camp_data.get("descriptions", [])
+            final_url    = request.url.strip()
+            if final_url and not re.match(r'^https?://', final_url, re.I):
+                final_url = f"https://{final_url}"
+            if len(headlines) >= 3 and len(descriptions) >= 2 and final_url:
+                try:
+                    ad_created = await asyncio.to_thread(
+                        _create_ad_sync, result["ad_group_rn"], headlines, descriptions, final_url, customer_id
+                    )
+                    logger.info(f"[GADS-CREATE] Ad created: {ad_created}")
+                except Exception as _ae:
+                    logger.warning(f"[GADS-CREATE] Ad creation failed: {_ae}")
+            else:
+                logger.info(
+                    f"[GADS-CREATE] Skipping ad creation — headlines={len(headlines)} "
+                    f"descriptions={len(descriptions)} final_url={final_url!r}"
+                )
+
         result["keywords_added"] = len(keywords_added)
+        result["ad_created"]     = bool(ad_created)
+        result["ad"]             = ad_created
         result["google_ads_dashboard"] = f"https://ads.google.com/aw/campaigns?campaignId={result['campaign_id']}"
         logger.info(f"[GADS-CREATE] Done: campaign_id={result['campaign_id']}")
         return {"success": True, **result}
@@ -6274,3 +6388,1181 @@ async def cricket_push_to_google(request: CricketPushRequest):
         "google_ads_dashboard": f"https://ads.google.com/aw/campaigns?campaignId={campaign_id}",
         "note":                 "Campaign created PAUSED. Add image assets in Google Ads dashboard before enabling.",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GOOGLE ADS ACCOUNT IMPORT — OAUTH CONNECTION, 12-MONTH IMPORT, DASHBOARD
+#  Single-tenant: ONE Google OAuth connection app-wide. The account selector
+#  picks among Ads accounts visible to that one connection (e.g. an MCC with
+#  several clients) — multi-account, not multi-user. Isolated gads_ tables,
+#  never collides with the cricket_* tables above.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# oauthlib is strict about scope drift and requires HTTPS redirects by default —
+# relax the former (Google commonly returns a superset of requested scopes) and
+# only relax the latter for non-HTTPS (local dev) redirect URIs.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
+
+def _gads_oauth_redirect_uri() -> str:
+    return _genv("GOOGLE_OAUTH_REDIRECT_URI") or "http://localhost:8000/google/callback"
+
+
+if not _gads_oauth_redirect_uri().startswith("https://"):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+
+# ── Token encryption ─────────────────────────────────────────────────────────
+def _get_fernet() -> Fernet:
+    key = _genv("ENCRYPTION_KEY")
+    if not key:
+        raise RuntimeError("ENCRYPTION_KEY not set")
+    return Fernet(key.encode())
+
+
+def encrypt_token(raw: str) -> str:
+    return _get_fernet().encrypt(raw.encode()).decode()
+
+
+def decrypt_token(enc: str) -> str:
+    return _get_fernet().decrypt(enc.encode()).decode()
+
+
+# ── OAuth state (CSRF) — stateless, HMAC-signed via ENCRYPTION_KEY ───────────
+def _make_oauth_state() -> str:
+    ts = str(int(datetime.utcnow().timestamp()))
+    key = _genv("ENCRYPTION_KEY").encode()
+    sig = hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()[:16]
+    return base64.urlsafe_b64encode(f"{ts}.{sig}".encode()).decode()
+
+
+def _verify_oauth_state(state: str, max_age_seconds: int = 600) -> bool:
+    try:
+        raw = base64.urlsafe_b64decode(state.encode()).decode()
+        ts, sig = raw.split(".", 1)
+        key = _genv("ENCRYPTION_KEY").encode()
+        expected = hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(sig, expected):
+            return False
+        age = datetime.utcnow().timestamp() - int(ts)
+        return 0 <= age <= max_age_seconds
+    except Exception:
+        return False
+
+
+# ── DB tables ─────────────────────────────────────────────────────────────────
+_GADS_DDL = """
+CREATE TABLE IF NOT EXISTS gads_oauth_tokens (
+    id                       INTEGER PRIMARY KEY,
+    encrypted_refresh_token  TEXT NOT NULL,
+    scope                    TEXT,
+    connected_at             TEXT,
+    updated_at               TEXT,
+    revoked                  BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS gads_accounts (
+    id                       BIGSERIAL PRIMARY KEY,
+    customer_id              TEXT UNIQUE NOT NULL,
+    account_name             TEXT,
+    login_customer_id        TEXT,
+    is_manager               BOOLEAN DEFAULT FALSE,
+    selected                 BOOLEAN DEFAULT FALSE,
+    last_imported_at         TEXT,
+    ai_summary_json          TEXT,
+    ai_summary_generated_at  TEXT,
+    discovered_at            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gads_import_jobs (
+    id            TEXT PRIMARY KEY,
+    customer_id   TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    progress_pct  INTEGER DEFAULT 0,
+    current_step  TEXT,
+    started_at    TEXT,
+    finished_at   TEXT,
+    error         TEXT,
+    created_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gads_campaigns (
+    id                      BIGSERIAL PRIMARY KEY,
+    customer_id             TEXT NOT NULL,
+    campaign_id             TEXT NOT NULL,
+    name                    TEXT,
+    status                  TEXT,
+    channel_type            TEXT,
+    bidding_strategy_type   TEXT,
+    budget_amount_micros    BIGINT,
+    budget_delivery_method  TEXT,
+    start_date              TEXT,
+    end_date                TEXT,
+    updated_at              TEXT,
+    UNIQUE(customer_id, campaign_id)
+);
+
+CREATE TABLE IF NOT EXISTS gads_campaign_day (
+    id                BIGSERIAL PRIMARY KEY,
+    customer_id       TEXT NOT NULL,
+    campaign_id       TEXT NOT NULL,
+    date              DATE NOT NULL,
+    impressions       BIGINT DEFAULT 0,
+    clicks            BIGINT DEFAULT 0,
+    cost_micros       BIGINT DEFAULT 0,
+    conversions       DOUBLE PRECISION DEFAULT 0,
+    conversion_value  DOUBLE PRECISION DEFAULT 0,
+    UNIQUE(customer_id, campaign_id, date)
+);
+
+CREATE TABLE IF NOT EXISTS gads_ad_groups (
+    id            BIGSERIAL PRIMARY KEY,
+    customer_id   TEXT NOT NULL,
+    campaign_id   TEXT NOT NULL,
+    ad_group_id   TEXT NOT NULL,
+    name          TEXT,
+    status        TEXT,
+    impressions   BIGINT DEFAULT 0,
+    clicks        BIGINT DEFAULT 0,
+    cost_micros   BIGINT DEFAULT 0,
+    conversions   DOUBLE PRECISION DEFAULT 0,
+    period_start  DATE,
+    period_end    DATE,
+    UNIQUE(customer_id, ad_group_id)
+);
+
+CREATE TABLE IF NOT EXISTS gads_ads (
+    id                 BIGSERIAL PRIMARY KEY,
+    customer_id        TEXT NOT NULL,
+    campaign_id        TEXT NOT NULL,
+    ad_group_id        TEXT NOT NULL,
+    ad_id              TEXT NOT NULL,
+    ad_type            TEXT,
+    status             TEXT,
+    headlines_json     TEXT,
+    descriptions_json  TEXT,
+    final_urls_json    TEXT,
+    impressions        BIGINT DEFAULT 0,
+    clicks             BIGINT DEFAULT 0,
+    cost_micros        BIGINT DEFAULT 0,
+    conversions        DOUBLE PRECISION DEFAULT 0,
+    period_start       DATE,
+    period_end         DATE,
+    UNIQUE(customer_id, ad_id)
+);
+
+CREATE TABLE IF NOT EXISTS gads_keywords (
+    id            BIGSERIAL PRIMARY KEY,
+    customer_id   TEXT NOT NULL,
+    campaign_id   TEXT NOT NULL,
+    ad_group_id   TEXT NOT NULL,
+    criterion_id  TEXT NOT NULL,
+    keyword_text  TEXT,
+    match_type    TEXT,
+    status        TEXT,
+    impressions   BIGINT DEFAULT 0,
+    clicks        BIGINT DEFAULT 0,
+    cost_micros   BIGINT DEFAULT 0,
+    conversions   DOUBLE PRECISION DEFAULT 0,
+    period_start  DATE,
+    period_end    DATE,
+    UNIQUE(customer_id, criterion_id)
+);
+
+CREATE TABLE IF NOT EXISTS gads_search_terms (
+    id               BIGSERIAL PRIMARY KEY,
+    customer_id      TEXT NOT NULL,
+    campaign_id      TEXT NOT NULL,
+    ad_group_id      TEXT NOT NULL,
+    search_term      TEXT NOT NULL,
+    matched_keyword  TEXT,
+    match_type       TEXT,
+    impressions      BIGINT DEFAULT 0,
+    clicks           BIGINT DEFAULT 0,
+    cost_micros      BIGINT DEFAULT 0,
+    conversions      DOUBLE PRECISION DEFAULT 0,
+    period_start     DATE,
+    period_end       DATE,
+    UNIQUE(customer_id, ad_group_id, search_term)
+);
+
+CREATE TABLE IF NOT EXISTS gads_device_performance (
+    id            BIGSERIAL PRIMARY KEY,
+    customer_id   TEXT NOT NULL,
+    device        TEXT NOT NULL,
+    impressions   BIGINT DEFAULT 0,
+    clicks        BIGINT DEFAULT 0,
+    cost_micros   BIGINT DEFAULT 0,
+    conversions   DOUBLE PRECISION DEFAULT 0,
+    period_start  DATE,
+    period_end    DATE,
+    UNIQUE(customer_id, device)
+);
+
+CREATE TABLE IF NOT EXISTS gads_location_performance (
+    id                    BIGSERIAL PRIMARY KEY,
+    customer_id           TEXT NOT NULL,
+    country_criterion_id  TEXT NOT NULL,
+    location_name         TEXT,
+    impressions           BIGINT DEFAULT 0,
+    clicks                BIGINT DEFAULT 0,
+    cost_micros           BIGINT DEFAULT 0,
+    conversions           DOUBLE PRECISION DEFAULT 0,
+    period_start          DATE,
+    period_end            DATE,
+    UNIQUE(customer_id, country_criterion_id)
+);
+"""
+
+
+def _create_gads_tables():
+    ddl = _GADS_DDL
+    if _is_sqlite:
+        ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.connect() as conn:
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+        conn.commit()
+    logger.info("[GADS] gads_* tables ready")
+
+
+try:
+    _create_gads_tables()
+except Exception as _ge:
+    logger.warning(f"[GADS] Table create failed: {_ge}")
+
+
+# ── OAuth client config / flow ───────────────────────────────────────────────
+_GADS_OAUTH_SCOPES = ["https://www.googleapis.com/auth/adwords"]
+
+
+def _gads_oauth_client_config() -> dict:
+    return {
+        "web": {
+            "client_id":     _genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
+            "client_secret": _genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
+            "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+            "token_uri":     "https://oauth2.googleapis.com/token",
+            "redirect_uris": [_gads_oauth_redirect_uri()],
+        }
+    }
+
+
+# ── Google Ads client builder — sources refresh_token from the encrypted ────
+# DB row instead of the static env var used by get_google_ads_client().
+def _build_gads_oauth_client(login_customer_id: str = None) -> GoogleAdsClient:
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT encrypted_refresh_token, revoked FROM gads_oauth_tokens WHERE id=1"
+        )).fetchone()
+    if not row or row[1]:
+        raise RuntimeError("Google account not connected. Visit /google/connect.")
+    refresh_token = decrypt_token(row[0])
+    lci = (login_customer_id or "").replace("-", "").replace(" ", "")
+    config = {
+        "developer_token": _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "client_id":       _genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
+        "client_secret":   _genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
+        "refresh_token":   refresh_token,
+        "use_proto_plus":  True,
+    }
+    if lci:
+        config["login_customer_id"] = lci
+    return GoogleAdsClient.load_from_dict(config)
+
+
+def _gads_date_range():
+    end = date.today()
+    start = end - timedelta(days=365)
+    return start.isoformat(), end.isoformat()
+
+
+def _get_selected_gads_account() -> Optional[dict]:
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT customer_id, login_customer_id FROM gads_accounts WHERE selected=TRUE"
+        )).fetchone()
+    if not row:
+        return None
+    return {"customer_id": row[0], "login_customer_id": row[1] or ""}
+
+
+# ── Account discovery (expands manager/MCC accounts into their children) ────
+def _list_gads_accessible_accounts_sync() -> list:
+    client_ = _build_gads_oauth_client()
+    customer_service = client_.get_service("CustomerService")
+    resource_names = list(customer_service.list_accessible_customers().resource_names)
+    top_level_ids = [r.split("/")[-1] for r in resource_names]
+
+    ga_service = client_.get_service("GoogleAdsService")
+    accounts = []
+    seen = set()
+
+    for cid in top_level_ids:
+        try:
+            rows = list(ga_service.search(
+                customer_id=cid,
+                query="SELECT customer.id, customer.descriptive_name, customer.manager FROM customer LIMIT 1"
+            ))
+        except Exception as _e:
+            logger.warning(f"[GADS] Could not query top-level account {cid}: {_e}")
+            continue
+        if not rows:
+            continue
+        c = rows[0].customer
+        if c.manager:
+            try:
+                child_client = _build_gads_oauth_client(login_customer_id=cid)
+                child_ga = child_client.get_service("GoogleAdsService")
+                child_rows = list(child_ga.search(
+                    customer_id=cid,
+                    query=(
+                        "SELECT customer_client.id, customer_client.descriptive_name, "
+                        "customer_client.manager, customer_client.status "
+                        "FROM customer_client WHERE customer_client.level <= 1"
+                    )
+                ))
+                for cr in child_rows:
+                    ccid = str(cr.customer_client.id)
+                    if ccid in seen or cr.customer_client.manager:
+                        continue
+                    seen.add(ccid)
+                    accounts.append({
+                        "customer_id": ccid,
+                        "account_name": cr.customer_client.descriptive_name or "",
+                        "login_customer_id": cid,
+                        "is_manager": False,
+                    })
+            except Exception as _ce:
+                logger.warning(f"[GADS] Could not expand manager account {cid}: {_ce}")
+        elif cid not in seen:
+            seen.add(cid)
+            accounts.append({
+                "customer_id": cid,
+                "account_name": c.descriptive_name or "",
+                "login_customer_id": "",
+                "is_manager": False,
+            })
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        for a in accounts:
+            conn.execute(text(
+                "INSERT INTO gads_accounts (customer_id, account_name, login_customer_id, is_manager, discovered_at) "
+                "VALUES (:cid, :name, :lcid, :mgr, :ts) "
+                "ON CONFLICT(customer_id) DO UPDATE SET account_name=:name, login_customer_id=:lcid, discovered_at=:ts"
+            ), {"cid": a["customer_id"], "name": a["account_name"], "lcid": a["login_customer_id"],
+                "mgr": a["is_manager"], "ts": now})
+
+    return accounts
+
+
+# ── GAQL fetch functions ─────────────────────────────────────────────────────
+def _fetch_gads_campaigns_sync(client_, customer_id: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = """
+        SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type,
+               campaign.bidding_strategy_type, campaign_budget.amount_micros, campaign_budget.delivery_method,
+               campaign.start_date, campaign.end_date
+        FROM campaign
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "campaign_id": str(r.campaign.id),
+            "name": r.campaign.name,
+            "status": r.campaign.status.name,
+            "channel_type": r.campaign.advertising_channel_type.name,
+            "bidding_strategy_type": r.campaign.bidding_strategy_type.name,
+            "budget_amount_micros": r.campaign_budget.amount_micros,
+            "budget_delivery_method": r.campaign_budget.delivery_method.name,
+            "start_date": r.campaign.start_date,
+            "end_date": r.campaign.end_date,
+        })
+    return rows
+
+
+def _fetch_gads_campaign_day_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks,
+               metrics.cost_micros, metrics.conversions, metrics.conversions_value
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        ORDER BY segments.date ASC
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "campaign_id": str(r.campaign.id),
+            "date": r.segments.date,
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+            "conversion_value": r.metrics.conversions_value,
+        })
+    return rows
+
+
+def _fetch_gads_ad_groups_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT ad_group.id, ad_group.name, ad_group.status, campaign.id,
+               metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM ad_group
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "campaign_id": str(r.campaign.id),
+            "ad_group_id": str(r.ad_group.id),
+            "name": r.ad_group.name,
+            "status": r.ad_group.status.name,
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+        })
+    return rows
+
+
+def _fetch_gads_ads_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status, ad_group.id, campaign.id,
+               ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions,
+               ad_group_ad.ad.final_urls,
+               metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM ad_group_ad
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        try:
+            headlines = [h.text for h in r.ad_group_ad.ad.responsive_search_ad.headlines]
+        except Exception:
+            headlines = []
+        try:
+            descriptions = [d.text for d in r.ad_group_ad.ad.responsive_search_ad.descriptions]
+        except Exception:
+            descriptions = []
+        rows.append({
+            "campaign_id": str(r.campaign.id),
+            "ad_group_id": str(r.ad_group.id),
+            "ad_id": str(r.ad_group_ad.ad.id),
+            "ad_type": r.ad_group_ad.ad.type_.name,
+            "status": r.ad_group_ad.status.name,
+            "headlines_json": json.dumps(headlines),
+            "descriptions_json": json.dumps(descriptions),
+            "final_urls_json": json.dumps(list(r.ad_group_ad.ad.final_urls)),
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+        })
+    return rows
+
+
+def _fetch_gads_keywords_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT ad_group_criterion.criterion_id, ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group.id, campaign.id,
+               metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM keyword_view
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "campaign_id": str(r.campaign.id),
+            "ad_group_id": str(r.ad_group.id),
+            "criterion_id": str(r.ad_group_criterion.criterion_id),
+            "keyword_text": r.ad_group_criterion.keyword.text,
+            "match_type": r.ad_group_criterion.keyword.match_type.name,
+            "status": r.ad_group_criterion.status.name,
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+        })
+    return rows
+
+
+def _fetch_gads_search_terms_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT search_term_view.search_term, ad_group.id, campaign.id,
+               segments.keyword.info.text, segments.keyword.info.match_type,
+               metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM search_term_view
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "campaign_id": str(r.campaign.id),
+            "ad_group_id": str(r.ad_group.id),
+            "search_term": r.search_term_view.search_term,
+            "matched_keyword": r.segments.keyword.info.text,
+            "match_type": r.segments.keyword.info.match_type.name,
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+        })
+    return rows
+
+
+def _fetch_gads_device_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT segments.device, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM customer
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "device": r.segments.device.name,
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+        })
+    return rows
+
+
+def _fetch_gads_location_sync(client_, customer_id: str, start: str, end: str) -> list:
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT geographic_view.country_criterion_id,
+               metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM geographic_view
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        rows.append({
+            "country_criterion_id": str(r.geographic_view.country_criterion_id),
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost_micros": r.metrics.cost_micros,
+            "conversions": r.metrics.conversions,
+        })
+
+    distinct_ids = sorted({row["country_criterion_id"] for row in rows})
+    names = {}
+    if distinct_ids:
+        try:
+            id_list = ", ".join(distinct_ids)
+            name_query = (
+                "SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.country_code "
+                f"FROM geo_target_constant WHERE geo_target_constant.id IN ({id_list})"
+            )
+            for r in svc.search(customer_id=customer_id, query=name_query):
+                names[str(r.geo_target_constant.id)] = r.geo_target_constant.name
+        except Exception as _ge:
+            logger.warning(f"[GADS] Could not resolve location names: {_ge}")
+
+    for row in rows:
+        row["location_name"] = names.get(row["country_criterion_id"], row["country_criterion_id"])
+    return rows
+
+
+# ── Write imported data (transactional replace per table) ───────────────────
+def _write_gads_import_data(customer_id: str, data: dict):
+    now = datetime.utcnow().isoformat()
+    start, end = data["period_start"], data["period_end"]
+
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM gads_campaigns WHERE customer_id=:cid"), {"cid": customer_id})
+        if data["campaigns"]:
+            rows = [{**c, "customer_id": customer_id, "updated_at": now} for c in data["campaigns"]]
+            conn.execute(text(
+                "INSERT INTO gads_campaigns (customer_id, campaign_id, name, status, channel_type, "
+                "bidding_strategy_type, budget_amount_micros, budget_delivery_method, start_date, end_date, updated_at) "
+                "VALUES (:customer_id, :campaign_id, :name, :status, :channel_type, :bidding_strategy_type, "
+                ":budget_amount_micros, :budget_delivery_method, :start_date, :end_date, :updated_at)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_campaign_day WHERE customer_id=:cid"), {"cid": customer_id})
+        if data["campaign_days"]:
+            rows = [{**d, "customer_id": customer_id} for d in data["campaign_days"]]
+            conn.execute(text(
+                "INSERT INTO gads_campaign_day (customer_id, campaign_id, date, impressions, clicks, "
+                "cost_micros, conversions, conversion_value) "
+                "VALUES (:customer_id, :campaign_id, :date, :impressions, :clicks, :cost_micros, "
+                ":conversions, :conversion_value)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_ad_groups WHERE customer_id=:cid"), {"cid": customer_id})
+        if data["ad_groups"]:
+            rows = [{**a, "customer_id": customer_id, "period_start": start, "period_end": end} for a in data["ad_groups"]]
+            conn.execute(text(
+                "INSERT INTO gads_ad_groups (customer_id, campaign_id, ad_group_id, name, status, "
+                "impressions, clicks, cost_micros, conversions, period_start, period_end) "
+                "VALUES (:customer_id, :campaign_id, :ad_group_id, :name, :status, :impressions, :clicks, "
+                ":cost_micros, :conversions, :period_start, :period_end)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_ads WHERE customer_id=:cid"), {"cid": customer_id})
+        if data["ads"]:
+            rows = [{**a, "customer_id": customer_id, "period_start": start, "period_end": end} for a in data["ads"]]
+            conn.execute(text(
+                "INSERT INTO gads_ads (customer_id, campaign_id, ad_group_id, ad_id, ad_type, status, "
+                "headlines_json, descriptions_json, final_urls_json, impressions, clicks, cost_micros, "
+                "conversions, period_start, period_end) "
+                "VALUES (:customer_id, :campaign_id, :ad_group_id, :ad_id, :ad_type, :status, :headlines_json, "
+                ":descriptions_json, :final_urls_json, :impressions, :clicks, :cost_micros, :conversions, "
+                ":period_start, :period_end)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_keywords WHERE customer_id=:cid"), {"cid": customer_id})
+        if data["keywords"]:
+            rows = [{**k, "customer_id": customer_id, "period_start": start, "period_end": end} for k in data["keywords"]]
+            conn.execute(text(
+                "INSERT INTO gads_keywords (customer_id, campaign_id, ad_group_id, criterion_id, keyword_text, "
+                "match_type, status, impressions, clicks, cost_micros, conversions, period_start, period_end) "
+                "VALUES (:customer_id, :campaign_id, :ad_group_id, :criterion_id, :keyword_text, :match_type, "
+                ":status, :impressions, :clicks, :cost_micros, :conversions, :period_start, :period_end)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_search_terms WHERE customer_id=:cid"), {"cid": customer_id})
+        agg = {}
+        for s in data["search_terms"]:
+            key = (s["ad_group_id"], s["search_term"])
+            if key not in agg:
+                agg[key] = {**s, "customer_id": customer_id, "period_start": start, "period_end": end}
+            else:
+                agg[key]["impressions"] += s["impressions"]
+                agg[key]["clicks"] += s["clicks"]
+                agg[key]["cost_micros"] += s["cost_micros"]
+                agg[key]["conversions"] += s["conversions"]
+        rows = list(agg.values())
+        if rows:
+            conn.execute(text(
+                "INSERT INTO gads_search_terms (customer_id, campaign_id, ad_group_id, search_term, "
+                "matched_keyword, match_type, impressions, clicks, cost_micros, conversions, period_start, period_end) "
+                "VALUES (:customer_id, :campaign_id, :ad_group_id, :search_term, :matched_keyword, :match_type, "
+                ":impressions, :clicks, :cost_micros, :conversions, :period_start, :period_end)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_device_performance WHERE customer_id=:cid"), {"cid": customer_id})
+        dev_agg = {}
+        for d in data["devices"]:
+            key = d["device"]
+            if key not in dev_agg:
+                dev_agg[key] = {**d, "customer_id": customer_id, "period_start": start, "period_end": end}
+            else:
+                dev_agg[key]["impressions"] += d["impressions"]
+                dev_agg[key]["clicks"] += d["clicks"]
+                dev_agg[key]["cost_micros"] += d["cost_micros"]
+                dev_agg[key]["conversions"] += d["conversions"]
+        rows = list(dev_agg.values())
+        if rows:
+            conn.execute(text(
+                "INSERT INTO gads_device_performance (customer_id, device, impressions, clicks, cost_micros, "
+                "conversions, period_start, period_end) "
+                "VALUES (:customer_id, :device, :impressions, :clicks, :cost_micros, :conversions, "
+                ":period_start, :period_end)"
+            ), rows)
+
+        conn.execute(text("DELETE FROM gads_location_performance WHERE customer_id=:cid"), {"cid": customer_id})
+        loc_agg = {}
+        for l in data["locations"]:
+            key = l["country_criterion_id"]
+            if key not in loc_agg:
+                loc_agg[key] = {**l, "customer_id": customer_id, "period_start": start, "period_end": end}
+            else:
+                loc_agg[key]["impressions"] += l["impressions"]
+                loc_agg[key]["clicks"] += l["clicks"]
+                loc_agg[key]["cost_micros"] += l["cost_micros"]
+                loc_agg[key]["conversions"] += l["conversions"]
+        rows = list(loc_agg.values())
+        if rows:
+            conn.execute(text(
+                "INSERT INTO gads_location_performance (customer_id, country_criterion_id, location_name, "
+                "impressions, clicks, cost_micros, conversions, period_start, period_end) "
+                "VALUES (:customer_id, :country_criterion_id, :location_name, :impressions, :clicks, "
+                ":cost_micros, :conversions, :period_start, :period_end)"
+            ), rows)
+
+
+# ── AI summary — reads only from the DB tables just written, never Google Ads ─
+def _generate_gads_ai_summary_sync(customer_id: str) -> dict:
+    with engine.connect() as conn:
+        top_campaigns = conn.execute(text("""
+            SELECT c.name, SUM(d.cost_micros)/1000000.0 AS cost, SUM(d.conversions) AS conversions,
+                   CASE WHEN SUM(d.conversions)=0 THEN NULL ELSE SUM(d.cost_micros)/1000000.0/SUM(d.conversions) END AS cpa
+            FROM gads_campaign_day d JOIN gads_campaigns c
+              ON c.customer_id=d.customer_id AND c.campaign_id=d.campaign_id
+            WHERE d.customer_id=:cid GROUP BY c.name
+            HAVING SUM(d.cost_micros) > 0
+            ORDER BY SUM(d.conversions) DESC, SUM(d.cost_micros) DESC LIMIT 10
+        """), {"cid": customer_id}).fetchall()
+
+        worst_campaigns = conn.execute(text("""
+            SELECT c.name, SUM(d.cost_micros)/1000000.0 AS cost, SUM(d.conversions) AS conversions,
+                   CASE WHEN SUM(d.conversions)=0 THEN NULL ELSE SUM(d.cost_micros)/1000000.0/SUM(d.conversions) END AS cpa
+            FROM gads_campaign_day d JOIN gads_campaigns c
+              ON c.customer_id=d.customer_id AND c.campaign_id=d.campaign_id
+            WHERE d.customer_id=:cid GROUP BY c.name
+            HAVING SUM(d.cost_micros) > 0
+            ORDER BY (SUM(d.conversions)=0) DESC, cpa DESC NULLS LAST, cost DESC LIMIT 10
+        """), {"cid": customer_id}).fetchall()
+
+        top_keywords = conn.execute(text("""
+            SELECT keyword_text, cost_micros/1000000.0 AS cost, clicks, conversions
+            FROM gads_keywords WHERE customer_id=:cid
+            ORDER BY conversions DESC, clicks DESC LIMIT 10
+        """), {"cid": customer_id}).fetchall()
+
+        waste_keywords = conn.execute(text("""
+            SELECT keyword_text, cost_micros/1000000.0 AS cost, clicks
+            FROM gads_keywords WHERE customer_id=:cid AND clicks >= 5 AND conversions = 0
+            ORDER BY cost_micros DESC LIMIT 10
+        """), {"cid": customer_id}).fetchall()
+
+        device_rows = conn.execute(text("""
+            SELECT device, cost_micros/1000000.0 AS cost, clicks, conversions
+            FROM gads_device_performance WHERE customer_id=:cid
+        """), {"cid": customer_id}).fetchall()
+
+        totals = conn.execute(text("""
+            SELECT COALESCE(SUM(impressions),0), COALESCE(SUM(clicks),0),
+                   COALESCE(SUM(cost_micros),0), COALESCE(SUM(conversions),0)
+            FROM gads_campaign_day WHERE customer_id=:cid
+        """), {"cid": customer_id}).fetchone()
+
+    impressions, clicks, cost_micros, conversions = totals
+    spend = cost_micros / 1_000_000
+    ctr = (clicks / impressions * 100) if impressions else 0
+    cpa = (spend / conversions) if conversions else 0
+
+    def _to_dicts(rows, cols):
+        return [dict(zip(cols, r)) for r in rows]
+
+    payload = {
+        "top_campaigns": _to_dicts(top_campaigns, ["name", "cost", "conversions", "cpa"]),
+        "worst_campaigns": _to_dicts(worst_campaigns, ["name", "cost", "conversions", "cpa"]),
+        "top_keywords": _to_dicts(top_keywords, ["keyword", "cost", "clicks", "conversions"]),
+        "waste_keywords": _to_dicts(waste_keywords, ["keyword", "cost", "clicks"]),
+        "device_performance": _to_dicts(device_rows, ["device", "cost", "clicks", "conversions"]),
+        "totals": {"spend": round(spend, 2), "clicks": clicks, "ctr": round(ctr, 2), "cpa": round(cpa, 2)},
+    }
+
+    prompt = (
+        "You are a Google Ads performance analyst. Analyze this account's last 12 months of data.\n\n"
+        f"TOP CAMPAIGNS: {json.dumps(payload['top_campaigns'])}\n"
+        f"WORST CAMPAIGNS: {json.dumps(payload['worst_campaigns'])}\n"
+        f"TOP KEYWORDS: {json.dumps(payload['top_keywords'])}\n"
+        f"WASTE KEYWORDS: {json.dumps(payload['waste_keywords'])}\n"
+        f"DEVICE PERFORMANCE: {json.dumps(payload['device_performance'])}\n"
+        f"TOTALS: {json.dumps(payload['totals'])}\n\n"
+        "RULES:\n"
+        "- Every item MUST cite a real campaign/keyword name and a real number from the data above.\n"
+        "- NEVER write generic filler like 'campaign is performing well' without naming it and citing numbers.\n"
+        "- If a data section above is empty, say so explicitly instead of inventing content.\n\n"
+        "Return ONLY valid JSON with this exact structure:\n"
+        "{\n"
+        '  "best_performing_campaigns": [{"campaign_name":"...","why":"...","recommendation":"..."}],\n'
+        '  "poor_performing_campaigns": [{"campaign_name":"...","why":"...","recommendation":"..."}],\n'
+        '  "budget_waste": {"total_wasted_estimate":"...","top_waste_keywords":["..."],"summary":"..."},\n'
+        '  "best_keywords": [{"keyword":"...","why":"..."}],\n'
+        '  "waste_keywords": [{"keyword":"...","cost":"...","why":"..."}],\n'
+        '  "recommended_next_campaign": {"concept":"...","target_audience":"...","suggested_budget":"...","rationale":"..."}\n'
+        "}"
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.4,
+        max_tokens=2000,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+# ── Background import job ────────────────────────────────────────────────────
+def _job_update(job_id: str, **fields):
+    sets = ", ".join(f"{k}=:{k}" for k in fields)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE gads_import_jobs SET {sets} WHERE id=:job_id"), {**fields, "job_id": job_id})
+
+
+async def _run_gads_import_job(job_id: str, customer_id: str, login_customer_id: str):
+    now = datetime.utcnow().isoformat()
+    _job_update(job_id, status="running", started_at=now, current_step="Validating account access", progress_pct=2)
+    try:
+        client_ = await asyncio.to_thread(_build_gads_oauth_client, login_customer_id or None)
+        start, end = _gads_date_range()
+
+        def _validate():
+            svc = client_.get_service("GoogleAdsService")
+            return list(svc.search(customer_id=customer_id, query="SELECT customer.id FROM customer LIMIT 1"))
+        await asyncio.to_thread(_validate)
+
+        _job_update(job_id, current_step="Fetching campaigns & budgets", progress_pct=10)
+        campaigns = await asyncio.to_thread(_fetch_gads_campaigns_sync, client_, customer_id)
+
+        _job_update(job_id, current_step="Fetching daily campaign performance (12 months)", progress_pct=35)
+        campaign_days = await asyncio.to_thread(_fetch_gads_campaign_day_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Fetching ad groups", progress_pct=48)
+        ad_groups = await asyncio.to_thread(_fetch_gads_ad_groups_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Fetching ads", progress_pct=58)
+        ads = await asyncio.to_thread(_fetch_gads_ads_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Fetching keywords", progress_pct=68)
+        keywords = await asyncio.to_thread(_fetch_gads_keywords_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Fetching search terms", progress_pct=78)
+        search_terms = await asyncio.to_thread(_fetch_gads_search_terms_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Fetching device performance", progress_pct=84)
+        devices = await asyncio.to_thread(_fetch_gads_device_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Fetching location performance", progress_pct=90)
+        locations = await asyncio.to_thread(_fetch_gads_location_sync, client_, customer_id, start, end)
+
+        _job_update(job_id, current_step="Writing to database", progress_pct=94)
+        data = {
+            "campaigns": campaigns, "campaign_days": campaign_days, "ad_groups": ad_groups,
+            "ads": ads, "keywords": keywords, "search_terms": search_terms,
+            "devices": devices, "locations": locations,
+            "period_start": start, "period_end": end,
+        }
+        await asyncio.to_thread(_write_gads_import_data, customer_id, data)
+
+        _job_update(job_id, current_step="Generating AI summary", progress_pct=98)
+        try:
+            summary = await asyncio.to_thread(_generate_gads_ai_summary_sync, customer_id)
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE gads_accounts SET ai_summary_json=:s, ai_summary_generated_at=:ts WHERE customer_id=:cid"
+                ), {"s": json.dumps(summary), "ts": datetime.utcnow().isoformat(), "cid": customer_id})
+        except Exception as _ae:
+            logger.warning(f"[GADS-IMPORT] AI summary generation failed: {_ae}")
+
+        finished = datetime.utcnow().isoformat()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE gads_accounts SET last_imported_at=:ts WHERE customer_id=:cid"
+            ), {"ts": finished, "cid": customer_id})
+        _job_update(job_id, status="succeeded", current_step="Done", progress_pct=100, finished_at=finished)
+        logger.info(f"[GADS-IMPORT] Job {job_id} succeeded for customer_id={customer_id}")
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[GADS-IMPORT] Job {job_id} failed: {_e}\n{tb}")
+        _job_update(job_id, status="failed", error=str(_e), finished_at=datetime.utcnow().isoformat())
+
+
+def _start_gads_import(customer_id: str, login_customer_id: str = "") -> str:
+    job_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO gads_import_jobs (id, customer_id, status, progress_pct, current_step, created_at) "
+            "VALUES (:id, :cid, 'queued', 0, 'Queued', :ts)"
+        ), {"id": job_id, "cid": customer_id, "ts": now})
+    asyncio.create_task(_run_gads_import_job(job_id, customer_id, login_customer_id))
+    return job_id
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+class GadsAccountSelectRequest(BaseModel):
+    customer_id: str
+
+
+class GadsImportRequest(BaseModel):
+    customer_id: str = ""
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+@app.get("/google/connect")
+async def google_connect():
+    try:
+        flow = _GoogleOAuthFlow.from_client_config(
+            _gads_oauth_client_config(),
+            scopes=_GADS_OAUTH_SCOPES,
+            redirect_uri=_gads_oauth_redirect_uri(),
+        )
+        state = _make_oauth_state()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+            state=state,
+        )
+        return {"success": True, "auth_url": auth_url}
+    except Exception as _e:
+        logger.error(f"[GADS-OAUTH] /google/connect error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+@app.get("/google/callback")
+async def google_callback(code: str = "", state: str = "", error: str = ""):
+    frontend = _genv("FRONTEND_URL") or "http://localhost:5173"
+    if error:
+        return RedirectResponse(f"{frontend}/google-ads?connected=false&error={error}")
+    if not _verify_oauth_state(state):
+        return RedirectResponse(f"{frontend}/google-ads?connected=false&error=invalid_state")
+    try:
+        flow = _GoogleOAuthFlow.from_client_config(
+            _gads_oauth_client_config(),
+            scopes=_GADS_OAUTH_SCOPES,
+            redirect_uri=_gads_oauth_redirect_uri(),
+        )
+
+        def _fetch():
+            flow.fetch_token(code=code)
+            return flow.credentials
+        creds = await asyncio.to_thread(_fetch)
+
+        if not creds.refresh_token:
+            return RedirectResponse(f"{frontend}/google-ads?connected=false&error=no_refresh_token")
+
+        enc = encrypt_token(creds.refresh_token)
+        now = datetime.utcnow().isoformat()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO gads_oauth_tokens (id, encrypted_refresh_token, scope, connected_at, updated_at, revoked) "
+                "VALUES (1, :enc, :scope, :ts, :ts, FALSE) "
+                "ON CONFLICT(id) DO UPDATE SET encrypted_refresh_token=:enc, scope=:scope, updated_at=:ts, revoked=FALSE"
+            ), {"enc": enc, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
+        logger.info("[GADS-OAUTH] Connected — encrypted refresh token stored")
+        return RedirectResponse(f"{frontend}/google-ads?connected=true")
+    except Exception as _e:
+        logger.error(f"[GADS-OAUTH] /google/callback error: {_e}")
+        return RedirectResponse(f"{frontend}/google-ads?connected=false&error=exchange_failed")
+
+
+@app.get("/google/accounts")
+async def google_accounts():
+    try:
+        accounts = await asyncio.to_thread(_list_gads_accessible_accounts_sync)
+        with engine.connect() as conn:
+            selected_row = conn.execute(text(
+                "SELECT customer_id FROM gads_accounts WHERE selected=TRUE"
+            )).fetchone()
+        selected_cid = selected_row[0] if selected_row else None
+        for a in accounts:
+            a["selected"] = (a["customer_id"] == selected_cid)
+        return {"success": True, "accounts": accounts}
+    except Exception as _e:
+        logger.error(f"[GADS] /google/accounts error: {_e}")
+        return {"success": False, "accounts": [], "error": str(_e)}
+
+
+@app.post("/google/accounts/select")
+async def google_accounts_select(request: GadsAccountSelectRequest):
+    cid = request.customer_id.replace("-", "").strip()
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT customer_id, account_name, login_customer_id, is_manager FROM gads_accounts WHERE customer_id=:cid"
+            ), {"cid": cid}).fetchone()
+            if not row:
+                return {"success": False, "error": "Account not found. Call /google/accounts first."}
+            conn.execute(text("UPDATE gads_accounts SET selected=FALSE"))
+            conn.execute(text("UPDATE gads_accounts SET selected=TRUE WHERE customer_id=:cid"), {"cid": cid})
+        return {"success": True, "selected_account": {
+            "customer_id": row[0], "account_name": row[1], "login_customer_id": row[2], "is_manager": row[3],
+        }}
+    except Exception as _e:
+        logger.error(f"[GADS] /google/accounts/select error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+def _resolve_gads_import_target(customer_id: str):
+    cid = (customer_id or "").replace("-", "").strip()
+    if not cid:
+        acct = _get_selected_gads_account()
+        if not acct:
+            return None, None, "No account selected. Call /google/accounts/select first."
+        return acct["customer_id"], acct["login_customer_id"], None
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT login_customer_id FROM gads_accounts WHERE customer_id=:cid"
+        ), {"cid": cid}).fetchone()
+    return cid, (row[0] if row else ""), None
+
+
+@app.post("/google-ads/import")
+async def google_ads_import(request: GadsImportRequest):
+    cid, lcid, err = _resolve_gads_import_target(request.customer_id)
+    if err:
+        return {"success": False, "error": err}
+    try:
+        with engine.connect() as conn:
+            tok = conn.execute(text("SELECT revoked FROM gads_oauth_tokens WHERE id=1")).fetchone()
+        if not tok or tok[0]:
+            return {"success": False, "error": "Google account not connected. Visit /google/connect."}
+        job_id = _start_gads_import(cid, lcid or "")
+        return {"success": True, "job_id": job_id, "status": "queued"}
+    except Exception as _e:
+        logger.error(f"[GADS] /google-ads/import error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+@app.post("/google-ads/refresh")
+async def google_ads_refresh(request: GadsImportRequest):
+    return await google_ads_import(request)
+
+
+@app.get("/google-ads/import/status/{job_id}")
+async def google_ads_import_status(job_id: str):
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT id, customer_id, status, progress_pct, current_step, started_at, finished_at, error, created_at "
+                "FROM gads_import_jobs WHERE id=:id"
+            ), {"id": job_id}).fetchone()
+            if not row:
+                return {"success": False, "error": "Job not found"}
+            job = dict(zip(
+                ["id", "customer_id", "status", "progress_pct", "current_step",
+                 "started_at", "finished_at", "error", "created_at"],
+                row
+            ))
+            stale = False
+            if job["status"] == "running" and job["started_at"]:
+                started = datetime.fromisoformat(job["started_at"])
+                if datetime.utcnow() - started > timedelta(minutes=20):
+                    stale = True
+                    now = datetime.utcnow().isoformat()
+                    err_msg = "stale/orphaned (server likely restarted mid-import)"
+                    conn.execute(text(
+                        "UPDATE gads_import_jobs SET status='failed', error=:err, finished_at=:ts WHERE id=:id"
+                    ), {"err": err_msg, "ts": now, "id": job_id})
+                    job["status"] = "failed"
+                    job["error"] = err_msg
+                    job["finished_at"] = now
+        job["stale"] = stale
+        return {"success": True, "job": job}
+    except Exception as _e:
+        logger.error(f"[GADS] /google-ads/import/status error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+@app.get("/google-ads/dashboard")
+async def google_ads_dashboard(customer_id: str = ""):
+    cid = customer_id.replace("-", "").strip()
+    if not cid:
+        acct = _get_selected_gads_account()
+        if not acct:
+            return {"success": False, "error": "No account selected."}
+        cid = acct["customer_id"]
+
+    try:
+        with engine.connect() as conn:
+            totals = conn.execute(text(
+                "SELECT COALESCE(SUM(impressions),0), COALESCE(SUM(clicks),0), "
+                "COALESCE(SUM(cost_micros),0), COALESCE(SUM(conversions),0) "
+                "FROM gads_campaign_day WHERE customer_id=:cid"
+            ), {"cid": cid}).fetchone()
+            impressions, clicks, cost_micros, conversions = totals
+            spend = cost_micros / 1_000_000
+            ctr = (clicks / impressions * 100) if impressions else 0
+            cpc = (spend / clicks) if clicks else 0
+            cpa = (spend / conversions) if conversions else 0
+
+            top_campaigns = conn.execute(text("""
+                SELECT c.campaign_id, c.name, c.status,
+                       SUM(d.cost_micros)/1000000.0 AS cost, SUM(d.clicks) AS clicks,
+                       SUM(d.impressions) AS impressions, SUM(d.conversions) AS conversions
+                FROM gads_campaign_day d
+                JOIN gads_campaigns c ON c.customer_id=d.customer_id AND c.campaign_id=d.campaign_id
+                WHERE d.customer_id=:cid
+                GROUP BY c.campaign_id, c.name, c.status
+                HAVING SUM(d.cost_micros) > 0
+                ORDER BY SUM(d.conversions) DESC, SUM(d.cost_micros) DESC
+                LIMIT 10
+            """), {"cid": cid}).fetchall()
+
+            worst_campaigns = conn.execute(text("""
+                SELECT c.campaign_id, c.name, c.status,
+                       SUM(d.cost_micros)/1000000.0 AS cost, SUM(d.conversions) AS conversions,
+                       CASE WHEN SUM(d.conversions) = 0 THEN NULL
+                            ELSE SUM(d.cost_micros)/1000000.0 / SUM(d.conversions) END AS cpa
+                FROM gads_campaign_day d
+                JOIN gads_campaigns c ON c.customer_id=d.customer_id AND c.campaign_id=d.campaign_id
+                WHERE d.customer_id=:cid
+                GROUP BY c.campaign_id, c.name, c.status
+                HAVING SUM(d.cost_micros) > 0
+                ORDER BY (SUM(d.conversions) = 0) DESC, cpa DESC NULLS LAST, cost DESC
+                LIMIT 10
+            """), {"cid": cid}).fetchall()
+
+            top_keywords = conn.execute(text("""
+                SELECT keyword_text, match_type, cost_micros/1000000.0 AS cost, clicks, impressions, conversions
+                FROM gads_keywords WHERE customer_id=:cid
+                ORDER BY conversions DESC, clicks DESC LIMIT 15
+            """), {"cid": cid}).fetchall()
+
+            waste_keywords = conn.execute(text("""
+                SELECT keyword_text, match_type, cost_micros/1000000.0 AS cost, clicks, impressions
+                FROM gads_keywords
+                WHERE customer_id=:cid AND clicks >= 5 AND conversions = 0
+                ORDER BY cost_micros DESC LIMIT 15
+            """), {"cid": cid}).fetchall()
+
+            device_perf = conn.execute(text("""
+                SELECT device, impressions, clicks, cost_micros/1000000.0 AS cost, conversions
+                FROM gads_device_performance WHERE customer_id=:cid
+            """), {"cid": cid}).fetchall()
+
+            location_perf = conn.execute(text("""
+                SELECT location_name, impressions, clicks, cost_micros/1000000.0 AS cost, conversions
+                FROM gads_location_performance WHERE customer_id=:cid
+                ORDER BY cost_micros DESC LIMIT 10
+            """), {"cid": cid}).fetchall()
+
+            acct_row = conn.execute(text(
+                "SELECT account_name, last_imported_at, ai_summary_json FROM gads_accounts WHERE customer_id=:cid"
+            ), {"cid": cid}).fetchone()
+
+        def _rows(cursor_rows, cols):
+            return [dict(zip(cols, r)) for r in cursor_rows]
+
+        cards = {
+            "total_spend": round(spend, 2),
+            "total_clicks": clicks,
+            "total_impressions": impressions,
+            "ctr": round(ctr, 2),
+            "cpc": round(cpc, 2),
+            "conversions": round(conversions, 2),
+            "cpa": round(cpa, 2),
+            "top_campaigns": _rows(top_campaigns, ["campaign_id", "name", "status", "cost", "clicks", "impressions", "conversions"]),
+            "worst_campaigns": _rows(worst_campaigns, ["campaign_id", "name", "status", "cost", "conversions", "cpa"]),
+            "top_keywords": _rows(top_keywords, ["keyword_text", "match_type", "cost", "clicks", "impressions", "conversions"]),
+            "waste_keywords": _rows(waste_keywords, ["keyword_text", "match_type", "cost", "clicks", "impressions"]),
+            "device_performance": _rows(device_perf, ["device", "impressions", "clicks", "cost", "conversions"]),
+            "location_performance": _rows(location_perf, ["location_name", "impressions", "clicks", "cost", "conversions"]),
+        }
+
+        account_name = last_imported_at = ai_summary = None
+        if acct_row:
+            account_name, last_imported_at, ai_summary_json = acct_row
+            if ai_summary_json:
+                try:
+                    ai_summary = json.loads(ai_summary_json)
+                except Exception:
+                    ai_summary = None
+
+        return {
+            "success": True,
+            "customer_id": cid,
+            "account_name": account_name,
+            "last_imported_at": last_imported_at,
+            "cards": cards,
+            "ai_summary": ai_summary,
+        }
+    except Exception as _e:
+        logger.error(f"[GADS] /google-ads/dashboard error: {_e}")
+        return {"success": False, "error": str(_e)}
