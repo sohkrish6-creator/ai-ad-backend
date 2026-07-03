@@ -841,9 +841,21 @@ _BANNED_WORD_MAP = {
     "Take your business to new heights": "grow your business",
     "take your business to new heights": "grow your business",
     "Unleash ":      "Release ","unleash ":        "release ",
-    "Game-changer":  "strong tool","game-changer": "strong tool",
-    "Game changer":  "strong tool","game changer":  "strong tool",
+    "Game-changer":  "advantage","game-changer": "advantage",
+    "Game changer":  "advantage","game changer":  "advantage",
     "Dive in":       "Start","dive in":            "start",
+    "Cutting-edge ": "Modern ","cutting-edge ":    "modern ",
+    "Cutting edge ": "Modern ","cutting edge ":    "modern ",
+    "State-of-the-art ": "Advanced ","state-of-the-art ": "advanced ",
+    "World-class ":  "Proven ","world-class ":      "proven ",
+    "World class ":  "Proven ","world class ":      "proven ",
+    "One-stop solution": "complete service","one-stop solution": "complete service",
+    "One stop solution": "complete service","one stop solution": "complete service",
+    "Look no further. ": "","look no further. ": "",
+    "Look no further, ": "","look no further, ": "",
+    "Look no further": "","look no further": "",
+    "In today's digital age, ": "","in today's digital age, ": "",
+    "In today's digital age": "","in today's digital age": "",
 }
 
 def _clean_banned_words(text: str) -> str:
@@ -1197,9 +1209,18 @@ For {request.target_industry} businesses in {request.target_city}, include:
         f"Use the actual business name detected from the website content.\n"
         "BANNED WORDS — ZERO TOLERANCE. Never use ANY of these in copy, headlines, hooks, or analysis: "
         "Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, "
-        "Unleash, Game-changer, Dive in, Take your business to new heights.\n"
+        "Unleash, Game-changer, Dive in, Take your business to new heights, Cutting-edge, State-of-the-art, "
+        "World-class, One-stop solution, Look no further, In today's digital age.\n"
         "CRITICAL FINAL CHECK: Before outputting your response, scan every sentence. "
         "If you find any banned word above, rewrite that sentence completely using plain, direct language.\n\n"
+        "EVIDENCE DISCIPLINE: Every claim must cite its basis — 'based on the website's [specific detail]', "
+        "'competitor [name] does [specific thing]', 'reviews mention [specific complaint/praise]'. "
+        "No unsupported generic statements.\n"
+        "NUMBER DISCIPLINE: All numbers must be specific and realistic for the industry and city — exact ₹ ranges, "
+        "exact %, exact timeframes. Never say 'increase revenue' — say something like 'estimated 15-25% more "
+        "walk-ins within 60 days'.\n"
+        "MISSING DATA: If there isn't enough information for a section, say 'Insufficient data — recommend "
+        "running [specific module name]' instead of filling the section with generic advice.\n\n"
     )
 
     # ── Memory: derive key + fetch existing knowledge ────────────────────────
@@ -1724,6 +1745,26 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     _month_short  = _now.strftime("%b%Y")    # e.g. Jul2026
     _month_long   = _now.strftime("%B %Y")   # e.g. July 2026
 
+    # ── Real performance benchmarks: calibrate against this account's actual
+    # live campaign data (kpi_memory / performance_memory) when it exists,
+    # instead of generic industry benchmarks. Gets smarter as real data accumulates.
+    business_key = derive_business_key(request.url, request.industry, request.city)
+    _prior_mem, _ = get_memory_with_city_fallback(request.url, request.industry, request.city)
+    real_perf_block = ""
+    _kpi_mem  = _prior_mem.get("kpi")
+    _perf_mem = _prior_mem.get("performance")
+    if _kpi_mem or _perf_mem:
+        _perf_lines = []
+        if _perf_mem:
+            _perf_lines.append(f"Live performance data: {json.dumps(_perf_mem, ensure_ascii=False)[:600]}")
+        if _kpi_mem:
+            _perf_lines.append(f"Prior KPI targets/actuals: {json.dumps(_kpi_mem, ensure_ascii=False)[:600]}")
+        real_perf_block = (
+            "REAL PERFORMANCE DATA from this account's live campaigns — calibrate ALL predictions, "
+            "bid ranges, and budget splits against these actuals, not generic industry benchmarks:\n"
+            + "\n".join(_perf_lines) + "\n\n"
+        )
+
     prompt = (
         f"You are a senior media buyer building a ready-to-paste campaign launch kit.\n"
         f"Business: {biz_label} | City: {city_label} | Total Monthly Budget: Rs {bdgt}\n"
@@ -1731,14 +1772,20 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         f"CURRENT DATE: {_month_long} — use this for ALL campaign names and date references.\n\n"
         f"MARKETING BRAIN OUTPUT (extract specific details — audience pain points, competitors, positioning — and use them in every asset below):\n"
         f"{sections_summary}\n\n"
+        f"{real_perf_block}"
         "RULES — READ BEFORE GENERATING:\n"
         "1. ZERO generic copy. Every asset must reference the specific business, industry, or city above.\n"
         "2. Ad Copy formula: Hook (problem/desire specific to this audience) + Body (specific benefit with proof or number) + CTA (one exact action).\n"
         "3. Every CTA must be one of: 'WhatsApp pe FREE AUDIT bhejo', 'Form bharo — free consultation lo', 'Call karo abhi', 'Link mein appointment book karo'.\n"
         "4. Audience targeting: Use EXACT job titles (not 'business owners'), specific interest combinations, behaviors that signal buying intent.\n"
         "5. No markdown bold or bullets. Plain text only. Use --- to separate sub-sections. Use exact rupee amounts.\n"
-        "6. BANNED WORDS — ZERO TOLERANCE: Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, Game-changer, Unleash. If any found, rewrite.\n"
-        f"7. Campaign names MUST use current month/year: {_month_short}. NEVER hardcode old dates like Nov2023 or Jun2024.\n\n"
+        "6. BANNED WORDS — ZERO TOLERANCE: Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, "
+        "Game-changer, Unleash, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age. If any found, rewrite.\n"
+        f"7. Campaign names MUST use current month/year: {_month_short}. NEVER hardcode old dates like Nov2023 or Jun2024.\n"
+        "8. CTR-OPTIMIZED HEADLINES: use proven high-CTR patterns — numbers ('3x more bookings'), questions "
+        "('Losing weekend footfall?'), specificity (name the city/neighborhood), urgency WITH a real reason "
+        "('Before wedding season fills up'). BANNED generic patterns in any headline or hook: 'Best services', "
+        "'Quality solutions', 'Your trusted partner'.\n\n"
         "=== META ADS LAUNCH KIT ===\n"
         f"Campaign Name: [exact name — format: CityType_Industry_Goal_{_month_short}, e.g. Jaipur_Coaching_Leads_{_month_short}]\n"
         f"Objective: [exact Meta objective — Leads / Traffic / Engagement / Sales — state which and why]\n"
@@ -1937,7 +1984,9 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "[ ] Thank-you page exists (needed for conversion tracking)\n"
         "[ ] No exit pop-ups that fire immediately (kills ad quality score)\n"
         "CRITICAL FINAL CHECK: Scan every word in your output above. "
-        "FORBIDDEN: Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, Game-changer, Unleash. "
+        "FORBIDDEN: Transform, Elevate, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, Maximize, Game-changer, Unleash, "
+        "Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age, 'Best services', "
+        "'Quality solutions', 'Your trusted partner'. "
         "If ANY found — rewrite that sentence completely before returning."
     )
 
@@ -1969,7 +2018,6 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     # so /google-ads/create-campaign can pull them back when the user clicks
     # "Push to Google Ads". Must use the SAME key derivation as the lookup.
     campaign_assets = _extract_campaign_kit_assets(google_kit)
-    business_key = derive_business_key(request.url, request.industry, request.city)
     logger.info(f"[CAMPAIGN KIT] SAVE key: '{business_key}'")
     save_to_memory("campaign", business_key, {
         "campaign_data": {
@@ -2033,8 +2081,12 @@ async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db))
     _current_month_yr = datetime.now().strftime("%B %Y")
     prompt = (
         "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
-        "BANNED WORDS — ZERO TOLERANCE: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform, leverage, maximize, utilize, boost your.\n"
+        "BANNED WORDS — ZERO TOLERANCE: unleash, elevate, dive in, game-changer, unlock, revolutionize, seamless, empower, transform, leverage, maximize, utilize, boost your, "
+        "cutting-edge, state-of-the-art, world-class, one-stop solution, look no further, in today's digital age.\n"
         "Agar yeh koi bhi word aaye toh sentence dobara likho. Plain aur direct language use karo.\n"
+        "CTR-OPTIMIZED HOOKS/HEADLINES: use proven high-CTR patterns — numbers ('3x more bookings'), questions "
+        "('Losing weekend footfall?'), specificity (name the city/neighborhood/audience), urgency WITH a real reason "
+        "('Before wedding season fills up'). BANNED generic patterns: 'Best services', 'Quality solutions', 'Your trusted partner'.\n"
         "LANGUAGE: " + request.language + "\n"
         f"CURRENT DATE: {_current_month_yr}\n\n"
         "BRAND WEBSITE:\n" + site[:1500] + "\n\nPROMOTE: " + request.offer + "\nPLATFORM: " + request.platform + "\nINDUSTRY: " + request.business_type + "\n\n"
@@ -2042,7 +2094,8 @@ async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db))
         "CREATIVE 1 — BENEFIT ANGLE (what they get, specific outcome):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
         "CREATIVE 2 — PROOF ANGLE (numbers, results, credibility — no generic claims):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
         "CREATIVE 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal urgency):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
-        "CRITICAL FINAL CHECK: Scan every word. If Transform, Elevate, Unlock, Seamless, Empower, Leverage, Boost, Maximize found — rewrite completely."
+        "CRITICAL FINAL CHECK: Scan every word. If Transform, Elevate, Unlock, Seamless, Empower, Leverage, Boost, Maximize, "
+        "Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age found — rewrite completely."
     )
 
     ai_response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=2000)
@@ -3388,9 +3441,13 @@ Your job: decide where this specific business should focus FIRST to get the fast
 RULES:
 - Be specific to THIS business. Reference actual segments, competitors, and gaps from the data above.
 - No generic advice. Every recommendation must cite evidence from the data.
-- BANNED WORDS: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer.
+- BANNED WORDS: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.
 - Revenue potential: "High" = can 2x revenue in 3 months, "Medium" = 30-50% lift, "Low" = < 30% lift.
 - Priority score 0-100: 90+ = do this week, 70-89 = do this month, below 70 = plan for later.
+- CONFIDENCE DISCIPLINE: "confidence" must reflect actual evidence available in the data above. Memory-backed
+  claims (directly cited from the business data) = high confidence (80+). Inferred claims (reasoned from partial
+  data) = medium (50-70). Speculative claims (no supporting data) = low (<50) and the relevant "why" field must
+  say "Speculative:" at the start. Never give 85+ confidence to a guess.
 
 Respond ONLY with a valid JSON object — no markdown, no explanation, just the JSON:
 
@@ -3522,9 +3579,12 @@ RULES:
 - Reference actual audience segments, competitor weaknesses, and market gaps from the data.
 - No generic offers. Tied to real evidence from the data above.
 - Offer names must be specific (include the city or niche if applicable).
-- BANNED WORDS: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer.
+- BANNED WORDS: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.
 - offer_score 0-100: 90+ = near-certain to convert, 70-89 = strong, below 70 = needs tweaking.
-- confidence 0-100: how confident you are in this recommendation given the available data.
+- CONFIDENCE DISCIPLINE: "confidence" must reflect actual evidence available in the data above. Memory-backed
+  claims (directly cited from the business data) = high confidence (80+). Inferred claims (reasoned from partial
+  data) = medium (50-70). Speculative claims (no supporting data) = low (<50) and "why_it_works" must say
+  "Speculative:" at the start. Never give 85+ confidence to a guess.
 
 Respond ONLY with valid JSON — no markdown, no explanation:
 
@@ -4067,7 +4127,15 @@ RULES:
 - Instagram opener STRICTLY 3 lines. No more.
 - Call script opener must be deliverable in under 10 seconds.
 - Every objection response must reference the specific {industry} context.
-- BANNED words in all copy: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Game-changer, Dive in.
+- BANNED words in all copy: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Game-changer, Dive in, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.
+- PERSONALIZATION DEPTH: every message (cold_email, linkedin_message, whatsapp, instagram_dm, call_script) must
+  contain at least ONE specific detail that could only apply to THIS business type in {city} — a local landmark,
+  a seasonal event, a known local pain point. A message that could be sent to any business anywhere is a failure —
+  rewrite it with a concrete {city}/{industry}-specific reference before returning.
+- CONFIDENCE DISCIPLINE: "confidence" must reflect actual evidence available in the context above. Memory-backed
+  personalization (business/market/opportunity/offer data all present) = high confidence (80+). Partial memory
+  (only some tables populated) = medium (50-70). Little to no memory backing = low (<50). Never give 85+
+  confidence to a guess.
 - Return ONLY the JSON object. Nothing outside it."""
 
     try:
@@ -4251,7 +4319,11 @@ RULES:
 - All numbers calibrated for {industry} in {city} at {budget_str} budget — no generic global averages.
 - Budget breakdown must sum to the total budget.
 - LTV must be realistic for {industry} (hotel: ₹50k+, restaurant: ₹30k+, agency: ₹1L+).
-- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless.
+- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.
+- CONFIDENCE DISCIPLINE: "confidence" must reflect actual evidence available in the context above. Memory-backed
+  predictions (business/market/opportunity/offer data present) = high confidence (80+). Predictions inferred from
+  partial memory (only some tables populated) = medium (50-70). Predictions with no memory backing (pure industry
+  assumption) = low (<50), and "confidence_reason" must start with "Speculative:". Never give 85+ confidence to a guess.
 - Return ONLY the JSON. Nothing outside it."""
 
     try:
