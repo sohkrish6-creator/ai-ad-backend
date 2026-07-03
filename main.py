@@ -915,6 +915,15 @@ def _clean_banned_words(text: str) -> str:
     text = _clean_banned_conjugations(text)
     return text
 
+def _clean_banned_words_deep(obj):
+    """Recursively apply _clean_banned_words to every string leaf of a JSON
+    object (dict/list) — needed for endpoints that return structured GPT JSON
+    (nested hooks, headlines, recommendations) instead of one raw text blob."""
+    if isinstance(obj, str):  return _clean_banned_words(obj)
+    if isinstance(obj, dict): return {k: _clean_banned_words_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [_clean_banned_words_deep(v) for v in obj]
+    return obj
+
 async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
         return []
@@ -4845,6 +4854,38 @@ async def ai_optimizer(request: AIOptimizerRequest):
             or (isinstance(am, dict) and str(am.get("cost","0")).replace("RS","").replace("₹","").strip() in ("0","0.0",""))
         )
 
+        # ── Full per-campaign breakdown + pause-eligibility filter ────────────
+        # A campaign with ₹0 spend AND 0 impressions has nothing to save by
+        # pausing it (it's not running) — exclude it from pause candidates so
+        # the AI can't recommend "pausing" noise instead of real underperformers.
+        def _parse_money(v):
+            try:
+                s = str(v).replace("RS", "").replace("₹", "").replace(",", "").strip()
+                return float(s) if s else 0.0
+            except Exception:
+                return 0.0
+
+        _all_campaigns = [c for c in (camp_bk if isinstance(camp_bk, list) else []) if isinstance(c, dict)]
+        _pause_eligible = [
+            c for c in _all_campaigns
+            if not (_parse_money(c.get("cost", 0)) == 0 and int(c.get("impressions", 0) or 0) == 0)
+        ]
+
+        campaign_breakdown_block = "\n".join(
+            "- " + c.get("campaign_name", "?") +
+            ": status=" + str(c.get("status", "?")) +
+            ", cost=" + str(c.get("cost", "?")) +
+            ", impressions=" + str(c.get("impressions", "?")) +
+            ", CTR=" + str(c.get("ctr", "?")) +
+            ", conversions=" + str(c.get("conversions", "?")) +
+            ", rating=" + str(c.get("performance_rating", "?"))
+            for c in _all_campaigns
+        ) or "No campaign breakdown available."
+
+        pause_eligible_block = "\n".join(
+            "- " + c.get("campaign_name", "?") for c in _pause_eligible
+        ) or "NONE — every campaign has ₹0 spend and 0 impressions. Return an empty pause_recommendations list. Do not invent one."
+
         def _jstr(obj):
             try: return json.dumps(obj, ensure_ascii=False)[:400]
             except: return str(obj)[:400]
@@ -4881,6 +4922,13 @@ async def ai_optimizer(request: AIOptimizerRequest):
                 + ("NOTE: No active campaign spend detected.\n" if no_campaigns else "")
             )) + "\n"
 
+            "=== CAMPAIGN BREAKDOWN (use these EXACT campaign_name values in any recommendation) ===\n"
+            + campaign_breakdown_block + "\n\n"
+
+            "=== PAUSE-ELIGIBLE CAMPAIGNS (only these may appear in pause_recommendations — "
+            "campaigns with ₹0 spend and 0 impressions are excluded, there is nothing to save by pausing them) ===\n"
+            + pause_eligible_block + "\n\n"
+
             "=== AUDIENCE & OFFER ===\n"
             "Target segments: " + _sv(audience_data, "segments")[:200] + "\n"
             "Recommended offer: " + _sv(offer_data, "recommended_offer")[:200] + "\n"
@@ -4907,10 +4955,10 @@ async def ai_optimizer(request: AIOptimizerRequest):
             '  "overall_verdict": "campaigns need urgent attention / on track / performing well",\n'
             '  "health_change": "improving / stable / declining",\n'
             '  "pause_recommendations": [\n'
-            '    {"what":"campaign or ad type to pause","why":"specific data reason","expected_saving":"RS X/month","urgency":"immediate/this week/monitor"}\n'
+            '    {"what":"EXACT campaign_name from the PAUSE-ELIGIBLE list above — never a generic phrase like \'paused campaigns\'","why":"specific data reason citing that campaign'"'"'s own numbers","expected_saving":"RS X/month","urgency":"immediate/this week/monitor"}\n'
             '  ],\n'
             '  "scale_recommendations": [\n'
-            '    {"what":"what to scale","why":"specific data reason","how_much":"increase budget by X%","expected_impact":"..."}\n'
+            '    {"what":"EXACT campaign_name from the CAMPAIGN BREAKDOWN above (or exact ad set) — never a generic phrase","why":"specific data reason citing that campaign'"'"'s own numbers","how_much":"increase budget by X%","expected_impact":"..."}\n'
             '  ],\n'
             '  "audience_recommendations": [\n'
             '    {"current":"current targeting","problem":"specific issue","recommended_change":"what to change","expected_improvement":"..."}\n'
@@ -4945,9 +4993,17 @@ async def ai_optimizer(request: AIOptimizerRequest):
             "- Use RS as prefix for Indian Rupees (e.g. RS 5,000).\n"
             "- this_week_actions must be ordered by impact (highest first, priority 1 = most impactful).\n"
             "- If no active campaigns: focus pause_recommendations on pre-launch setup; scale on budget allocation plan.\n"
-            "- Minimum 2 items in pause, scale, audience, creative, keyword lists.\n"
+            "- CAMPAIGN NAMING: when recommending activating, pausing, or scaling a campaign, ALWAYS name the "
+            "specific campaign from the CAMPAIGN BREAKDOWN data above. Never say 'paused campaigns', 'underperforming "
+            "campaigns', or any other generic phrase — say e.g. 'Activate [exact campaign_name] because [specific "
+            "reason from its data]'.\n"
+            "- pause_recommendations may ONLY name campaigns from the PAUSE-ELIGIBLE list above. If that list says "
+            "NONE, return an empty pause_recommendations array — do not invent a pause recommendation.\n"
+            "- Minimum 2 items in scale, audience, creative, keyword lists. pause_recommendations has no minimum — "
+            "leave it empty rather than padding it with a campaign that isn't pause-eligible.\n"
             "- Minimum 5 this_week_actions.\n"
-            "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless.\n"
+            "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, "
+            "Maximize, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.\n"
             "- Return ONLY the JSON. Nothing else."
         )
 
@@ -4966,6 +5022,9 @@ async def ai_optimizer(request: AIOptimizerRequest):
 
         # Replace RS → ₹ in all string values
         optimizer = _fix_rs(optimizer)
+        # Scrub banned buzzwords (and their conjugations) from every nested string —
+        # this is structured JSON, not one raw text blob, so the filter must recurse.
+        optimizer = _clean_banned_words_deep(optimizer)
 
         save_to_memory("optimizer", norm_key, {"optimizer_data": optimizer})
         logger.info(f"[AI-OPT] Done: key={norm_key!r} confidence={optimizer.get('confidence')}")
