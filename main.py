@@ -858,6 +858,52 @@ _BANNED_WORD_MAP = {
     "In today's digital age": "","in today's digital age": "",
 }
 
+# ── Conjugation catcher ────────────────────────────────────────────────────
+# _BANNED_WORD_MAP above only matches the bare word ("Transform ", "boost your ").
+# GPT frequently uses conjugated forms instead ("leverages", "boosting",
+# "transformed") which slip past those exact-phrase entries. Generate every
+# -s / -ing / -ed form for each core banned verb and match them case-insensitively.
+_CONJUGATION_BASE_MAP = {
+    "leverage":      "use",
+    "utilize":       "use",
+    "transform":     "improve",
+    "elevate":       "strengthen",
+    "unlock":        "access",
+    "revolutionize": "modernize",
+    "empower":       "help",
+    "boost":         "increase",
+    "maximize":      "increase",
+}
+
+def _inflect(word: str) -> tuple:
+    """Return the regular (s_form, ing_form, ed_form) for a regular verb."""
+    if word.endswith("e"):
+        return (word + "s", word[:-1] + "ing", word + "d")
+    if word.endswith(("s", "x", "z", "ch", "sh")):
+        return (word + "es", word + "ing", word + "ed")
+    return (word + "s", word + "ing", word + "ed")
+
+_CONJUGATION_MAP = {}
+for _bad_base, _good_base in _CONJUGATION_BASE_MAP.items():
+    for _bad_form, _good_form in zip(_inflect(_bad_base), _inflect(_good_base)):
+        _CONJUGATION_MAP[_bad_form] = _good_form
+
+_CONJUGATION_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in sorted(_CONJUGATION_MAP, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+def _clean_banned_conjugations(text: str) -> str:
+    """Catch conjugated forms of the core banned verbs (leverages, boosting, transformed, ...)."""
+    def _replace(m):
+        matched = m.group(0)
+        good = _CONJUGATION_MAP[matched.lower()]
+        if matched[0].isupper():
+            good = good[0].upper() + good[1:]
+        logger.warning(f"[BANNED-WORD-CONJUGATION] '{matched}' found in AI output — replacing with '{good}'")
+        return good
+    return _CONJUGATION_PATTERN.sub(_replace, text)
+
 def _clean_banned_words(text: str) -> str:
     """Post-processing: replace banned buzzwords with plain alternatives.
     Logs a warning for each hit so prompt engineers can track leakage.
@@ -866,6 +912,7 @@ def _clean_banned_words(text: str) -> str:
         if bad in text:
             logger.warning(f"[BANNED-WORD] '{bad.strip()}' found in AI output — replacing")
             text = text.replace(bad, good)
+    text = _clean_banned_conjugations(text)
     return text
 
 async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
