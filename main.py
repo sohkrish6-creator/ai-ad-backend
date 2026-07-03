@@ -1439,17 +1439,24 @@ For {request.target_industry} businesses in {request.target_city}, include:
     ad_guide  = _clean_banned_words(ad_guide_raw)
 
     # ── Split each grouped output into individual sections ────────────────
+    def _header_pattern(header):
+        # GPT sometimes wraps headers in markdown bold/hashes or drops the
+        # trailing colon (e.g. "**MARKETING PLAN**" instead of "MARKETING PLAN:").
+        # Match the header text loosely regardless of that formatting noise.
+        core = re.escape(header.rstrip(":"))
+        return re.compile(r'[#\*\s]*' + core + r'[:\*\s]*', re.I)
+
     def split_by_headers(text, headers):
         result = {}
         for i, header in enumerate(headers):
             next_header = headers[i + 1] if i + 1 < len(headers) else None
-            start_match = re.search(re.escape(header), text, re.I)
+            start_match = _header_pattern(header).search(text)
             if not start_match:
                 result[header] = ""
                 continue
             content_start = start_match.end()
             if next_header:
-                end_match = re.search(re.escape(next_header), text[content_start:], re.I)
+                end_match = _header_pattern(next_header).search(text[content_start:])
                 content = text[content_start:content_start + end_match.start()].strip() if end_match else text[content_start:].strip()
             else:
                 content = text[content_start:].strip()
