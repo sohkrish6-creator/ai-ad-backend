@@ -2020,6 +2020,9 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     remarketing_kit = extract_kit(full_text, "=== REMARKETING KIT ===",       "=== TRACKING SETUP ===")
     tracking_kit    = extract_kit(full_text, "=== TRACKING SETUP ===",        "=== LANDING PAGE CHECKLIST ===")
     lp_checklist    = extract_kit(full_text, "=== LANDING PAGE CHECKLIST ===")
+    # GPT occasionally echoes the trailing self-check instruction verbatim as
+    # the last line of the last section — strip it if it leaked through.
+    lp_checklist = re.sub(r'\n?CRITICAL FINAL CHECK:.*$', '', lp_checklist, flags=re.S).strip()
 
     # ── Save keywords/headlines/descriptions to campaign_memory ─────────────
     # so /google-ads/create-campaign can pull them back when the user clicks
