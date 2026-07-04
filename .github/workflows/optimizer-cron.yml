@@ -1,0 +1,16 @@
+name: Optimizer Batch Run
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-optimizer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger /optimizer/run-all
+        run: |
+          curl -X POST https://ai-ad-backend-zhpj.onrender.com/optimizer/run-all \
+            --max-time 300 \
+            --fail-with-body
