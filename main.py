@@ -249,6 +249,15 @@ CREATE TABLE IF NOT EXISTS prospect_memory (
     created_at      TEXT,
     updated_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS autonomous_plan_memory (
+    id              BIGSERIAL PRIMARY KEY,
+    business_key    TEXT UNIQUE NOT NULL,
+    plan_data       TEXT,
+    goal_text       TEXT,
+    budget          REAL,
+    created_at      TEXT,
+    updated_at      TEXT
+);
 """
 
 def _create_memory_tables():
@@ -259,7 +268,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -309,6 +318,7 @@ _MEMORY_TABLES = {
     "optimizer":   "optimizer_memory",
     "result":      "result_memory",
     "prospect":    "prospect_memory",
+    "autonomous_plan": "autonomous_plan_memory",
 }
 
 def _json_val(v):
@@ -1879,6 +1889,8 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
             + "\n".join(_perf_lines) + "\n\n"
         )
 
+    _growth_block = growth_learning_block(request.industry)
+
     prompt = (
         f"You are a senior media buyer building a ready-to-paste campaign launch kit.\n"
         f"Business: {biz_label} | City: {city_label} | Total Monthly Budget: Rs {bdgt}\n"
@@ -1887,6 +1899,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         f"MARKETING BRAIN OUTPUT (extract specific details — audience pain points, competitors, positioning — and use them in every asset below):\n"
         f"{sections_summary}\n\n"
         f"{real_perf_block}"
+        f"{_growth_block}"
         "RULES — READ BEFORE GENERATING:\n"
         "1. ZERO generic copy. Every asset must reference the specific business, industry, or city above.\n"
         "2. Ad Copy formula: Hook (problem/desire specific to this audience) + Body (specific benefit with proof or number) + CTA (one exact action).\n"
@@ -3548,11 +3561,14 @@ async def opportunity_engine(request: OpportunityEngineRequest):
     memory_context = "\n".join(ctx_parts)
 
     # ── GPT-4o call ──────────────────────────────────────────────────────────
+    _growth_block = growth_learning_block(request.industry or bm.get("industry", ""))
+
     prompt = f"""You are a senior growth strategist. Analyze this business's stored data and identify the highest-ROI opportunities.
 
 BUSINESS DATA (from Adsoh memory system):
 {memory_context}
 
+{_growth_block}
 Your job: decide where this specific business should focus FIRST to get the fastest, highest return.
 
 RULES:
@@ -3565,6 +3581,8 @@ RULES:
   claims (directly cited from the business data) = high confidence (80+). Inferred claims (reasoned from partial
   data) = medium (50-70). Speculative claims (no supporting data) = low (<50) and the relevant "why" field must
   say "Speculative:" at the start. Never give 85+ confidence to a guess.
+- If CROSS-BUSINESS LEARNING data is present above, treat it as real evidence from other businesses in this
+  industry — it can justify high confidence even when this business's own memory is thin.
 
 Respond ONLY with a valid JSON object — no markdown, no explanation, just the JSON:
 
@@ -4377,10 +4395,14 @@ WEBSITE HEALTH:
 - Audit score: {_safe(_wm, "overall_score", "not audited")}
 """
 
+    _growth_block = growth_learning_block(industry)
+
     prompt = f"""You are a performance marketing expert specialising in Indian digital advertising for {industry} businesses in {city}.
 Generate precise, data-driven KPI predictions for this campaign. All numbers must reflect real Indian market benchmarks for this specific industry and city.
 
 {context}
+
+{_growth_block}
 
 Return ONLY a valid JSON object (no markdown, no text outside JSON) with this EXACT schema:
 {{
@@ -4441,6 +4463,9 @@ RULES:
   predictions (business/market/opportunity/offer data present) = high confidence (80+). Predictions inferred from
   partial memory (only some tables populated) = medium (50-70). Predictions with no memory backing (pure industry
   assumption) = low (<50), and "confidence_reason" must start with "Speculative:". Never give 85+ confidence to a guess.
+- If CROSS-BUSINESS LEARNING data is present above, it is real outcomes from other {industry} campaigns on this
+  platform — weigh it over generic benchmarks and raise confidence accordingly; cite it explicitly in
+  "confidence_reason" when used.
 - Return ONLY the JSON. Nothing outside it."""
 
     try:
@@ -4470,6 +4495,144 @@ RULES:
         "memory_used":  True,
         "business_key": norm_key,
         "kpi":          kpi,
+    }
+
+
+# ── Autonomous Marketing Engine (Phase 9) ────────────────────────────────────
+# User gives just a budget + a plain-language goal ("My budget is ₹5000, I need
+# doctor leads") and this decides the complete launch plan — campaign type,
+# platforms, budget split, pacing, expected results — no follow-up questions.
+
+class AutonomousMarketingRequest(BaseModel):
+    url:       str = ""
+    industry:  str = ""
+    city:      str = "Jaipur"
+    budget:    float = 0.0
+    goal_text: str
+
+@app.post("/autonomous-marketing")
+async def autonomous_marketing(request: AutonomousMarketingRequest):
+    industry  = (request.industry or "").strip()
+    city      = (request.city     or "Jaipur").strip()
+    budget    = request.budget or 0.0
+    goal_text = (request.goal_text or "").strip()
+
+    if not goal_text:
+        return {"success": False, "error": "goal_text is required — e.g. 'I need doctor leads'"}
+
+    _bk_src = (request.url or "").strip()
+    memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
+    logger.info(f"[AUTONOMOUS] key={norm_key!r} industry={industry!r} city={city!r} budget={budget} goal_text={goal_text!r}")
+
+    def _safe(d, *keys, dfl="N/A"):
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict): return dfl
+            cur = cur.get(k, dfl)
+        return str(cur or dfl)
+
+    def _jf(mem_dict, table_key, field_key):
+        raw = (mem_dict.get(table_key) or {})
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except Exception: raw = {}
+        val = raw.get(field_key, {})
+        if isinstance(val, str):
+            try: return json.loads(val)
+            except Exception: return {}
+        return val or {}
+
+    _bm       = memory.get("business", {}) or {}
+    _mm       = memory.get("market", {}) or {}
+    _opp_data = _jf(memory, "opportunity", "opportunity_data")
+    _offer_data = _jf(memory, "offer", "offer_data")
+    _kpi_data = _jf(memory, "kpi", "kpi_data")
+
+    context = (
+        "BUSINESS: " + _safe(_bm, "business_name") +
+        " | Industry: " + (industry or _safe(_bm, "industry")) +
+        " | City: " + city +
+        " | Monthly Budget: ₹" + str(int(budget)) + "\n"
+        "USER'S GOAL (plain language, may be ambiguous — interpret it before deciding anything): \"" + goal_text + "\"\n\n"
+        "KNOWN BUSINESS DATA:\n"
+        "- Positioning: " + _safe(_bm, "positioning") + "\n"
+        "- Market gap: " + _safe(_mm, "market_gap")[:200] + "\n"
+        "- Highest ROI audience (from Opportunity Engine): " + _safe(_opp_data, "highest_roi_audience", "segment") + "\n"
+        "- Highest ROI offer: " + _safe(_opp_data, "highest_roi_offer", "offer") + "\n"
+        "- Recommended offer (from Offer Intelligence): " + _safe(_offer_data, "recommended_offer", "name") + "\n"
+        "- Prior KPI primary metric/target: " + _safe(_kpi_data, "primary_kpi", "metric") + " / " + _safe(_kpi_data, "primary_kpi", "target") + "\n"
+    )
+
+    _growth_block = growth_learning_block(industry or _safe(_bm, "industry"))
+
+    prompt = (
+        "You are the Autonomous Marketing Engine inside Marketing Brain (Adsoh) — you think like a CMO who takes "
+        "a plain-language goal and a budget and returns a complete, launch-today decision. Never ask a follow-up "
+        "question; make the best call from the evidence available and state your confidence.\n\n"
+        "STEP 1 — INTERPRET THE GOAL: before deciding anything, work out WHO the goal is really about, relative to "
+        "THIS business. The same phrase means different things for different businesses — e.g. 'doctor leads' means "
+        "doctor-as-prospect for a marketing agency selling TO doctors, doctor-as-employee for a hospital hiring "
+        "doctors, doctor-as-buyer for a medical equipment company, doctor-as-hiring-lead for a healthcare recruiter. "
+        "State this interpretation explicitly and let it drive every decision below.\n\n"
+        + context + "\n" + _growth_block +
+        "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
+        "{\n"
+        '  "goal_interpretation": {"who_is_the_target":"...","relationship_to_business":"prospect/customer/employee/buyer/hiring_lead/other","reasoning":"specific reasoning tied to this business'"'"'s actual industry"},\n'
+        '  "campaign_type": "Search / Social Lead Gen / Display / Performance Max / Demand Gen / Cold Outreach / ...",\n'
+        '  "platforms_ranked": [{"platform":"...","why":"specific reason","budget_pct":0}],\n'
+        '  "budget_split": {"google_ads":"RS X","meta_ads":"RS X","remarketing":"RS X"},\n'
+        '  "daily_budget": "RS X/day",\n'
+        '  "campaign_duration_days": 30,\n'
+        '  "pacing": "spend fast to exit learning phase quickly, or spread evenly across the month — state which and why, citing the budget size and competition level",\n'
+        '  "expected_results": {"expected_leads":"X-Y over the period","recommended_cpl":"RS X","recommended_cpa":"RS X","expected_roi":"X%"},\n'
+        '  "reason": "one paragraph tying the whole plan together",\n'
+        '  "risk": "the main way this plan could fail and what would signal it early",\n'
+        '  "confidence": 0,\n'
+        '  "next_action": "the single next step the user should take right now"\n'
+        "}\n\n"
+        "RULES:\n"
+        "- All monetary values in Indian Rupees, prefixed RS (post-processing converts to ₹).\n"
+        f"- budget_split must sum to the RS {int(budget)} monthly budget.\n"
+        "- Numbers must be specific and realistic for this industry+city — no vague ranges like 'a lot more leads'.\n"
+        "- CONFIDENCE DISCIPLINE: memory-backed decisions (business/opportunity/offer/kpi data present above) = "
+        "high confidence (80+). Inferred decisions = medium (50-70). Pure industry assumption = low (<50) and "
+        "'reason' must start with 'Speculative:'. If CROSS-BUSINESS LEARNING data is present, weigh it as real "
+        "evidence and raise confidence accordingly.\n"
+        "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, "
+        "Maximize, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.\n"
+        "- Return ONLY the JSON. Nothing else."
+    )
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=1600,
+            temperature=0.4,
+        )
+        raw = resp.choices[0].message.content.strip()
+        plan = json.loads(raw)
+    except Exception as _e:
+        logger.error(f"[AUTONOMOUS] GPT call failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    plan = _fix_rs(plan)
+    plan = _clean_banned_words_deep(plan)
+
+    save_to_memory("autonomous_plan", norm_key, {
+        "plan_data": plan,
+        "goal_text": goal_text,
+        "budget":    budget,
+    })
+    logger.info(f"[AUTONOMOUS] Done: key={norm_key!r} confidence={plan.get('confidence')}")
+
+    return {
+        "success":      True,
+        "memory_used":  bool(memory),
+        "business_key": norm_key,
+        "plan":         plan,
     }
 
 
@@ -4805,14 +4968,18 @@ class AIOptimizerRequest(BaseModel):
     industry: str = ""
     city:     str = "Jaipur"
 
-@app.post("/ai-optimizer")
-async def ai_optimizer(request: AIOptimizerRequest):
+async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = "Jaipur") -> dict:
+    """
+    Core optimizer logic, factored out of the /ai-optimizer endpoint so it can
+    also be driven in bulk by /optimizer/run-all (Phase 10 continuous
+    optimization loop) without duplicating the prompt/parsing logic.
+    """
     try:
-        industry = (request.industry or "").strip()
-        city     = (request.city     or "Jaipur").strip()
-        _bk_src  = (request.url     or "").strip()
+        industry = (industry or "").strip()
+        city     = (city     or "Jaipur").strip()
+        _bk_src  = (url      or "").strip()
 
-        logger.info(f"[AI-OPT] url={request.url!r} industry={industry!r} city={city!r}")
+        logger.info(f"[AI-OPT] url={url!r} industry={industry!r} city={city!r}")
 
         memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
         logger.info(f"[AI-OPT] key={norm_key!r} tables={list(memory.keys())}")
@@ -5094,6 +5261,74 @@ async def ai_optimizer(request: AIOptimizerRequest):
         logger.error(f"[AI-OPT] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
 
+@app.post("/ai-optimizer")
+async def ai_optimizer(request: AIOptimizerRequest):
+    return await _run_ai_optimizer_core(request.url, request.industry, request.city)
+
+
+# ── Continuous Optimization Loop (Phase 10) ──────────────────────────────────
+# Stateless web services (like this one on Render) can't reliably run an
+# in-process scheduler — multiple worker processes would each fire their own
+# timer and duplicate work, and a free-tier instance can sleep between
+# requests. Instead this endpoint runs the optimizer for every business we
+# have performance data for, and is meant to be triggered by an EXTERNAL
+# scheduler (a Render Cron Job, GitHub Actions schedule, or any cron hitting
+# this URL every few hours) — that's what makes the loop "continuous".
+@app.post("/optimizer/run-all")
+async def optimizer_run_all():
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT DISTINCT business_key FROM performance_memory")
+            ).fetchall()
+        business_keys = [r[0] for r in rows if r[0]]
+    except Exception as _e:
+        logger.error(f"[OPT-RUN-ALL] Could not list business_keys: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    results = []
+    for bk in business_keys:
+        try:
+            mem = get_memory(bk)
+            bm = mem.get("business", {}) or {}
+            industry = bm.get("industry", "") or ""
+            city     = bm.get("city", "") or "Jaipur"
+            # business_key encodes the url/industry portion; business_memory's own
+            # industry/city columns (saved by full-report) are the reliable source
+            # since the key itself may be url-only or industry-only depending on mode.
+            url_guess = bk.split("::")[0] if "::" in bk else bk
+
+            prev_optimizer = (mem.get("optimizer", {}) or {}).get("optimizer_data")
+            if isinstance(prev_optimizer, str):
+                try: prev_optimizer = json.loads(prev_optimizer)
+                except Exception: prev_optimizer = {}
+            prev_verdict = (prev_optimizer or {}).get("overall_verdict")
+
+            outcome = await _run_ai_optimizer_core(url_guess, industry, city)
+            new_verdict = (outcome.get("optimizer", {}) or {}).get("overall_verdict") if outcome.get("success") else None
+
+            results.append({
+                "business_key":    bk,
+                "success":         outcome.get("success", False),
+                "overall_verdict": new_verdict,
+                "health_change":   (outcome.get("optimizer", {}) or {}).get("health_change") if outcome.get("success") else None,
+                "alert":           bool(prev_verdict and new_verdict and prev_verdict != new_verdict),
+                "error":           outcome.get("error") if not outcome.get("success") else None,
+            })
+        except Exception as _e:
+            logger.error(f"[OPT-RUN-ALL] Failed for {bk!r}: {_e}")
+            results.append({"business_key": bk, "success": False, "error": str(_e)})
+
+    alerts = [r for r in results if r.get("alert")]
+    logger.info(f"[OPT-RUN-ALL] Processed {len(results)} businesses, {len(alerts)} verdict changes")
+
+    return {
+        "success":              True,
+        "businesses_processed": len(results),
+        "alerts":               alerts,
+        "results":              results,
+    }
+
 
 # ── Module 22: Result Center ──────────────────────────────────────────────────
 
@@ -5149,6 +5384,51 @@ def _save_growth_memory(gmp: dict):
         logger.info(f"[RESULT] Growth memory saved: industry={gmp.get('industry')!r}")
     except Exception as _e:
         logger.error(f"[RESULT] growth_memory save failed: {_e}")
+
+def get_growth_learning(industry: str, limit: int = 5) -> dict:
+    """
+    Learning Engine (Phase 11) read side: pull anonymised winning-pattern
+    evidence from OTHER businesses in the same industry (across the whole
+    Adsoh install base, not just this one business_key), most confident
+    and most recent first. Used to calibrate predictions/recommendations
+    with real cross-business evidence instead of generic benchmarks.
+    """
+    industry = (industry or "").strip()
+    if not industry:
+        return {"sample_size": 0, "entries": []}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT business_type, budget_range, winning_audience, winning_platform, "
+                    "winning_offer, avg_cpl, avg_roas, confidence, created_at FROM growth_memory "
+                    "WHERE LOWER(industry) = LOWER(:industry) "
+                    "ORDER BY confidence DESC, created_at DESC LIMIT :limit"
+                ),
+                {"industry": industry, "limit": limit},
+            ).mappings().all()
+        entries = [dict(r) for r in rows]
+        return {"sample_size": len(entries), "entries": entries}
+    except Exception as _e:
+        logger.error(f"[GROWTH-LEARNING] lookup failed for industry={industry!r}: {_e}")
+        return {"sample_size": 0, "entries": []}
+
+def growth_learning_block(industry: str, label: str = "CROSS-BUSINESS LEARNING") -> str:
+    """Render get_growth_learning() as a prompt-ready text block, or '' if no data yet."""
+    learning = get_growth_learning(industry)
+    if not learning["entries"]:
+        return ""
+    lines = [
+        f"- Platform: {e.get('winning_platform','?')} | Audience: {e.get('winning_audience','?')} | "
+        f"Offer: {e.get('winning_offer','?')} | CPL: {e.get('avg_cpl','?')} | ROAS: {e.get('avg_roas','?')} "
+        f"(confidence {e.get('confidence','?')})"
+        for e in learning["entries"]
+    ]
+    return (
+        f"{label} — anonymised results from {learning['sample_size']} other {industry} campaign(s) "
+        "run through Adsoh (real outcomes, not industry averages — weigh these over generic benchmarks):\n"
+        + "\n".join(lines) + "\n\n"
+    )
 
 @app.post("/result-center")
 async def result_center(request: ResultCenterRequest):
@@ -7179,6 +7459,166 @@ async def smart_analysis_history_detail(history_id: int):
     except Exception as _e:
         logger.error(f"[SMART-ANALYSIS] history detail failed: {_e}")
         return {"success": False, "error": str(_e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND CENTER (Phase 12) — one text box that activates internal engines
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CommandRequest(BaseModel):
+    text:     str
+    url:      str = ""
+    industry: str = ""
+    city:     str = ""   # blank, not "Jaipur" — must stay falsy so a city mentioned in `text` can win the fallback below
+    budget:   float = 0.0
+    goal:     str = ""
+
+_COMMAND_INTENTS = (
+    "full_report", "prospect_discovery", "campaign_launch_kit", "ai_optimizer",
+    "opportunity_engine", "kpi_engine", "outreach_ai", "website_intelligence",
+    "offer_intelligence", "autonomous_marketing", "unknown",
+)
+
+async def _classify_command(text_cmd: str, url: str, industry: str, city: str, budget: float) -> dict:
+    prompt = (
+        "Classify this command into exactly one internal Marketing Brain action and extract any parameters "
+        "mentioned in the text itself.\n\n"
+        f'COMMAND: "{text_cmd}"\n'
+        f"ALREADY KNOWN CONTEXT: url={url or 'none'}, industry={industry or 'none'}, city={city or 'none'}, budget={budget or 'none'}\n\n"
+        "AVAILABLE ACTIONS:\n"
+        "- full_report: run the complete Marketing Brain analysis (business/market/competitor/audience/campaign strategy)\n"
+        "- prospect_discovery: find a list of prospect businesses in an industry+city, e.g. 'find hotels in Delhi'\n"
+        "- campaign_launch_kit: generate a ready-to-launch Google+Meta Ads campaign kit (keywords, headlines, audiences, budget split)\n"
+        "- ai_optimizer: analyze an existing campaign's performance and recommend pause/scale/creative/budget changes\n"
+        "- opportunity_engine: find the highest-ROI audience/offer/platform opportunity for a business, e.g. 'find better audience'\n"
+        "- kpi_engine: predict CTR/CPC/CPL/ROAS and budget breakdown for a campaign\n"
+        "- outreach_ai: generate cold outreach scripts (WhatsApp/email/DM/call) for a target\n"
+        "- website_intelligence: audit a website/landing page for conversion issues, e.g. 'improve landing page'\n"
+        "- offer_intelligence: design the best offer/lead magnet/pricing for a business\n"
+        "- autonomous_marketing: given a plain budget + goal (e.g. 'budget 5000, need doctor leads'), decide the "
+        "complete campaign plan automatically — pick this when the command states a budget AND a goal together\n"
+        "- unknown: none of the above fit\n\n"
+        'Return ONLY JSON: {"intent": "one of the actions above", '
+        '"extracted": {"industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line"}\n'
+        "Only fill \"extracted\" fields you can confidently pull from the command text itself — leave blank/0 if not mentioned."
+    )
+    resp = await asyncio.to_thread(
+        client.chat.completions.create,
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_tokens=300,
+        temperature=0,
+    )
+    parsed = json.loads(resp.choices[0].message.content.strip())
+    if parsed.get("intent") not in _COMMAND_INTENTS:
+        parsed["intent"] = "unknown"
+    return parsed
+
+@app.post("/command")
+async def command_center(request: CommandRequest):
+    text_cmd = (request.text or "").strip()
+    if not text_cmd:
+        return {"success": False, "error": "text is required"}
+
+    try:
+        classification = await _classify_command(text_cmd, request.url, request.industry, request.city, request.budget)
+    except Exception as _e:
+        logger.error(f"[COMMAND] classification failed: {_e}")
+        return {"success": False, "error": f"Could not understand command: {_e}"}
+
+    intent    = classification.get("intent", "unknown")
+    extracted = classification.get("extracted", {}) or {}
+    industry  = request.industry or extracted.get("industry") or ""
+    city      = request.city or extracted.get("city") or "Jaipur"
+    budget    = request.budget or extracted.get("budget") or 0
+    goal      = request.goal or extracted.get("goal") or text_cmd
+    url       = request.url or ""
+
+    logger.info(f"[COMMAND] text={text_cmd!r} -> intent={intent!r} industry={industry!r} city={city!r} budget={budget}")
+
+    try:
+        if intent == "full_report":
+            db = SessionLocal()
+            try:
+                result = await full_report(FullReportRequest(
+                    url=url, business_type=industry or "Business", budget=int(budget) or 10000,
+                    goal=goal, target_industry=industry, target_city=city,
+                ), db)
+            finally:
+                db.close()
+
+        elif intent == "prospect_discovery":
+            if not industry:
+                return {"success": False, "intent": intent, "error": "Missing industry — try 'find [industry] in [city]'"}
+            result = await prospect_discovery(ProspectDiscoveryRequest(industry=industry, city=city, url=url))
+
+        elif intent == "campaign_launch_kit":
+            result = await campaign_launch_kit(CampaignLaunchKitRequest(
+                url=url, industry=industry, city=city, budget=int(budget) or 10000, goal=goal,
+            ))
+
+        elif intent == "ai_optimizer":
+            result = await ai_optimizer(AIOptimizerRequest(url=url, industry=industry, city=city))
+
+        elif intent == "opportunity_engine":
+            if not url and not industry:
+                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry"}
+            result = await opportunity_engine(OpportunityEngineRequest(
+                business_key=url or industry, industry=industry, city=city, budget=int(budget),
+            ))
+
+        elif intent == "kpi_engine":
+            if not industry:
+                return {"success": False, "intent": intent, "error": "Missing industry"}
+            result = await kpi_engine(KPIEngineRequest(url=url, industry=industry, city=city, budget=budget, goal=goal))
+
+        elif intent == "outreach_ai":
+            result = await outreach_ai(OutreachAIRequest(url=url, industry=industry, city=city, outreach_goal=goal))
+
+        elif intent == "website_intelligence":
+            if not url:
+                return {"success": False, "intent": intent, "error": "Missing url to audit"}
+            result = await website_intelligence(WebsiteIntelligenceRequest(url=url, industry=industry, city=city))
+
+        elif intent == "offer_intelligence":
+            if not url and not industry:
+                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry"}
+            result = await offer_intelligence(OfferIntelligenceRequest(business_key=url or industry, industry=industry, city=city))
+
+        elif intent == "autonomous_marketing":
+            if not goal:
+                return {"success": False, "intent": intent, "error": "Missing goal — describe what you need, e.g. 'doctor leads'"}
+            result = await autonomous_marketing(AutonomousMarketingRequest(
+                url=url, industry=industry, city=city, budget=budget, goal_text=goal,
+            ))
+
+        else:
+            return {
+                "success": False,
+                "intent": "unknown",
+                "error": "Could not match this command to an internal engine.",
+                "reasoning": classification.get("reasoning", ""),
+                "available_commands": [
+                    "Run full analysis on [url]", "Find [industry] in [city]",
+                    "Generate campaign for [url]", "Optimize campaign for [url]",
+                    "Find better audience for [url]", "Predict results for [industry] campaign",
+                    "Write outreach for [industry] in [city]", "Audit landing page for [url]",
+                    "Design offer for [url]", "Budget [X], need [goal]",
+                ],
+            }
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[COMMAND] dispatch to {intent!r} failed: {_e}\n{tb}")
+        return {"success": False, "intent": intent, "error": str(_e)}
+
+    return {
+        "success":   True,
+        "intent":    intent,
+        "reasoning": classification.get("reasoning", ""),
+        "params_used": {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal},
+        "result":    result,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
