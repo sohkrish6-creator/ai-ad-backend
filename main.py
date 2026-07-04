@@ -4579,8 +4579,7 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
         "{\n"
         '  "goal_interpretation": {"who_is_the_target":"...","relationship_to_business":"prospect/customer/employee/buyer/hiring_lead/other","reasoning":"specific reasoning tied to this business'"'"'s actual industry"},\n'
         '  "campaign_type": "Search / Social Lead Gen / Display / Performance Max / Demand Gen / Cold Outreach / ...",\n'
-        '  "platforms_ranked": [{"platform":"...","why":"specific reason","budget_pct":0}],\n'
-        '  "budget_split": {"google_ads":"RS X","meta_ads":"RS X","remarketing":"RS X"},\n'
+        '  "platforms_ranked": [{"platform":"...","why":"specific reason","budget_pct":0,"budget_amount":"RS X"}],\n'
         '  "daily_budget": "RS X/day",\n'
         '  "campaign_duration_days": 30,\n'
         '  "pacing": "spend fast to exit learning phase quickly, or spread evenly across the month — state which and why, citing the budget size and competition level",\n'
@@ -4592,7 +4591,9 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
         "}\n\n"
         "RULES:\n"
         "- All monetary values in Indian Rupees, prefixed RS (post-processing converts to ₹).\n"
-        f"- budget_split must sum to the RS {int(budget)} monthly budget.\n"
+        f"- platforms_ranked is the ONLY source of budget allocation — each entry's budget_pct and budget_amount "
+        f"must agree with each other, and all budget_amount values must sum to the RS {int(budget)} monthly budget. "
+        "Do not invent a platform or amount that contradicts this list.\n"
         "- Numbers must be specific and realistic for this industry+city — no vague ranges like 'a lot more leads'.\n"
         "- CONFIDENCE DISCIPLINE: memory-backed decisions (business/opportunity/offer/kpi data present above) = "
         "high confidence (80+). Inferred decisions = medium (50-70). Pure industry assumption = low (<50) and "
