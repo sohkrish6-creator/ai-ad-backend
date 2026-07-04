@@ -1260,6 +1260,11 @@ For {request.target_industry} businesses in {request.target_city}, include:
 
     _analyzed_url = request.url or f"{request.business_type} business"
     business_critical = (
+        "IDENTITY: You are Marketing Brain — the complete Marketing Operating System inside Adsoh. "
+        "You are NOT a chatbot and NOT a generic AI report generator. You think exactly like an experienced "
+        "Chief Marketing Officer, Growth Strategist, Media Buyer, Brand Strategist, Market Researcher, "
+        "Performance Marketer, and Business Consultant working together on one account. Never write like ChatGPT. "
+        "Never pad a section with generic marketing filler — if you don't have evidence for a point, don't make it.\n"
         f"CRITICAL: The business you are analyzing is the one at {_analyzed_url}. "
         f"Do NOT call it Adsoh or Sohscape. "
         f"Use the actual business name detected from the website content.\n"
@@ -1277,6 +1282,15 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "walk-ins within 60 days'.\n"
         "MISSING DATA: If there isn't enough information for a section, say 'Insufficient data — recommend "
         "running [specific module name]' instead of filling the section with generic advice.\n\n"
+        "DECISION DISCIPLINE: Every non-obvious recommendation must be backed by an observation from the data, "
+        "the evidence for it, why it matters, your confidence in it (state 'high confidence' when it's directly "
+        "backed by data above, 'medium confidence' when inferred, 'low confidence / assumption' when you're "
+        "filling a gap), and the risk of being wrong. Weave this into normal prose — do not create a separate "
+        "labeled sub-section for it.\n"
+        "SELF-CHECK BEFORE ANSWERING: Before finalizing each section, verify it actually matches this specific "
+        "business, its real industry, and its real audience — not a generic template for that industry. If a "
+        "sentence could be copy-pasted into a report for an unrelated business without anyone noticing, rewrite it "
+        "with a detail that only applies here.\n\n"
     )
 
     # ── Memory: derive key + fetch existing knowledge ────────────────────────
@@ -1329,13 +1343,26 @@ For {request.target_industry} businesses in {request.target_city}, include:
         f"{live_intel_block}"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 1-4:\n\n"
         "BUSINESS UNDERSTANDING:\n"
-        "[What truly makes this business different — UVP, trust signals, detected_industry, core_products from DNA. 4-5 specific points]\n\n"
+        "[Run the Business Discovery Engine on the DNA data above: business model (B2B / B2C / D2C / Marketplace / "
+        "Agency / Local Business / Enterprise / SaaS), whether it's product or service led, offline / online / "
+        "hybrid, target market tier (premium / budget / luxury) and geographic scope (local / national / "
+        "international). Then what truly makes this business different — UVP, trust signals, core_products from "
+        "DNA. State your confidence in this classification (high/medium/low) — if below 90% confident on the "
+        "business model, say exactly what's ambiguous. 5-6 specific points]\n\n"
         "MARKET UNDERSTANDING:\n"
-        "[Market size, growth, saturation, real gaps — reference market_size, market_opportunity_score, market_opportunity_reason. 4-5 specific points]\n\n"
+        "[Run the Market Intelligence Engine: market size, demand, seasonality, growth, current trends, digital "
+        "adoption level, competition level for this industry+city, and whether the biggest untapped opportunity is "
+        "local, national, or international — reference market_size, market_opportunity_score, "
+        "market_opportunity_reason. 4-5 specific points]\n\n"
         "COMPETITOR INSIGHTS:\n"
-        "[Real competitor landscape, strengths, weaknesses, positioning gaps — reference key_threats, differentiators, moat_strength from threat data. 4-5 specific points]\n\n"
+        "[Run the Competitor Intelligence Engine: real competitor landscape — their offers, pricing signals, SEO/"
+        "keyword signals, social presence, positioning, strengths, weaknesses, and the single biggest opportunity "
+        "their weakness creates for this business — reference key_threats, differentiators, moat_strength from "
+        "threat data. 4-5 specific points]\n\n"
         "POSITIONING STRATEGY:\n"
-        "[Market position this business should own — reference winning_position, positioning_gap, category_ownership_opportunity, messaging_shift. 3-4 specific points]"
+        "[Market position this business should own — reference winning_position, positioning_gap, "
+        "category_ownership_opportunity, messaging_shift, and the competitive advantage to lead with in every "
+        "asset downstream. 3-4 specific points]"
     )
 
     if request.target_industry:
@@ -1350,9 +1377,17 @@ For {request.target_industry} businesses in {request.target_city}, include:
             f"{live_intel_block}"
             "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
             "AUDIENCE STRATEGY:\n"
-            f"[BUYER INTELLIGENCE — 3 segments: Owner, Manager, Director of {request.target_industry} businesses in {city}. "
-            f"For each: age, gender, income level, specific pain points in {request.target_industry}, "
-            f"what they search for online, where they hang out online, what triggers them to buy a service like yours]\n\n"
+            f"[First state in one line WHO the {request.target_industry} owner/manager actually is in relation to "
+            f"this business — a prospect being sold to, a partner, a referral source, etc — this framing must drive "
+            f"every script below.\n"
+            f"BUYER INTELLIGENCE — 3 segments: Owner, Manager, Director of {request.target_industry} businesses in {city}. "
+            f"For each: age, gender, income level, specific pain points in {request.target_industry}, buying trigger "
+            f"(the specific event that makes them start looking for this service), dream outcome, "
+            f"what they search for online, where they hang out online (platform behaviour), device usage, and "
+            f"what triggers them to buy a service like yours.\n"
+            f"Then estimate: audience reach in {city}, expected CPC range, expected CTR range, expected CPL range, "
+            f"an audience score (0-100) and a buying-intent score (0-100) with one line of reasoning each, and an "
+            f"overall confidence level for this audience read]\n\n"
             "LEAD SOURCES:\n"
             f"[WHERE TO FIND {request.target_industry.upper()} BUSINESSES IN {city.upper()}:\n"
             f"Google Maps search terms to find them:\n"
@@ -1395,9 +1430,16 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "4. KABHI earn money, win cash language mat use karo.\n\n"
             "Koi asterisk mat use kar. Seedha likho. Generate sections 5-8:\n\n"
             "AUDIENCE STRATEGY:\n"
-            "[BUYER INTELLIGENCE — 3 validated segments from audience BI. "
-            "For each: age, gender, income level, specific pain points, what triggers purchase, "
-            "where they hang out online, what they search before buying. Reference validated_segments from BI]\n\n"
+            "[First state in one line WHO the buyer actually is relative to this business — the end consumer, a "
+            "gift-buyer, a repeat customer, a first-time trial buyer, etc — this framing must drive every script "
+            "below.\n"
+            "BUYER INTELLIGENCE — 3 validated segments from audience BI. "
+            "For each: age, gender, income level, specific pain points, buying trigger (the specific event that "
+            "makes them start looking), dream outcome, what triggers purchase, where they hang out online "
+            "(platform behaviour), device usage, what they search before buying. Reference validated_segments from BI.\n"
+            "Then estimate: audience reach, expected CPC range, expected CTR range, expected CPL range, an "
+            "audience score (0-100) and a buying-intent score (0-100) with one line of reasoning each, and an "
+            "overall confidence level for this audience read]\n\n"
             "LEAD SOURCES:\n"
             f"[WHERE TO FIND BUYERS for {request.business_type}:\n"
             "Online — platforms, communities, hashtags, Facebook groups they're in:\n"
@@ -1439,6 +1481,11 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "NEVER use the word Elevate in any headline, hook, or copy.\n"
         "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
         "MARKETING PLAN:\n"
+        "Channel Ranking: [Rank the top 4-5 channels for THIS business right now out of: Google Ads, Meta Ads, SEO, "
+        "Local SEO / Google Business Profile, Email, WhatsApp, LinkedIn, YouTube, Display, Performance Max, Demand "
+        "Gen, Organic Social, Influencer, Referral, Community, Partnership, PR, Offline/Events, Cold Outreach. "
+        "For each ranked channel give one line: why it ranks here for this specific business, citing evidence "
+        "from the data above — not a generic channel description]\n"
         "Google Ads: [specific keywords, match types, bid strategy, budget split]\n"
         "Meta Ads: [exact audience — age, gender, interests, behaviors, placements]\n"
         "Remarketing: [3 retargeting sequences with triggers and copy angles]\n"
@@ -1462,6 +1509,10 @@ For {request.target_industry} businesses in {request.target_city}, include:
         f"Campaign Objective: [{request.goal} — explain why this fits the business]\n"
         "Platform Priority: [1st: [] — why | 2nd: [] — why | 3rd: [] — why]\n"
         f"Budget Split: [{bdgt} — exact rupee allocation per platform with reasoning]\n"
+        f"Budget Pacing: [Given {bdgt} and the current competition level and learning-phase needs, should this "
+        "spend faster (compress into fewer days to exit the learning phase quickly — good for small budgets or "
+        "high competition) or pace evenly across the full month (steadier signal, better for stable long-term "
+        "accounts)? Recommend one and say why, citing the budget size and goal above]\n"
         "Bid Strategy: [recommended bid strategy + why it fits this business and goal]\n"
         "Launch Plan: [recommended launch date, what to set up first, first 7 days checklist]\n"
         "Scaling Rules: [when to scale — conditions, by how much %, safe vs aggressive thresholds]\n"
@@ -1484,9 +1535,9 @@ For {request.target_industry} businesses in {request.target_city}, include:
     )
 
     section_a_raw, section_b_raw, section_c_raw, ad_guide_raw = await asyncio.gather(
-        run_ai(prompt_a, 2000),
-        run_ai(prompt_b, 2000),
-        run_ai(prompt_c, 2500),
+        run_ai(prompt_a, 2400),
+        run_ai(prompt_b, 2400),
+        run_ai(prompt_c, 2800),
         run_ai(prompt_guide, 1000),
     )
     section_a = _clean_banned_words(section_a_raw)
