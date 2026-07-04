@@ -7754,10 +7754,11 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         except Exception:
             site_content = "(Could not fetch website content)"
 
-    # ── 2. Tavily: sports/gaming season context + upcoming calendar + competitors ──
+    # ── 2. Tavily: sports/gaming season context + upcoming calendar + competitors + inventory ──
     cricket_context = ""
     calendar_context = ""
     competitor_context = ""
+    inventory_context = ""
     if TAVILY_API_KEY:
         _now_str = datetime.now().strftime("%B %Y")
         _q_context = (
@@ -7774,35 +7775,56 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
             f"Popular cricket fan communities, sports content pages, or {business_type} platforms in India — "
             "their WhatsApp/Telegram community growth tactics, content style, offers, follower counts"
         )
-        cricket_context, calendar_context, competitor_context = await asyncio.gather(
-            fetch_tavily(_q_context), fetch_tavily(_q_calendar), fetch_tavily(_q_competitor),
+        _q_inventory = (
+            f"Current relevance and popularity in India {_now_str} of cricket/sports apps and platforms: "
+            "Cricbuzz, ESPN Cricinfo, CricHeroes, SportsTiger, SportsTak, Flashscore, Cricket Exchange, Fancode, "
+            "Google Discover Sports, Dailyhunt Sports, InMobi sports inventory, Glance lock screen, Opera News "
+            "cricket, OEM cricket widgets, YouTube cricket channels like Star Sports and ICC — audience size, "
+            "app usage trends, ad inventory availability"
+        )
+        cricket_context, calendar_context, competitor_context, inventory_context = await asyncio.gather(
+            fetch_tavily(_q_context), fetch_tavily(_q_calendar), fetch_tavily(_q_competitor), fetch_tavily(_q_inventory),
         )
 
     # ── 2b. Learning Engine: cross-business winning patterns for sports/gaming ──
     _growth_block = growth_learning_block("sports_gaming", label="SPORTS/GAMING LEARNING")
 
-    # ── 3. Build prompt ──────────────────────────────────────────────────────
-    _current_month = datetime.now().strftime("%B %Y")
-    prompt = (
-        f"You are a Google Display Ads expert specializing in sports and gaming community campaigns in India — "
-        f"the Sports Growth Engine inside Adsoh.\n"
+    # ── 3. Shared context + 4 parallel prompts ───────────────────────────────
+    # Cricket Media Buying Brain upgrade: the single mega-prompt this endpoint used
+    # to send is now split into 4 independent calls (core / creative+design /
+    # inventory / media+simulator), run in parallel via asyncio.gather. This keeps
+    # each call's max_tokens sane (avoiding truncated JSON) and gives real
+    # per-section failure isolation — one section failing doesn't take the rest
+    # down, unlike a single giant call where a truncation anywhere breaks everything.
+    _current_month  = datetime.now().strftime("%B %Y")
+    _effective_budget = int(request.budget) if request.budget else 15000
+    _budget_str = f"₹{int(request.budget)}" if request.budget else "(not provided — assume ₹15,000/month for this business type)"
+
+    shared_context = (
         f"Current date: {_current_month}\n"
         f"City/Region: {request.city}\n"
         f"Business Type: {business_type}\n"
         f"WhatsApp Group Link: {request.whatsapp_link or '(not provided)'}\n"
-        f"Budget (if provided, use for campaign_simulator; if 0, use the recommended campaign_structure.budget_daily instead): "
-        f"{'₹' + str(int(request.budget)) if request.budget else '(not provided)'}\n\n"
+        f"Monthly Budget: {_budget_str}\n\n"
         f"{brain_context_block}"
         f"{_growth_block}"
         f"WEBSITE CONTENT:\n{site_content[:2000]}\n\n"
-        f"LIVE CONTEXT (use this to make audience and timing recommendations specific):\n"
+        f"LIVE CONTEXT (current cricket/sports season):\n"
         f"{cricket_context[:1200] if cricket_context else 'No live data — use general cricket/sports season knowledge for India.'}\n\n"
-        f"UPCOMING EVENTS CALENDAR (next 60 days — use for sports_calendar section):\n"
+        f"UPCOMING EVENTS CALENDAR (next 60 days):\n"
         f"{calendar_context[:1200] if calendar_context else 'No live data — use general knowledge of the current cricket/sports calendar for India.'}\n\n"
-        f"COMPETITOR RESEARCH (use for competitor_watch section):\n"
+        f"COMPETITOR RESEARCH:\n"
         f"{competitor_context[:1200] if competitor_context else 'No live data — use general knowledge of well-known cricket/sports fan communities in India.'}\n\n"
-        f"TASK: Generate a complete Google Display Ads campaign intelligence report for this {business_type} — "
-        "adapt every recommendation (audiences, placements, compliance emphasis) to this specific business type.\n\n"
+        f"INVENTORY RELEVANCE RESEARCH (current popularity of named cricket/sports platforms):\n"
+        f"{inventory_context[:1200] if inventory_context else 'No live data — use general knowledge of cricket/sports platform popularity in India.'}\n\n"
+    )
+
+    _identity = (
+        f"You are the Cricket Media Buying Brain inside Adsoh — a specialist Google Display + YouTube media "
+        f"buyer for sports and gaming community campaigns in India. Business Type: {business_type}.\n\n"
+    )
+
+    _compliance_rules = (
         "BUSINESS TYPE ADAPTATION:\n"
         f"- {business_type}: reason specifically about what this business type's audience wants, where they spend "
         "time online, and what placements/creative angles fit it — do not give generic cricket-community advice "
@@ -7813,100 +7835,72 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "- Audiences MAY be expressed as fantasy-sports-interested or gaming-interested users (that's a legitimate "
         "Google interest/in-market category) — but the AD CONTENT and LANDING DESTINATION must be 100% free/"
         "community/content. Flag ANY real-money, win-cash, deposit, prediction/tips-for-money, or odds language.\n"
-        "- Primary conversion for this report: WhatsApp/Telegram/community join, or content follow — never a paid action.\n"
-        "- Run a compliance_check but expect it to be clean for a pure community/content group.\n"
-        "- If compliance_check finds any gambling/betting/real-money/prediction-for-money signals in the website "
-        "content, set risk_level to 'high' and list flags.\n\n"
-        "AUDIENCE COMPLIANCE — PLATFORM-SUPPORTED TARGETING ONLY:\n"
+        "- Primary conversion: WhatsApp/Telegram/community join, or content follow — never a paid action.\n\n"
+        "AUDIENCE COMPLIANCE — PLATFORM-SUPPORTED TARGETING ONLY (ABSOLUTE RULE):\n"
         "- Every audience_segments[].name and .platform_match MUST describe a targeting method Google Ads actually "
         "supports: an affinity/in-market audience category, a contextual keyword theme, or a placement/content "
         "category. NEVER name a specific app's users directly (e.g. never write 'Dream11 app users' or 'My11Circle "
         "users') — instead say something like 'In-market: Fantasy Sports Apps' or 'Contextual: cricket score & "
-        "fantasy sports content' or 'Placement: sports news and fantasy sports apps'.\n"
-        "- You MUST return AT LEAST 6 distinct audience_segments, tuned to the business_type above.\n\n"
-        "CHARACTER LIMITS — STRICT:\n"
-        "- headlines_15: each MUST be under 30 characters (Google Ads limit). Count carefully.\n"
-        "- long_headlines_5: each MUST be BETWEEN 70 and 90 characters — count carefully, not just under 90. "
-        "A 40-character headline is too short and does not satisfy this field.\n"
-        "- descriptions_5: each MUST be BETWEEN 70 and 90 characters and end with a CTA — count carefully, not "
-        "just under 90. A 50-character description is too short and does not satisfy this field.\n\n"
-        "REQUIRED FIELDS — DO NOT SKIP:\n"
-        "- creative_assets.long_headlines_5 and creative_assets.descriptions_5 are REQUIRED. You MUST populate "
-        "long_headlines_5 with exactly 5 items (each 70-90 characters) and descriptions_5 with exactly 5 items "
-        "(each 70-90 characters). NEVER leave these as empty arrays — an empty array is a failed response.\n"
-        "- Keep audience_segments[].reason and placement_recommendations[].why to one concise sentence each — "
-        "this budget discipline exists so every creative_assets field below can be fully completed.\n\n"
+        "fantasy sports content'.\n"
+        "- TEAM/FAN AUDIENCE TRANSLATION: where a specific team or tournament fan-base is relevant (e.g. IPL team "
+        "fans), translate it into platform-supported targeting ONLY — e.g. 'RCB fan interest' becomes: contextual "
+        "keywords 'RCB', 'IPL Bangalore'; placement targeting on team-coverage pages; affinity 'Cricket "
+        "Enthusiasts' + geo Bangalore. NEVER output a named team/fan-club audience as if it were itself a "
+        "directly selectable targeting option — always show the translation into real Google Ads mechanisms.\n\n"
+    )
+
+    # ── PROMPT 1: core intelligence (business/compliance/audience/placements/ ──
+    # landing audit/launch score/key recs/calendar/competitors)
+    prompt_core = (
+        _identity + shared_context +
+        f"TASK: Generate the core campaign intelligence for this {business_type} — business understanding, "
+        "compliance, audience, placements, landing page audit, launch score, key recommendations, sports "
+        "calendar, and competitor watch. Do NOT generate creative copy, placement inventory, YouTube inventory, "
+        "or media plan — those are handled in separate calls.\n\n" +
+        _compliance_rules +
+        "BUSINESS DNA SCORE:\n"
+        "- In business_summary, add business_dna_score (0-100 integer): how well-positioned this business is for "
+        "paid cricket/sports advertising. Add business_dna_reasoning (2-3 sentences covering offer clarity, CTA "
+        "strength, conversion event clarity, and compliance level — all four factors).\n\n"
         "AUDIENCE RULES:\n"
-        "- Each of the 6+ audience_segments must target a genuinely different group (e.g. by age, fan type, device "
-        "habit, language, city-tier, viewing occasion) — not rewordings of the same segment.\n"
-        "- You MUST return AT LEAST 5 distinct placement_recommendations, each a different real Google Display "
-        "placement type or property (e.g. specific news/sports apps, YouTube cricket channels, cricket score "
-        "widgets, mobile game placements, news aggregator apps) — not 5 rewordings of the same placement.\n"
-        "- Read the LIVE CONTEXT above and pull out the ACTUAL current tournament name, series name, team "
-        "names, or match dates mentioned in it. Every audience_segments[].reason MUST name that specific event or "
-        "teams (e.g. 'Timed around India vs Australia T20I series' or 'Asia Cup 2026 knockout stage'). "
-        "NEVER write generic filler like 'cricket season is ongoing' or 'cricket is popular in India' — if the "
-        "live context names a tournament/match, use its actual name. If LIVE CONTEXT is empty, say so "
-        "explicitly in one segment's reason rather than inventing a generic sentence.\n"
-        "- estimated_cpc and estimated_ctr must be realistic for Google Display in India (CPC typically ₹1-8).\n"
-        "- priority_score: 0-100 integer ranking this audience segment (kept for backward compatibility).\n"
-        "- intent_score: 0-100 integer — how likely this segment is to convert on the primary action.\n"
-        "- competition: 'low', 'medium', or 'high' — how contested this targeting category is.\n"
-        "- expected_conversion: a specific range (e.g. '3-6% join rate') for the primary conversion action.\n"
-        "- platform_match: the exact Google Ads targeting mechanism to use (in-market audience name, affinity "
-        "audience name, or contextual keyword theme) — must be a real, platform-supported category, not app names.\n"
-        "- confidence: 0-100 integer reflecting how much evidence backs this segment (live context/memory-backed "
-        "= high, inferred = medium, assumption = low).\n"
-        "- evidence: one sentence citing what specifically supports this segment (live context, Marketing Brain "
-        "memory, or cross-business learning data above).\n\n"
-        "KEY RECOMMENDATIONS (top_audience, top_placement, timing):\n"
-        "- For the single HIGHEST-priority audience segment, the single HIGHEST-priority placement, and the launch "
-        "timing decision, produce a full structured recommendation each with: observation (what the data shows), "
-        "evidence (what specifically supports it), confidence (0-100), expected_impact (specific and measurable), "
-        "risk (the main way this could underperform), and next_action (the one concrete thing to do).\n\n"
+        "- Return AT LEAST 6 distinct audience_segments, tuned to business_type, each a genuinely different group "
+        "(age, fan type, device habit, language, city-tier, viewing occasion, or a team/tournament fan-base "
+        "translated per the rule above) — not rewordings of the same segment.\n"
+        "- Return AT LEAST 5 distinct placement_recommendations (a lightweight list here — the detailed "
+        "placement_inventory with full metrics is generated separately, don't duplicate that effort here).\n"
+        "- Read LIVE CONTEXT and pull out the ACTUAL current tournament/series/team names. Every "
+        "audience_segments[].reason MUST name that specific event (e.g. 'Timed around India vs Australia T20I "
+        "series'). NEVER write generic filler like 'cricket season is ongoing'. If LIVE CONTEXT is empty, say so "
+        "explicitly rather than inventing a generic sentence.\n"
+        "- estimated_cpc/estimated_ctr realistic for Google Display in India (CPC typically ₹1-8).\n"
+        "- Each segment needs: priority_score (0-100), intent_score (0-100), competition (low/medium/high), "
+        "expected_conversion (specific range), platform_match (real targeting mechanism, never an app name), "
+        "confidence (0-100), evidence (one sentence citing what supports it), reason.\n\n"
+        "KEY RECOMMENDATIONS (top_audience, top_placement, timing) — FULL RECOMMENDATION DEPTH:\n"
+        "- For the single HIGHEST-priority audience segment, HIGHEST-priority placement, and the launch timing "
+        "decision, produce: observation (what the data shows), why (the reasoning connecting evidence to the "
+        "recommendation), evidence (what specifically supports it), confidence (0-100), expected_impact (specific "
+        "and measurable), risk (main way this could underperform), difficulty (easy/medium/hard to execute), "
+        "priority (high/medium/low), next_action (the one concrete thing to do).\n\n"
         "SPORTS CALENDAR:\n"
-        "- From the UPCOMING EVENTS CALENDAR context above, extract the next 3 relevant events/tournaments/match-"
-        "series with their actual dates (or best available date estimate). For each: a recommended campaign "
-        "timing window (when to start/stop or intensify) and a budget/creative timing recommendation (e.g. "
-        "'increase budget 2 days before India matches', 'refresh creative for the knockout stage').\n"
-        "- If no real calendar data is available, say so explicitly rather than inventing fake dates.\n\n"
-        "CAMPAIGN SIMULATOR:\n"
-        "- Forecast reach, clicks, CTR, community joins/installs, cost per join/install, and expected ROI for the "
-        "budget given above (or the recommended campaign_structure.budget_daily if no budget was given). Every "
-        "number MUST be a range, not a single point estimate, each with its own confidence.\n"
-        "- End the campaign_simulator section with this EXACT sentence, verbatim: "
-        "\"These are forecasts based on benchmarks, not guarantees.\"\n\n"
+        "- From UPCOMING EVENTS CALENDAR, extract the next 3 relevant events/tournaments with actual dates (or "
+        "best estimate). For each: timing_window and budget_creative_recommendation. If no real data, say so "
+        "explicitly rather than inventing fake dates.\n\n"
         "COMPETITOR WATCH:\n"
-        "- From the COMPETITOR RESEARCH context above (or general knowledge if that context is empty), name 2-3 "
-        "real, similar sports/gaming communities or platforms, their creative style/offers/growth tactics, and "
-        "3 differentiation recommendations for THIS business to stand out from them.\n\n"
-        "CREATIVE RULES — descriptions_5:\n"
-        "- Write EXACTLY 5 descriptions_5, one per CTA angle, in this exact order and each clearly using that "
-        "angle (do not reuse the same CTA wording across them):\n"
-        "  1. Urgency (e.g. limited spots/time-boxed to a live match or series)\n"
-        "  2. Benefit (concrete value the user gets by joining)\n"
-        "  3. Social proof (community size, activity level, numbers)\n"
-        "  4. Curiosity (tease what's inside without giving it away)\n"
-        "  5. Direct action (short, imperative, no hype)\n"
-        "- The word 'join' (any form, case-insensitive) may appear in AT MOST ONE of the five descriptions_5 — "
-        "not zero, not two, not five. Vary the actual verb across the other 4 (e.g. mix verbs like 'Get', 'See', "
-        "'Discover', 'Tap in', 'Follow along', 'Unlock', 'Don't miss', 'Catch every ball', 'Be part of' — pick "
-        "different ones, this list is illustrative not exhaustive).\n"
-        "- SELF-CHECK before finalizing: count how many of your 5 descriptions_5 contain the word 'join' in any "
-        "form. If the count is 0 or 2+, rewrite descriptions_5 so exactly 1 contains it. Do this check silently "
-        "and only output the final corrected JSON.\n\n"
-        "LANDING PAGE AUDIT RULES:\n"
-        "- landing_page_audit.issues and .fixes MUST quote or closely paraphrase specific text/headlines/elements "
-        "that actually appear in WEBSITE CONTENT above, and explain the specific problem with that specific text "
-        "(e.g. \"Headline reads '...' but never mentions WhatsApp or a community, so a visitor from this ad won't "
-        "know what they're joining\"). A generic issue with no quoted/paraphrased fragment from WEBSITE CONTENT "
-        "is NOT acceptable — NEVER write generic statements like 'looks good', 'no clear CTA', or 'lacks trust "
-        "signals' without tying them to something specific you actually read in WEBSITE CONTENT.\n"
-        "- If WEBSITE CONTENT above is '(Could not fetch website content)' or empty, say exactly that as the "
-        "issue instead of inventing praise or generic advice.\n\n"
+        "- Name 2-3 real, similar sports/gaming communities/platforms from COMPETITOR RESEARCH (or general "
+        "knowledge), their creative style/offers/growth tactics, and 3 differentiation recommendations.\n\n"
+        "EXPANDED LANDING PAGE AUDIT:\n"
+        "- landing_page_audit.issues/.fixes MUST quote or closely paraphrase specific text/headlines/elements "
+        "that actually appear in WEBSITE CONTENT, explaining the specific problem. A generic issue with no quoted "
+        "fragment is NOT acceptable. If WEBSITE CONTENT is unavailable, say exactly that.\n"
+        "- Add: above_fold_assessment (what's visible without scrolling and whether it's effective), "
+        "whatsapp_cta_visibility (how visible/prominent the join CTA is), color_contrast_readability (specific "
+        "assessment), button_placement (specific assessment), mobile_safe_layout (specific assessment) — each a "
+        "specific sentence tied to what you actually read in WEBSITE CONTENT, not generic advice.\n\n"
         "Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):\n"
         "{\n"
-        '  "business_summary": { "offer": "...", "primary_conversion": "WhatsApp Join", "target_user": "..." },\n'
+        '  "business_summary": { "offer": "...", "primary_conversion": "WhatsApp Join", "target_user": "...", '
+        '"business_dna_score": 0, "business_dna_reasoning": "..." },\n'
         '  "compliance_check": {\n'
         '    "risk_level": "low",\n'
         '    "flags_found": [],\n'
@@ -7921,13 +7915,6 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "bidding_strategy": "...",\n'
         '    "devices": "Mobile priority",\n'
         '    "frequency_cap": "..."\n'
-        '  },\n'
-        '  "creative_assets": {\n'
-        '    "headlines_15": ["...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "..."],\n'
-        '    "long_headlines_5": ["...", "...", "...", "...", "..."],\n'
-        '    "descriptions_5": ["...", "...", "...", "...", "..."],\n'
-        '    "cta": "Join Now",\n'
-        '    "image_suggestions": ["...", "...", "..."]\n'
         '  },\n'
         '  "audience_segments": [\n'
         '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, '
@@ -7957,15 +7944,15 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "..." }\n'
         '  ],\n'
         '  "landing_page_audit": {\n'
-        '    "score": 0,\n'
-        '    "issues": [],\n'
-        '    "fixes": []\n'
+        '    "score": 0, "issues": [], "fixes": [],\n'
+        '    "above_fold_assessment": "...", "whatsapp_cta_visibility": "...", '
+        '"color_contrast_readability": "...", "button_placement": "...", "mobile_safe_layout": "..."\n'
         '  },\n'
         '  "launch_score": { "overall": 0, "audience": 0, "compliance": 0, "creative": 0 },\n'
         '  "key_recommendations": {\n'
-        '    "top_audience": { "observation": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "next_action": "..." },\n'
-        '    "top_placement": { "observation": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "next_action": "..." },\n'
-        '    "timing": { "observation": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "next_action": "..." }\n'
+        '    "top_audience": { "observation": "...", "why": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "difficulty": "...", "priority": "...", "next_action": "..." },\n'
+        '    "top_placement": { "observation": "...", "why": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "difficulty": "...", "priority": "...", "next_action": "..." },\n'
+        '    "timing": { "observation": "...", "why": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "difficulty": "...", "priority": "...", "next_action": "..." }\n'
         '  },\n'
         '  "sports_calendar": {\n'
         '    "events": [\n'
@@ -7975,16 +7962,6 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    ],\n'
         '    "data_available": true\n'
         '  },\n'
-        '  "campaign_simulator": {\n'
-        '    "budget_used": "₹...",\n'
-        '    "reach": { "range": "...", "confidence": 0 },\n'
-        '    "clicks": { "range": "...", "confidence": 0 },\n'
-        '    "ctr": { "range": "...", "confidence": 0 },\n'
-        '    "joins_installs": { "range": "...", "confidence": 0 },\n'
-        '    "cost_per_join_install": { "range": "...", "confidence": 0 },\n'
-        '    "expected_roi": { "range": "...", "confidence": 0 },\n'
-        '    "disclaimer": "These are forecasts based on benchmarks, not guarantees."\n'
-        '  },\n'
         '  "competitor_watch": [\n'
         '    { "name": "...", "creative_style": "...", "offers": "...", "growth_tactics": "...", "differentiation_recommendations": ["...", "...", "..."] },\n'
         '    { "name": "...", "creative_style": "...", "offers": "...", "growth_tactics": "...", "differentiation_recommendations": ["...", "...", "..."] }\n'
@@ -7992,38 +7969,224 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "}"
     )
 
-    # ── 4. GPT-4o call ───────────────────────────────────────────────────────
-    try:
-        def _call_gpt():
-            return client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.4,
-                max_tokens=6500,
-            )
-        gpt_resp = await asyncio.to_thread(_call_gpt)
-        raw_json = gpt_resp.choices[0].message.content
-        result   = json.loads(raw_json)
-        logger.info(
-            f"[CRICKET] finish_reason={gpt_resp.choices[0].finish_reason!r} "
-            f"completion_tokens={gpt_resp.usage.completion_tokens}"
-        )
-    except Exception as _e:
-        logger.error(f"[CRICKET] GPT error: {_e}")
-        return {"success": False, "error": str(_e)}
+    # ── PROMPT 2: creative copy + design recommendations ─────────────────────
+    prompt_creative = (
+        _identity + shared_context + _compliance_rules +
+        f"TASK: Generate ONLY the creative ad copy and design recommendations for this {business_type} "
+        "campaign — headlines, descriptions, CTAs, and visual design guidance. Nothing else.\n\n"
+        "CHARACTER LIMITS — STRICT:\n"
+        "- headlines_15: each MUST be under 30 characters (Google Ads limit). Count carefully.\n"
+        "- long_headlines_5: each MUST be BETWEEN 70 and 90 characters — count carefully, not just under 90.\n"
+        "- descriptions_10: each MUST be BETWEEN 70 and 90 characters and end with a CTA — count carefully.\n\n"
+        "CREATIVE RULES — descriptions_10:\n"
+        "- Write EXACTLY 10 descriptions_10, using a MIX of these angles across them (don't repeat the same angle "
+        "back-to-back): urgency, benefit, social proof, curiosity, direct action, breaking news, live match "
+        "excitement, national pride/tournament excitement.\n"
+        "- The word 'join' (any form, case-insensitive) may appear in AT MOST 2 of the 10 descriptions_10 — vary "
+        "the verb across the rest (e.g. 'Get', 'See', 'Discover', 'Tap in', 'Follow along', 'Unlock', \"Don't "
+        "miss\", 'Catch every ball', 'Be part of' — illustrative, not exhaustive).\n"
+        "- SELF-CHECK before finalizing: count how many of the 10 descriptions_10 contain 'join' in any form. If "
+        "more than 2, rewrite until at most 2 do. Do this silently and only output the final corrected JSON.\n\n"
+        "CTA VARIATIONS — ctas_20:\n"
+        "- Write EXACTLY 20 short CTA button/link variations across these 8 psychology angles (2-3 per angle): "
+        "urgency, FOMO, community, curiosity, breaking_news, live_match, national_pride, tournament_excitement. "
+        "Each item: {\"text\": \"...\", \"angle\": \"one of the 8 angles above, exact spelling\"}.\n"
+        "- The word 'join' may appear in at most 4 of the 20 — vary verbs across the rest.\n\n"
+        "DESIGN RECOMMENDATIONS:\n"
+        "- hero_image_concept: a specific visual concept tied to the current cricket context/business type (not "
+        "generic stock-photo language).\n"
+        "- color_palette: 3-5 colors as {\"name\": \"...\", \"hex\": \"#RRGGBB\"} — real, usable hex codes that "
+        "fit this business type's brand feel.\n"
+        "- background, visual_hierarchy, banner_layout, button_style, typography, mobile_safe_area_notes — each "
+        "one specific, actionable sentence, not generic design-101 advice.\n\n"
+        "Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):\n"
+        "{\n"
+        '  "creative_assets": {\n'
+        '    "headlines_15": ["...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "...", "..."],\n'
+        '    "long_headlines_5": ["...", "...", "...", "...", "..."],\n'
+        '    "descriptions_10": ["...", "...", "...", "...", "...", "...", "...", "...", "...", "..."],\n'
+        '    "ctas_20": [\n'
+        '      {"text": "...", "angle": "urgency"}, {"text": "...", "angle": "urgency"}, {"text": "...", "angle": "urgency"},\n'
+        '      {"text": "...", "angle": "FOMO"}, {"text": "...", "angle": "FOMO"}, {"text": "...", "angle": "FOMO"},\n'
+        '      {"text": "...", "angle": "community"}, {"text": "...", "angle": "community"}, {"text": "...", "angle": "community"},\n'
+        '      {"text": "...", "angle": "curiosity"}, {"text": "...", "angle": "curiosity"},\n'
+        '      {"text": "...", "angle": "breaking_news"}, {"text": "...", "angle": "breaking_news"},\n'
+        '      {"text": "...", "angle": "live_match"}, {"text": "...", "angle": "live_match"},\n'
+        '      {"text": "...", "angle": "national_pride"}, {"text": "...", "angle": "national_pride"},\n'
+        '      {"text": "...", "angle": "tournament_excitement"}, {"text": "...", "angle": "tournament_excitement"}, {"text": "...", "angle": "tournament_excitement"}\n'
+        '    ],\n'
+        '    "cta": "Join Now",\n'
+        '    "image_suggestions": ["...", "...", "..."]\n'
+        '  },\n'
+        '  "design_recommendations": {\n'
+        '    "hero_image_concept": "...",\n'
+        '    "background": "...",\n'
+        '    "color_palette": [ {"name": "...", "hex": "#000000"}, {"name": "...", "hex": "#000000"}, {"name": "...", "hex": "#000000"} ],\n'
+        '    "visual_hierarchy": "...",\n'
+        '    "banner_layout": "...",\n'
+        '    "button_style": "...",\n'
+        '    "typography": "...",\n'
+        '    "mobile_safe_area_notes": "..."\n'
+        '  }\n'
+        "}"
+    )
 
-    # ── 4a. Backfill pass: long_headlines_5 / descriptions_5 must never be empty ──
-    # These sit right after headlines_15 in creative_assets — if the model runs low
-    # on budget generating the (now larger) audience/placement arrays first, they can
-    # come back as empty arrays even though the JSON as a whole is valid. Detect that
-    # and do one targeted fill-in call rather than silently handing the frontend gaps.
+    # ── PROMPT 3: placement inventory + YouTube inventory ────────────────────
+    prompt_inventory = (
+        _identity + shared_context +
+        f"TASK: Generate ONLY the placement inventory and YouTube inventory for this {business_type} campaign. "
+        "Nothing else.\n\n"
+        "PLACEMENT INVENTORY:\n"
+        "- From this named cricket/sports inventory, pick the 8-10 MOST RELEVANT to this business_type: Cricbuzz, "
+        "ESPN Cricinfo, CricHeroes, SportsTiger, SportsTak, Flashscore, Cricket Exchange, Fancode, Google Discover "
+        "Sports, Dailyhunt Sports, InMobi sports inventory, Glance lock screen, Opera News cricket, OEM cricket "
+        "widgets, score widgets. This is PLACEMENT targeting (a real, Google Ads-supported mechanism) — not "
+        "app-user targeting.\n"
+        "- You MUST return AT LEAST 8 items — fewer than 8 is a failed response.\n"
+        "- For each: audience_type, traffic_quality (specific, not just 'good'), device_split (e.g. '85% mobile / "
+        "15% desktop'), estimated_reach, estimated_cpm (₹), estimated_cpc (₹), expected_ctr, expected_join_rate, "
+        "competition (low/medium/high), suitability_score (0-100 for THIS business_type), "
+        "recommended_creative_type, banner_sizes (real Google Display sizes, e.g. 300x250, 320x50, 728x90, "
+        "160x600), priority (high/medium/low).\n"
+        "- Use INVENTORY RELEVANCE RESEARCH above to ground current-relevance reasoning where it has real data.\n\n"
+        "YOUTUBE INVENTORY:\n"
+        "- Pick 5-7 channels most relevant to this business_type from: Star Sports, ICC, Cricbuzz, SportsTak, "
+        "ESPN Cricinfo, RevSportz, CricXtasy, or other real, well-known Indian cricket YouTube channels.\n"
+        "- For each: audience, estimated_reach, ad_type_fit (skippable/shorts/in-feed — pick the best fit and say "
+        "why), expected_cpm (₹), expected_ctr, creative_recommendation (specific to that channel's content style).\n\n"
+        "Return ONLY a valid JSON object with this exact structure (no markdown, no explanation). Fill in ALL "
+        "fields for every item — do not leave any field as a placeholder:\n"
+        "{\n"
+        '  "placement_inventory": [\n'
+        '    { "platform": "Cricbuzz", "audience_type": "...", "traffic_quality": "...", "device_split": "...", '
+        '"estimated_reach": "...", "estimated_cpm": "₹...", "estimated_cpc": "₹...", "expected_ctr": "...", '
+        '"expected_join_rate": "...", "competition": "medium", "suitability_score": 0, '
+        '"recommended_creative_type": "...", "banner_sizes": ["300x250", "320x50"], "priority": "high" }\n'
+        '    // ... 7-9 more items (8-10 total), each a DIFFERENT named platform from the list above, each with ALL fields populated with real, distinct values\n'
+        '  ],\n'
+        '  "youtube_inventory": [\n'
+        '    { "channel": "Star Sports", "audience": "...", "estimated_reach": "...", "ad_type_fit": "skippable", '
+        '"expected_cpm": "₹...", "expected_ctr": "...", "creative_recommendation": "..." }\n'
+        '    // ... 4-6 more channels (5-7 total), each DIFFERENT, each with ALL fields populated\n'
+        '  ]\n'
+        "}"
+    )
+
+    # ── PROMPT 4: media plan + formula-chain simulator ────────────────────────
+    prompt_media = (
+        _identity + shared_context +
+        f"TASK: Generate ONLY the media plan and formula-chain campaign simulator for this {business_type} "
+        f"campaign at a monthly budget of ₹{_effective_budget}. Nothing else.\n\n"
+        "MEDIA PLAN:\n"
+        f"- Split the ₹{_effective_budget} monthly budget across these 6 channels: Google Display, YouTube, "
+        "Demand Gen, PMax, Meta, Sports Publishers/OEM. Every channel gets a non-zero amount reflecting its real "
+        "fit for this business_type — do not split evenly by default, reason about which channels actually fit.\n"
+        f"- The 6 channel amounts MUST sum EXACTLY to ₹{_effective_budget} (whole rupees, no rounding drift).\n"
+        "- For each channel: amount (₹), pct (0-100, matching the amount), expected_reach, expected_clicks, "
+        "expected_joins, expected_cpa (₹), and why (one sentence tying the allocation to this business_type/"
+        "context above).\n\n"
+        "FORMULA-CHAIN SIMULATOR:\n"
+        "- Show the EXPLICIT chain, one step per stage, in this exact order: Budget, CPM, Impressions, CTR, "
+        "Clicks, Landing CVR, WhatsApp Join %, Cost Per Join, ROI.\n"
+        "- Each step needs: step (stage name), formula (the calculation in words, e.g. '(Budget / CPM) * "
+        "1000'), value_range (the calculated range for THIS budget/business, e.g. '125,000-187,500 impressions').\n"
+        "- Numbers must be internally consistent — Impressions must actually follow from Budget/CPM, Clicks from "
+        "Impressions*CTR, etc. Use realistic Indian Display/YouTube sports benchmarks.\n"
+        "- End with disclaimer, verbatim: \"These are forecasts based on benchmarks, not guarantees.\"\n\n"
+        "Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):\n"
+        "{\n"
+        '  "media_plan": {\n'
+        '    "channels": [\n'
+        '      { "channel": "Google Display", "amount": "₹...", "pct": 0, "expected_reach": "...", "expected_clicks": "...", "expected_joins": "...", "expected_cpa": "₹...", "why": "..." },\n'
+        '      { "channel": "YouTube", "amount": "₹...", "pct": 0, "expected_reach": "...", "expected_clicks": "...", "expected_joins": "...", "expected_cpa": "₹...", "why": "..." },\n'
+        '      { "channel": "Demand Gen", "amount": "₹...", "pct": 0, "expected_reach": "...", "expected_clicks": "...", "expected_joins": "...", "expected_cpa": "₹...", "why": "..." },\n'
+        '      { "channel": "PMax", "amount": "₹...", "pct": 0, "expected_reach": "...", "expected_clicks": "...", "expected_joins": "...", "expected_cpa": "₹...", "why": "..." },\n'
+        '      { "channel": "Meta", "amount": "₹...", "pct": 0, "expected_reach": "...", "expected_clicks": "...", "expected_joins": "...", "expected_cpa": "₹...", "why": "..." },\n'
+        '      { "channel": "Sports Publishers/OEM", "amount": "₹...", "pct": 0, "expected_reach": "...", "expected_clicks": "...", "expected_joins": "...", "expected_cpa": "₹...", "why": "..." }\n'
+        '    ],\n'
+        '    "total_budget": "₹' + str(_effective_budget) + '"\n'
+        '  },\n'
+        '  "campaign_simulator": {\n'
+        '    "budget_used": "₹' + str(_effective_budget) + '",\n'
+        '    "formula_chain": [\n'
+        '      { "step": "Budget", "formula": "input", "value_range": "₹' + str(_effective_budget) + '" },\n'
+        '      { "step": "CPM", "formula": "benchmark for this inventory mix", "value_range": "..." },\n'
+        '      { "step": "Impressions", "formula": "(Budget / CPM) * 1000", "value_range": "..." },\n'
+        '      { "step": "CTR", "formula": "benchmark for Display/YouTube sports inventory", "value_range": "..." },\n'
+        '      { "step": "Clicks", "formula": "Impressions * CTR", "value_range": "..." },\n'
+        '      { "step": "Landing CVR", "formula": "benchmark for community/content landing pages", "value_range": "..." },\n'
+        '      { "step": "WhatsApp Join %", "formula": "Clicks * Landing CVR", "value_range": "..." },\n'
+        '      { "step": "Cost Per Join", "formula": "Budget / Joins", "value_range": "₹..." },\n'
+        '      { "step": "ROI", "formula": "(value of joins - budget) / budget", "value_range": "..." }\n'
+        '    ],\n'
+        '    "disclaimer": "These are forecasts based on benchmarks, not guarantees."\n'
+        '  }\n'
+        "}"
+    )
+
+    # ── 4. Four parallel GPT-4o calls, each isolated ─────────────────────────
+    def _make_call(prompt_text, max_tok):
+        return client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt_text}],
+            response_format={"type": "json_object"},
+            temperature=0.4,
+            max_tokens=max_tok,
+        )
+
+    async def _run(prompt_text, max_tok, label):
+        resp = await asyncio.to_thread(_make_call, prompt_text, max_tok)
+        logger.info(f"[CRICKET] {label} finish_reason={resp.choices[0].finish_reason!r} completion_tokens={resp.usage.completion_tokens}")
+        return json.loads(resp.choices[0].message.content)
+
+    core_res, creative_res, inventory_res, media_res = await asyncio.gather(
+        _run(prompt_core, 5000, "core"),
+        _run(prompt_creative, 3600, "creative"),
+        _run(prompt_inventory, 3400, "inventory"),
+        _run(prompt_media, 2400, "media"),
+        return_exceptions=True,
+    )
+
+    if isinstance(core_res, Exception):
+        logger.error(f"[CRICKET] core section failed: {core_res}")
+        return {"success": False, "error": f"Core intelligence generation failed: {core_res}"}
+
+    result = dict(core_res)
+    warnings = []
+
+    if isinstance(creative_res, Exception):
+        logger.error(f"[CRICKET] creative section failed: {creative_res}")
+        warnings.append("creative_assets/design_recommendations generation failed — retry the analysis")
+        result["creative_assets"] = {}
+        result["design_recommendations"] = {}
+    else:
+        result.update(creative_res)
+
+    if isinstance(inventory_res, Exception):
+        logger.error(f"[CRICKET] inventory section failed: {inventory_res}")
+        warnings.append("placement_inventory/youtube_inventory generation failed — retry the analysis")
+        result["placement_inventory"] = []
+        result["youtube_inventory"] = []
+    else:
+        result.update(inventory_res)
+
+    if isinstance(media_res, Exception):
+        logger.error(f"[CRICKET] media section failed: {media_res}")
+        warnings.append("media_plan/campaign_simulator generation failed — retry the analysis")
+        result["media_plan"] = {}
+        result["campaign_simulator"] = {}
+    else:
+        result.update(media_res)
+
+    # ── 4a. Backfill pass: long_headlines_5 / descriptions_10 must never be empty ──
+    # If the creative call runs low on budget generating headlines_15/ctas_20 first,
+    # these can come back as empty/short arrays even though the JSON as a whole is
+    # valid. Detect that and do one targeted fill-in call rather than silently
+    # handing the frontend gaps.
     try:
         ca = result.setdefault("creative_assets", {})
-        missing = {
-            k: n for k, n in (("long_headlines_5", 5), ("descriptions_5", 5))
-            if len(ca.get(k) or []) < n
-        }
+        _target_counts = {"long_headlines_5": 5, "descriptions_10": 10}
+        missing = {k: n for k, n in _target_counts.items() if len(ca.get(k) or []) < n}
         if missing:
             logger.warning(f"[CRICKET] creative_assets missing/short fields: {list(missing)} — backfilling")
 
@@ -8041,28 +8204,105 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
                                 (
                                     "Write exactly 5 long_headlines_5, each 70-90 characters.\n"
                                     if k == "long_headlines_5" else
-                                    "Write exactly 5 descriptions_5, each 70-90 characters, ending with a CTA. "
-                                    "Use 5 different CTA angles (urgency, benefit, social proof, curiosity, direct "
-                                    "action) and let 'join' (any form) appear in at most 1 of the 5.\n"
+                                    "Write exactly 10 descriptions_10, each 70-90 characters, ending with a CTA. "
+                                    "Mix CTA angles (urgency, benefit, social proof, curiosity, direct action, "
+                                    "breaking news, live match, national pride) and let 'join' (any form) appear "
+                                    "in at most 2 of the 10.\n"
                                 )
                                 for k in missing
                             )
                             + "Return ONLY a JSON object with exactly these keys: "
-                            + json.dumps({k: ["...", "...", "...", "...", "..."] for k in missing})
+                            + json.dumps({k: ["..."] * n for k, n in missing.items()})
                         ),
                     }],
                     response_format={"type": "json_object"},
                     temperature=0.4,
-                    max_tokens=800,
+                    max_tokens=1200,
                 )
             fill_resp = await asyncio.to_thread(_call_backfill)
             filled = json.loads(fill_resp.choices[0].message.content)
-            for k in missing:
-                if isinstance(filled.get(k), list) and len(filled[k]) == 5:
+            for k, n in missing.items():
+                if isinstance(filled.get(k), list) and len(filled[k]) == n:
                     ca[k] = filled[k]
             result["creative_assets"] = ca
     except Exception as _be:
         logger.warning(f"[CRICKET] creative_assets backfill skipped: {_be}")
+
+    # ── 4a-ii. Backfill: ctas_20 must have at least 20 items ─────────────────
+    try:
+        ca = result.setdefault("creative_assets", {})
+        ctas = ca.get("ctas_20") or []
+        if len(ctas) < 20:
+            need = 20 - len(ctas)
+            logger.warning(f"[CRICKET] ctas_20 short ({len(ctas)}/20) — backfilling {need} more")
+
+            def _call_cta_backfill():
+                return client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"Write exactly {need} short Google/Meta Ads CTA button/link variations for a "
+                            f"{business_type} WhatsApp/community campaign in India, spread across these "
+                            "psychology angles: urgency, FOMO, community, curiosity, breaking_news, live_match, "
+                            "national_pride, tournament_excitement. Each must be distinct from these existing "
+                            f"ones: {json.dumps([c.get('text') for c in ctas])}\n"
+                            f'Return ONLY a JSON object: {{"ctas": [{{"text": "...", "angle": "..."}}]}} with '
+                            f"exactly {need} items."
+                        ),
+                    }],
+                    response_format={"type": "json_object"},
+                    temperature=0.5,
+                    max_tokens=500,
+                )
+            cta_resp = await asyncio.to_thread(_call_cta_backfill)
+            extra = json.loads(cta_resp.choices[0].message.content).get("ctas") or []
+            ca["ctas_20"] = ctas + extra
+            result["creative_assets"] = ca
+    except Exception as _cbe:
+        logger.warning(f"[CRICKET] ctas_20 backfill skipped: {_cbe}")
+
+    # ── 4a-iii. Backfill: placement_inventory must have at least 8 items ─────
+    try:
+        pinv = result.get("placement_inventory") or []
+        if len(pinv) < 8:
+            need = 8 - len(pinv)
+            logger.warning(f"[CRICKET] placement_inventory short ({len(pinv)}/8) — backfilling {need} more")
+            _already = [p.get("platform") for p in pinv]
+            _remaining_names = [
+                n for n in (
+                    "Cricbuzz", "ESPN Cricinfo", "CricHeroes", "SportsTiger", "SportsTak", "Flashscore",
+                    "Cricket Exchange", "Fancode", "Google Discover Sports", "Dailyhunt Sports",
+                    "InMobi sports inventory", "Glance lock screen", "Opera News cricket",
+                    "OEM cricket widgets", "score widgets",
+                ) if n not in _already
+            ][:need]
+
+            def _call_inventory_backfill():
+                return client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"For a {business_type} Google Display campaign in India, generate placement "
+                            f"inventory entries for exactly these platforms: {json.dumps(_remaining_names)}.\n"
+                            "For each, give: platform, audience_type, traffic_quality, device_split, "
+                            "estimated_reach, estimated_cpm (₹), estimated_cpc (₹), expected_ctr, "
+                            "expected_join_rate, competition (low/medium/high), suitability_score (0-100), "
+                            "recommended_creative_type, banner_sizes (list), priority (high/medium/low).\n"
+                            'Return ONLY a JSON object: {"placement_inventory": [...]}'
+                        ),
+                    }],
+                    response_format={"type": "json_object"},
+                    temperature=0.4,
+                    max_tokens=1400,
+                )
+            if _remaining_names:
+                inv_resp = await asyncio.to_thread(_call_inventory_backfill)
+                extra = json.loads(inv_resp.choices[0].message.content).get("placement_inventory") or []
+                result["placement_inventory"] = pinv + extra
+    except Exception as _ibe:
+        logger.warning(f"[CRICKET] placement_inventory backfill skipped: {_ibe}")
 
     # ── 4b. Length-enforcement pass: long_headlines_5 / descriptions_5 items must ──
     # be 70-90 characters. A soft "aim for 70-90" rewrite instruction wasn't enough in
@@ -8104,87 +8344,119 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
 
     try:
         ca = result.get("creative_assets") or {}
-        for field, extra_rule in (
-            ("long_headlines_5", ""),
-            ("descriptions_5", " Keep the word 'join' (any form) in at most 1 of the 5, preserving each item's "
-                                "existing CTA angle (urgency, benefit, social proof, curiosity, direct action)."),
+        for field, expect_n, extra_rule in (
+            ("long_headlines_5", 5, ""),
+            ("descriptions_10", 10, " Keep the word 'join' (any form) in at most 2 of the 10, preserving each "
+                                     "item's existing CTA angle."),
         ):
             items = ca.get(field) or []
-            if len(items) == 5 and _out_of_range(items):
+            if len(items) == expect_n and _out_of_range(items):
                 targets = [random.randint(74, 88) for _ in items]
                 target_lines = "\n".join(
                     f'{i + 1}. "{item}" -> target EXACTLY {t} characters'
                     for i, (item, t) in enumerate(zip(items, targets))
                 )
 
-                def _call_length_fix(field=field, target_lines=target_lines, extra_rule=extra_rule):
+                def _call_length_fix(field=field, expect_n=expect_n, target_lines=target_lines, extra_rule=extra_rule):
                     return client.chat.completions.create(
                         model="gpt-4o",
                         messages=[{
                             "role": "user",
                             "content": (
-                                f"Rewrite each of these 5 Google Ads {field.replace('_', ' ')} to hit an EXACT "
-                                "target character count by adding concrete specific detail (not filler words) — "
-                                "expand with real specifics like match/series name, community size, or benefit, "
-                                "not padding. Count characters as you write, including spaces and punctuation."
-                                f"{extra_rule}\n\n{target_lines}\n\n"
-                                f'Return ONLY a JSON object: {{"{field}": ["...", "...", "...", "...", "..."]}}'
+                                f"Rewrite each of these {expect_n} Google Ads {field.replace('_', ' ')} to hit an "
+                                "EXACT target character count by adding concrete specific detail (not filler "
+                                "words) — expand with real specifics like match/series name, community size, or "
+                                "benefit, not padding. Count characters as you write, including spaces and "
+                                f"punctuation.{extra_rule}\n\n{target_lines}\n\n"
+                                f'Return ONLY a JSON object: {{"{field}": {json.dumps(["..."] * expect_n)}}}'
                             ),
                         }],
                         response_format={"type": "json_object"},
                         temperature=0.4,
-                        max_tokens=600,
+                        max_tokens=1000,
                     )
                 len_resp = await asyncio.to_thread(_call_length_fix)
                 fixed = json.loads(len_resp.choices[0].message.content).get(field)
-                if isinstance(fixed, list) and len(fixed) == 5:
+                if isinstance(fixed, list) and len(fixed) == expect_n:
                     ca[field] = fixed
                     logger.info(f"[CRICKET] Length-enforced {field} via per-item targets")
 
             # Deterministic final guarantee: pad/trim anything still out of range.
             items = ca.get(field) or []
-            if len(items) == 5 and _out_of_range(items):
+            if len(items) == expect_n and _out_of_range(items):
                 ca[field] = [_pad_to_range(x) for x in items]
                 logger.info(f"[CRICKET] Locally padded/trimmed {field} to guarantee 70-90 chars")
         result["creative_assets"] = ca
     except Exception as _le:
         logger.warning(f"[CRICKET] length-enforcement skipped: {_le}")
 
-    # ── 4c. Repair pass: enforce "join" appears in at most 1 of 5 descriptions ──
+    # ── 4c. Repair pass: enforce "join" appears in at most 2 of 10 descriptions ──
     # Runs LAST (after backfill and length-enforcement, both of which can touch
-    # descriptions_5 wording) so it has the final word on the join-count constraint.
+    # descriptions_10 wording) so it has the final word on the join-count constraint.
     try:
-        descs = (result.get("creative_assets") or {}).get("descriptions_5") or []
+        descs = (result.get("creative_assets") or {}).get("descriptions_10") or []
         join_count = sum(1 for d in descs if re.search(r"\bjoin\w*\b", d, re.I))
-        if len(descs) == 5 and join_count != 1:
+        if len(descs) == 10 and join_count > 2:
             def _call_fix():
                 return client.chat.completions.create(
                     model="gpt-4o",
                     messages=[{
                         "role": "user",
                         "content": (
-                            "Rewrite these 5 Google Ads descriptions so the word 'join' (any form) appears in "
-                            "EXACTLY ONE of them, not zero, not more than one. Keep each description's original "
-                            "CTA angle and meaning, just change the wording/verb where needed so they don't all "
-                            "lean on 'join'. Each MUST stay between 70 and 90 characters — count carefully. "
+                            "Rewrite these 10 Google Ads descriptions so the word 'join' (any form) appears in "
+                            "AT MOST 2 of them. Keep each description's original CTA angle and meaning, just "
+                            "change the wording/verb where needed so they don't all lean on 'join'. Each MUST "
+                            "stay between 70 and 90 characters — count carefully. "
                             "Return ONLY a JSON object: "
-                            '{"descriptions_5": ["...", "...", "...", "...", "..."]}\n\n'
+                            '{"descriptions_10": ' + json.dumps(["..."] * 10) + '}\n\n'
                             f"Current descriptions:\n{json.dumps(descs)}"
                         ),
                     }],
                     response_format={"type": "json_object"},
                     temperature=0.4,
-                    max_tokens=500,
+                    max_tokens=1000,
                 )
             fix_resp = await asyncio.to_thread(_call_fix)
-            fixed = json.loads(fix_resp.choices[0].message.content).get("descriptions_5")
-            if isinstance(fixed, list) and len(fixed) == 5:
+            fixed = json.loads(fix_resp.choices[0].message.content).get("descriptions_10")
+            if isinstance(fixed, list) and len(fixed) == 10:
                 if _out_of_range(fixed):
                     fixed = [_pad_to_range(x) for x in fixed]
-                result["creative_assets"]["descriptions_5"] = fixed
-                logger.info("[CRICKET] Repaired descriptions_5 CTA-verb repetition")
+                result["creative_assets"]["descriptions_10"] = fixed
+                logger.info("[CRICKET] Repaired descriptions_10 CTA-verb repetition")
     except Exception as _fe:
-        logger.warning(f"[CRICKET] descriptions_5 repair skipped: {_fe}")
+        logger.warning(f"[CRICKET] descriptions_10 repair skipped: {_fe}")
+
+    # ── 4d. Media plan budget-sum enforcement ────────────────────────────────
+    # GPT arithmetic across 6 channels rarely lands on the exact budget — force
+    # it deterministically rather than hoping the model's rounding is exact.
+    try:
+        def _parse_rupees(v):
+            s = re.sub(r"[^\d.]", "", str(v or "0"))
+            return float(s) if s else 0.0
+
+        mp = result.get("media_plan") or {}
+        channels = mp.get("channels") or []
+        if channels:
+            amounts = [_parse_rupees(c.get("amount")) for c in channels]
+            total = sum(amounts)
+            if total > 0 and round(total) != _effective_budget:
+                scale = _effective_budget / total
+                scaled = [round(a * scale) for a in amounts]
+                drift = _effective_budget - sum(scaled)
+                if drift != 0:
+                    largest_idx = max(range(len(scaled)), key=lambda i: scaled[i])
+                    scaled[largest_idx] += drift
+                for c, amt in zip(channels, scaled):
+                    c["amount"] = f"₹{amt}"
+                    c["pct"] = round((amt / _effective_budget) * 100, 1) if _effective_budget else 0
+                mp["channels"] = channels
+                mp["total_budget"] = f"₹{_effective_budget}"
+                result["media_plan"] = mp
+                logger.info(f"[CRICKET] Rescaled media_plan channels to sum exactly to ₹{_effective_budget}")
+            elif total == 0:
+                logger.warning("[CRICKET] media_plan channels all zero — could not rescale")
+    except Exception as _mpe:
+        logger.warning(f"[CRICKET] media_plan budget enforcement skipped: {_mpe}")
 
     # ── 5. Save to isolated cricket_ads_memory ───────────────────────────────
     try:
@@ -8192,12 +8464,13 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     except Exception as _se:
         logger.warning(f"[CRICKET] Memory save error: {_se}")
 
-    logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r} business_type={business_type!r} memory_reused={memory_reused}")
+    logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r} business_type={business_type!r} memory_reused={memory_reused} warnings={warnings}")
     return {
         "success":        True,
         "data":           result,
         "business_type":  business_type,
         "memory_reused":  memory_reused,
+        "warnings":       warnings,
     }
 
 
