@@ -7682,28 +7682,67 @@ def get_cricket_memory(business_key: str) -> dict | None:
 
 
 # ── Pydantic model ───────────────────────────────────────────────────────────
+_SPORTS_BUSINESS_TYPES = (
+    "Cricket Community", "Fantasy Sports Platform", "Gaming Community", "Esports Content",
+    "Sports News", "Sports Coaching", "Sports Merchandise", "Tournament Platform",
+)
+
 class CricketAdsRequest(BaseModel):
     url:           str
     whatsapp_link: str = ""
     city:          str = "India"
+    industry:      str = ""                        # optional — enables Marketing Brain memory reuse
+    business_type: str = "Cricket Community"        # one of _SPORTS_BUSINESS_TYPES
+    budget:        float = 0.0                       # optional — feeds the campaign simulator
 
 
 # ── Endpoint ─────────────────────────────────────────────────────────────────
 @app.post("/cricket-ads-intelligence")
 async def cricket_ads_intelligence(request: CricketAdsRequest):
     """
-    Standalone Cricket Community Ads intelligence module.
-    Crawls the landing page, fetches live cricket context via Tavily,
-    then calls GPT-4o once to produce a full campaign intelligence report.
+    Sports Growth Engine intelligence module (route kept as /cricket-ads-intelligence
+    for backward compatibility with the frontend and any saved bookmarks/integrations).
+
+    ARCHITECTURE RULE: never duplicate Marketing Brain. If this business already has
+    Marketing Brain memory (business/audience/kpi/performance), reuse it instead of
+    re-discovering everything from scratch via a fresh crawl. Otherwise fall back to
+    the original Firecrawl-based discovery flow.
     """
     biz_key = f"cricket::{request.url.strip().rstrip('/').lower()}::{request.city.lower()}"
+    business_type = request.business_type if request.business_type in _SPORTS_BUSINESS_TYPES else "Cricket Community"
+
+    # ── 0. Marketing Brain memory reuse ──────────────────────────────────────
+    brain_memory, _brain_key = get_memory_with_city_fallback(request.url, request.industry, request.city)
+    brain_context_block = ""
+    if brain_memory:
+        _bm    = brain_memory.get("business", {}) or {}
+        _am    = brain_memory.get("audience", {}) or {}
+        _kpim  = brain_memory.get("kpi", {}) or {}
+        _perfm = brain_memory.get("performance", {}) or {}
+        _parts = []
+        if _bm.get("uvp"):          _parts.append(f"UVP: {_bm['uvp']}")
+        if _bm.get("positioning"):  _parts.append(f"Positioning: {_bm['positioning']}")
+        if _bm.get("business_dna"): _parts.append(f"Business DNA: {json.dumps(_bm['business_dna'], ensure_ascii=False)[:600]}")
+        if _am.get("segments"):     _parts.append(f"Audience segments (from Marketing Brain): {json.dumps(_am['segments'], ensure_ascii=False)[:600]}")
+        if _kpim.get("kpi_data"):   _parts.append(f"KPI data: {json.dumps(_kpim['kpi_data'], ensure_ascii=False)[:400]}")
+        if _perfm.get("performance_data"): _parts.append(f"Performance data: {json.dumps(_perfm['performance_data'], ensure_ascii=False)[:400]}")
+        if _parts:
+            brain_context_block = (
+                "PLATFORM INTELLIGENCE (from Marketing Brain — this business has already been analyzed on Adsoh; "
+                "treat this as ground truth and do NOT re-derive it, just build the sports campaign on top of it):\n"
+                + "\n".join(f"- {p}" for p in _parts) + "\n\n"
+            )
+    memory_reused = bool(brain_context_block)
 
     # ── 1. Crawl landing page ────────────────────────────────────────────────
+    # Skip the (paid, slower) Firecrawl discovery crawl when Marketing Brain memory
+    # already covers business/audience discovery. Still do a cheap httpx fetch so
+    # compliance_check and landing_page_audit have real page text to scan — those
+    # are safety checks, not "discovery", and stay strict regardless of memory reuse.
     site_content = ""
-    if FIRECRAWL_API_KEY and request.url:
+    if not memory_reused and FIRECRAWL_API_KEY and request.url:
         site_content = await fetch_firecrawl(request.url)
     if not site_content:
-        # Lightweight httpx fallback
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as _hc:
                 _r = await _hc.get(request.url, headers={"User-Agent": "Mozilla/5.0"})
@@ -7715,32 +7754,76 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         except Exception:
             site_content = "(Could not fetch website content)"
 
-    # ── 2. Tavily: live cricket season context ───────────────────────────────
+    # ── 2. Tavily: sports/gaming season context + upcoming calendar + competitors ──
     cricket_context = ""
+    calendar_context = ""
+    competitor_context = ""
     if TAVILY_API_KEY:
-        _q = (
-            f"Current cricket season India {datetime.now().strftime('%B %Y')}: "
+        _now_str = datetime.now().strftime("%B %Y")
+        _q_context = (
+            f"Current cricket and sports season India {_now_str}: "
             "IPL matches, international series, World Cup schedule, "
             "cricket fan engagement trends, WhatsApp cricket community growth"
         )
-        cricket_context = await fetch_tavily(_q)
+        _q_calendar = (
+            f"Cricket and sports events calendar India in the next 60 days from {_now_str}: "
+            "IPL, World Cup, Asia Cup, international tours, tournament dates, "
+            "trending teams and players right now, trending cricket/sports search topics"
+        )
+        _q_competitor = (
+            f"Popular cricket fan communities, sports content pages, or {business_type} platforms in India — "
+            "their WhatsApp/Telegram community growth tactics, content style, offers, follower counts"
+        )
+        cricket_context, calendar_context, competitor_context = await asyncio.gather(
+            fetch_tavily(_q_context), fetch_tavily(_q_calendar), fetch_tavily(_q_competitor),
+        )
+
+    # ── 2b. Learning Engine: cross-business winning patterns for sports/gaming ──
+    _growth_block = growth_learning_block("sports_gaming", label="SPORTS/GAMING LEARNING")
 
     # ── 3. Build prompt ──────────────────────────────────────────────────────
     _current_month = datetime.now().strftime("%B %Y")
     prompt = (
-        f"You are a Google Display Ads expert specializing in sports community campaigns in India.\n"
+        f"You are a Google Display Ads expert specializing in sports and gaming community campaigns in India — "
+        f"the Sports Growth Engine inside Adsoh.\n"
         f"Current date: {_current_month}\n"
         f"City/Region: {request.city}\n"
-        f"WhatsApp Group Link: {request.whatsapp_link or '(not provided)'}\n\n"
+        f"Business Type: {business_type}\n"
+        f"WhatsApp Group Link: {request.whatsapp_link or '(not provided)'}\n"
+        f"Budget (if provided, use for campaign_simulator; if 0, use the recommended campaign_structure.budget_daily instead): "
+        f"{'₹' + str(int(request.budget)) if request.budget else '(not provided)'}\n\n"
+        f"{brain_context_block}"
+        f"{_growth_block}"
         f"WEBSITE CONTENT:\n{site_content[:2000]}\n\n"
-        f"LIVE CRICKET CONTEXT (use this to make audience and timing recommendations specific):\n"
-        f"{cricket_context[:1500] if cricket_context else 'No live data — use general cricket season knowledge for India.'}\n\n"
-        "TASK: Generate a complete Google Display Ads campaign intelligence report for this cricket community/news WhatsApp group.\n\n"
-        "CONTENT RULES:\n"
-        "- This is a cricket NEWS and COMMUNITY group — no gambling, no betting, no fantasy earnings, no real-money gaming.\n"
-        "- Primary conversion: WhatsApp group join via link click.\n"
-        "- Run a compliance_check but expect it to be clean for a pure community/news group.\n"
-        "- If compliance_check finds any gambling/betting/money signals in the website content, set risk_level to 'high' and list flags.\n\n"
+        f"LIVE CONTEXT (use this to make audience and timing recommendations specific):\n"
+        f"{cricket_context[:1200] if cricket_context else 'No live data — use general cricket/sports season knowledge for India.'}\n\n"
+        f"UPCOMING EVENTS CALENDAR (next 60 days — use for sports_calendar section):\n"
+        f"{calendar_context[:1200] if calendar_context else 'No live data — use general knowledge of the current cricket/sports calendar for India.'}\n\n"
+        f"COMPETITOR RESEARCH (use for competitor_watch section):\n"
+        f"{competitor_context[:1200] if competitor_context else 'No live data — use general knowledge of well-known cricket/sports fan communities in India.'}\n\n"
+        f"TASK: Generate a complete Google Display Ads campaign intelligence report for this {business_type} — "
+        "adapt every recommendation (audiences, placements, compliance emphasis) to this specific business type.\n\n"
+        "BUSINESS TYPE ADAPTATION:\n"
+        f"- {business_type}: reason specifically about what this business type's audience wants, where they spend "
+        "time online, and what placements/creative angles fit it — do not give generic cricket-community advice "
+        "if the business type is Esports Content, Sports Merchandise, Tournament Platform, etc.\n"
+        "- Regardless of business type, the PRIMARY CONVERSION must be a free action: WhatsApp/Telegram join, "
+        "app download/install, content follow, or community sign-up — never a deposit, entry fee, or paid contest.\n\n"
+        "CONTENT RULES — COMPLIANCE STAYS STRICT REGARDLESS OF BUSINESS TYPE:\n"
+        "- Audiences MAY be expressed as fantasy-sports-interested or gaming-interested users (that's a legitimate "
+        "Google interest/in-market category) — but the AD CONTENT and LANDING DESTINATION must be 100% free/"
+        "community/content. Flag ANY real-money, win-cash, deposit, prediction/tips-for-money, or odds language.\n"
+        "- Primary conversion for this report: WhatsApp/Telegram/community join, or content follow — never a paid action.\n"
+        "- Run a compliance_check but expect it to be clean for a pure community/content group.\n"
+        "- If compliance_check finds any gambling/betting/real-money/prediction-for-money signals in the website "
+        "content, set risk_level to 'high' and list flags.\n\n"
+        "AUDIENCE COMPLIANCE — PLATFORM-SUPPORTED TARGETING ONLY:\n"
+        "- Every audience_segments[].name and .platform_match MUST describe a targeting method Google Ads actually "
+        "supports: an affinity/in-market audience category, a contextual keyword theme, or a placement/content "
+        "category. NEVER name a specific app's users directly (e.g. never write 'Dream11 app users' or 'My11Circle "
+        "users') — instead say something like 'In-market: Fantasy Sports Apps' or 'Contextual: cricket score & "
+        "fantasy sports content' or 'Placement: sports news and fantasy sports apps'.\n"
+        "- You MUST return AT LEAST 6 distinct audience_segments, tuned to the business_type above.\n\n"
         "CHARACTER LIMITS — STRICT:\n"
         "- headlines_15: each MUST be under 30 characters (Google Ads limit). Count carefully.\n"
         "- long_headlines_5: each MUST be BETWEEN 70 and 90 characters — count carefully, not just under 90. "
@@ -7754,20 +7837,49 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "- Keep audience_segments[].reason and placement_recommendations[].why to one concise sentence each — "
         "this budget discipline exists so every creative_assets field below can be fully completed.\n\n"
         "AUDIENCE RULES:\n"
-        "- You MUST return AT LEAST 6 distinct audience_segments. Do not return fewer than 6. Each must target a "
-        "genuinely different group (e.g. by age, fan type, device habit, language, city-tier, viewing occasion) — "
-        "not 6 rewordings of the same segment.\n"
+        "- Each of the 6+ audience_segments must target a genuinely different group (e.g. by age, fan type, device "
+        "habit, language, city-tier, viewing occasion) — not rewordings of the same segment.\n"
         "- You MUST return AT LEAST 5 distinct placement_recommendations, each a different real Google Display "
         "placement type or property (e.g. specific news/sports apps, YouTube cricket channels, cricket score "
         "widgets, mobile game placements, news aggregator apps) — not 5 rewordings of the same placement.\n"
-        "- Read the LIVE CRICKET CONTEXT above and pull out the ACTUAL current tournament name, series name, team "
+        "- Read the LIVE CONTEXT above and pull out the ACTUAL current tournament name, series name, team "
         "names, or match dates mentioned in it. Every audience_segments[].reason MUST name that specific event or "
         "teams (e.g. 'Timed around India vs Australia T20I series' or 'Asia Cup 2026 knockout stage'). "
         "NEVER write generic filler like 'cricket season is ongoing' or 'cricket is popular in India' — if the "
-        "live context names a tournament/match, use its actual name. If LIVE CRICKET CONTEXT is empty, say so "
+        "live context names a tournament/match, use its actual name. If LIVE CONTEXT is empty, say so "
         "explicitly in one segment's reason rather than inventing a generic sentence.\n"
         "- estimated_cpc and estimated_ctr must be realistic for Google Display in India (CPC typically ₹1-8).\n"
-        "- priority_score: 0-100 integer ranking this audience segment.\n\n"
+        "- priority_score: 0-100 integer ranking this audience segment (kept for backward compatibility).\n"
+        "- intent_score: 0-100 integer — how likely this segment is to convert on the primary action.\n"
+        "- competition: 'low', 'medium', or 'high' — how contested this targeting category is.\n"
+        "- expected_conversion: a specific range (e.g. '3-6% join rate') for the primary conversion action.\n"
+        "- platform_match: the exact Google Ads targeting mechanism to use (in-market audience name, affinity "
+        "audience name, or contextual keyword theme) — must be a real, platform-supported category, not app names.\n"
+        "- confidence: 0-100 integer reflecting how much evidence backs this segment (live context/memory-backed "
+        "= high, inferred = medium, assumption = low).\n"
+        "- evidence: one sentence citing what specifically supports this segment (live context, Marketing Brain "
+        "memory, or cross-business learning data above).\n\n"
+        "KEY RECOMMENDATIONS (top_audience, top_placement, timing):\n"
+        "- For the single HIGHEST-priority audience segment, the single HIGHEST-priority placement, and the launch "
+        "timing decision, produce a full structured recommendation each with: observation (what the data shows), "
+        "evidence (what specifically supports it), confidence (0-100), expected_impact (specific and measurable), "
+        "risk (the main way this could underperform), and next_action (the one concrete thing to do).\n\n"
+        "SPORTS CALENDAR:\n"
+        "- From the UPCOMING EVENTS CALENDAR context above, extract the next 3 relevant events/tournaments/match-"
+        "series with their actual dates (or best available date estimate). For each: a recommended campaign "
+        "timing window (when to start/stop or intensify) and a budget/creative timing recommendation (e.g. "
+        "'increase budget 2 days before India matches', 'refresh creative for the knockout stage').\n"
+        "- If no real calendar data is available, say so explicitly rather than inventing fake dates.\n\n"
+        "CAMPAIGN SIMULATOR:\n"
+        "- Forecast reach, clicks, CTR, community joins/installs, cost per join/install, and expected ROI for the "
+        "budget given above (or the recommended campaign_structure.budget_daily if no budget was given). Every "
+        "number MUST be a range, not a single point estimate, each with its own confidence.\n"
+        "- End the campaign_simulator section with this EXACT sentence, verbatim: "
+        "\"These are forecasts based on benchmarks, not guarantees.\"\n\n"
+        "COMPETITOR WATCH:\n"
+        "- From the COMPETITOR RESEARCH context above (or general knowledge if that context is empty), name 2-3 "
+        "real, similar sports/gaming communities or platforms, their creative style/offers/growth tactics, and "
+        "3 differentiation recommendations for THIS business to stand out from them.\n\n"
         "CREATIVE RULES — descriptions_5:\n"
         "- Write EXACTLY 5 descriptions_5, one per CTA angle, in this exact order and each clearly using that "
         "angle (do not reuse the same CTA wording across them):\n"
@@ -7818,12 +7930,24 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "image_suggestions": ["...", "...", "..."]\n'
         '  },\n'
         '  "audience_segments": [\n'
-        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." },\n'
-        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, "reason": "..." }\n'
+        '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, '
+        '"intent_score": 80, "competition": "medium", "expected_conversion": "3-6% join rate", '
+        '"platform_match": "In-market: Fantasy Sports Apps", "confidence": 75, "evidence": "...", "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
+        '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
+        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
+        '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
+        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
+        '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
+        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
+        '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
+        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
+        '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
+        '"confidence": 0, "evidence": "...", "reason": "..." }\n'
         '  ],\n'
         '  "placement_recommendations": [\n'
         '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" },\n'
@@ -7837,7 +7961,34 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "issues": [],\n'
         '    "fixes": []\n'
         '  },\n'
-        '  "launch_score": { "overall": 0, "audience": 0, "compliance": 0, "creative": 0 }\n'
+        '  "launch_score": { "overall": 0, "audience": 0, "compliance": 0, "creative": 0 },\n'
+        '  "key_recommendations": {\n'
+        '    "top_audience": { "observation": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "next_action": "..." },\n'
+        '    "top_placement": { "observation": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "next_action": "..." },\n'
+        '    "timing": { "observation": "...", "evidence": "...", "confidence": 0, "expected_impact": "...", "risk": "...", "next_action": "..." }\n'
+        '  },\n'
+        '  "sports_calendar": {\n'
+        '    "events": [\n'
+        '      { "name": "...", "date": "...", "timing_window": "...", "budget_creative_recommendation": "..." },\n'
+        '      { "name": "...", "date": "...", "timing_window": "...", "budget_creative_recommendation": "..." },\n'
+        '      { "name": "...", "date": "...", "timing_window": "...", "budget_creative_recommendation": "..." }\n'
+        '    ],\n'
+        '    "data_available": true\n'
+        '  },\n'
+        '  "campaign_simulator": {\n'
+        '    "budget_used": "₹...",\n'
+        '    "reach": { "range": "...", "confidence": 0 },\n'
+        '    "clicks": { "range": "...", "confidence": 0 },\n'
+        '    "ctr": { "range": "...", "confidence": 0 },\n'
+        '    "joins_installs": { "range": "...", "confidence": 0 },\n'
+        '    "cost_per_join_install": { "range": "...", "confidence": 0 },\n'
+        '    "expected_roi": { "range": "...", "confidence": 0 },\n'
+        '    "disclaimer": "These are forecasts based on benchmarks, not guarantees."\n'
+        '  },\n'
+        '  "competitor_watch": [\n'
+        '    { "name": "...", "creative_style": "...", "offers": "...", "growth_tactics": "...", "differentiation_recommendations": ["...", "...", "..."] },\n'
+        '    { "name": "...", "creative_style": "...", "offers": "...", "growth_tactics": "...", "differentiation_recommendations": ["...", "...", "..."] }\n'
+        '  ]\n'
         "}"
     )
 
@@ -7849,7 +8000,7 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.4,
-                max_tokens=4096,
+                max_tokens=6500,
             )
         gpt_resp = await asyncio.to_thread(_call_gpt)
         raw_json = gpt_resp.choices[0].message.content
@@ -8041,8 +8192,13 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     except Exception as _se:
         logger.warning(f"[CRICKET] Memory save error: {_se}")
 
-    logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r}")
-    return {"success": True, "data": result}
+    logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r} business_type={business_type!r} memory_reused={memory_reused}")
+    return {
+        "success":        True,
+        "data":           result,
+        "business_type":  business_type,
+        "memory_reused":  memory_reused,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8214,6 +8370,8 @@ class CricketPushRequest(BaseModel):
     long_headlines:    list = []
     descriptions:      list = []
     whatsapp_link:     str  = ""
+    business_type:     str  = "Cricket Community"   # for the growth_memory learning packet
+    top_audience:       str  = ""                    # winning audience segment name, if known
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -8293,6 +8451,27 @@ async def cricket_push_to_google(request: CricketPushRequest):
 
     campaign_id = result["campaign_id"]
     logger.info(f"[CRICKET-PUSH] Created Display campaign {campaign_id!r} on account {cid!r}")
+
+    # ── Learning Engine write-side: log this launch as a sports/gaming pattern ──
+    # Confidence is deliberately low here — this only confirms a campaign was
+    # LAUNCHED with this audience/platform, not that it performed well (no real
+    # performance data exists yet). Real confidence should build over time as
+    # /cricket-ads/optimize runs against actual results for this account.
+    try:
+        await asyncio.to_thread(_save_growth_memory, {
+            "industry":         "sports_gaming",
+            "business_type":    request.business_type or "Cricket Community",
+            "budget_range":     f"₹{request.budget_daily}/day",
+            "winning_audience": request.top_audience or "N/A",
+            "winning_platform": "Google Display",
+            "winning_offer":    request.whatsapp_link and "WhatsApp/Community join" or "Community join",
+            "avg_cpl":          "N/A — not yet measured",
+            "avg_roas":         "N/A — not yet measured",
+            "confidence":       25,
+        })
+    except Exception as _gme:
+        logger.warning(f"[CRICKET-PUSH] growth_memory write skipped: {_gme}")
+
     return {
         "success":              True,
         "campaign_id":          campaign_id,
@@ -8301,6 +8480,126 @@ async def cricket_push_to_google(request: CricketPushRequest):
         "google_ads_dashboard": f"https://ads.google.com/aw/campaigns?campaignId={campaign_id}",
         "note":                 "Campaign created PAUSED. Add image assets in Google Ads dashboard before enabling.",
     }
+
+
+# ── Performance + Optimizer reuse ─────────────────────────────────────────────
+# ARCHITECTURE RULE: never duplicate the optimizer. Fetch raw metrics for the
+# selected cricket ad account, shape them into the same performance_data schema
+# the main platform's performance_memory uses, save under a stable per-account
+# key, then hand off to the SAME _run_ai_optimizer_core() the rest of Adsoh uses
+# — no cricket-specific optimizer prompt.
+def _cricket_perf_key_parts(customer_id: str) -> tuple:
+    return (f"cricket-account-{customer_id.strip()}", "Sports & Gaming", "India")
+
+
+@app.get("/cricket-ads/performance")
+async def cricket_ads_performance(customer_id: str, login_customer_id: str = "", days: int = 30):
+    cid  = customer_id.replace("-", "").strip()
+    lcid = (login_customer_id or "").replace("-", "").strip() or None
+    if not cid:
+        return {"success": False, "error": "customer_id is required"}
+
+    try:
+        client_ = await asyncio.to_thread(_build_cricket_client, lcid)
+        end   = datetime.now().date()
+        start = end - timedelta(days=days)
+        campaigns = await asyncio.to_thread(_fetch_gads_campaigns_sync, client_, cid)
+        daily     = await asyncio.to_thread(
+            _fetch_gads_campaign_day_sync, client_, cid,
+            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+        )
+    except GoogleAdsException as ex:
+        errs = [e.message for e in ex.failure.errors]
+        return {"success": False, "error": "; ".join(errs)}
+    except Exception as _e:
+        return {"success": False, "error": str(_e)}
+
+    camp_lookup = {c["campaign_id"]: c for c in campaigns}
+    agg = {}
+    for row in daily:
+        a = agg.setdefault(row["campaign_id"], {"impressions": 0, "clicks": 0, "cost_micros": 0, "conversions": 0.0})
+        a["impressions"]  += row["impressions"]
+        a["clicks"]       += row["clicks"]
+        a["cost_micros"]  += row["cost_micros"]
+        a["conversions"]  += row["conversions"]
+
+    campaign_breakdown = []
+    total_impr = total_clicks = 0
+    total_cost_micros = 0
+    total_conv = 0.0
+    for cid_, a in agg.items():
+        meta   = camp_lookup.get(cid_, {})
+        impr   = a["impressions"]
+        clicks = a["clicks"]
+        cost   = a["cost_micros"] / 1_000_000
+        conv   = a["conversions"]
+        ctr    = round((clicks / impr * 100), 2) if impr else 0.0
+        rating = "good" if (ctr > 2 or conv > 0) else ("average" if ctr >= 1 else "poor")
+        campaign_breakdown.append({
+            "campaign_name":      meta.get("name", cid_),
+            "status":             meta.get("status", "UNKNOWN"),
+            "impressions":        impr,
+            "clicks":             clicks,
+            "cost":               f"RS{round(cost, 2)}",
+            "conversions":        conv,
+            "ctr":                f"{ctr}%",
+            "performance_rating": rating,
+        })
+        total_impr += impr
+        total_clicks += clicks
+        total_cost_micros += a["cost_micros"]
+        total_conv += conv
+
+    total_cost  = total_cost_micros / 1_000_000
+    overall_ctr = round((total_clicks / total_impr * 100), 2) if total_impr else 0.0
+    overall_cpc = round((total_cost / total_clicks), 2) if total_clicks else 0.0
+    overall_cpa = round((total_cost / total_conv), 2) if total_conv else 0.0
+    zero_activity = (total_impr == 0 and total_cost == 0)
+
+    performance_data = {
+        "actual_metrics": {
+            "ctr":         f"{overall_ctr}%",
+            "cpc":         f"RS{overall_cpc}",
+            "cost":        f"RS{round(total_cost, 2)}",
+            "conversions": total_conv,
+            "cpa":         f"RS{overall_cpa}",
+            "roas":        "N/A",
+        },
+        "campaign_breakdown": campaign_breakdown,
+        "overall_health": 50,
+        "trend": "N/A",
+        "top_insight": "" if zero_activity else f"{len(campaign_breakdown)} campaign(s) with live spend over the last {days} days.",
+        "biggest_problem": "No active spend detected in this window." if zero_activity else "",
+    }
+
+    url_stub, industry_stub, city_stub = _cricket_perf_key_parts(cid)
+    business_key = derive_business_key(url_stub, industry_stub, city_stub)
+    save_to_memory("performance", business_key, {
+        "performance_data": performance_data,
+        "date_range":       f"{days}d",
+        "overall_health":   performance_data["overall_health"],
+    })
+
+    return {
+        "success":      True,
+        "business_key": business_key,
+        "performance":  performance_data,
+        "campaigns":    campaigns,
+    }
+
+
+class CricketOptimizeRequest(BaseModel):
+    customer_id:       str
+    login_customer_id: str = ""
+
+
+@app.post("/cricket-ads/optimize")
+async def cricket_ads_optimize(request: CricketOptimizeRequest):
+    cid = request.customer_id.replace("-", "").strip()
+    if not cid:
+        return {"success": False, "error": "customer_id is required"}
+    url_stub, industry_stub, city_stub = _cricket_perf_key_parts(cid)
+    return await _run_ai_optimizer_core(url_stub, industry_stub, city_stub)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
