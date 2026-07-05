@@ -9314,6 +9314,23 @@ async def _sie_website_step(website_url: str, business_key: str, industry: str, 
         return {"found": False, "data_label": "NOT_VERIFIED", "note": f"Website audit error: {_e}"}
 
 
+def _sie_name_appears_in_snippet(business_name: str, snippet: str) -> bool:
+    """
+    Deterministic guard: does the business's name actually appear in this
+    research snippet? Prevents attributing an unrelated same-keyword
+    company's real data to this business — a subtler honesty-rule
+    violation than outright invention (a real number about the WRONG
+    business), which prompt instructions alone don't reliably prevent.
+    """
+    if not business_name or not snippet:
+        return False
+    snippet_l = snippet.lower()
+    words = [w for w in re.findall(r"[a-zA-Z]+", business_name) if len(w) >= 4]
+    if not words:
+        words = [business_name.strip()]
+    return any(w.lower() in snippet_l for w in words)
+
+
 async def _sie_social_observed_step(business_name: str, platforms: dict, city: str) -> dict:
     """
     Step 6 — Instagram/Facebook/LinkedIn (OBSERVED only). Tavily research for
@@ -9347,6 +9364,14 @@ async def _sie_social_observed_step(business_name: str, platforms: dict, city: s
             "percentages — only report what the snippets actually say. If a snippet mentions an approximate "
             "follower count or activity level, report it AS MENTIONED with the source context. If nothing "
             "reliable is found for a platform, say so explicitly and label it NOT_VERIFIED.\n\n"
+            "CRITICAL — VERIFY THE SNIPPET IS ACTUALLY ABOUT THIS BUSINESS: web search results often surface an "
+            f"UNRELATED company or page that just happens to share keywords with {business_name} or {city} (e.g. "
+            "a different 'marketing services' or 'community' page in the same city). Before extracting ANY "
+            f"follower count, activity level, or theme, confirm the snippet is actually naming or describing "
+            f"{business_name} specifically — not a same-industry or same-city page with a different name. If a "
+            "snippet's company/page name does not match, or you cannot confirm it's the same business, treat "
+            "that platform as NOT_VERIFIED and do not use any of that snippet's numbers, even if they look "
+            "real — a real number about the WRONG business is not this business's data.\n\n"
             f"{combined}\n\n"
             "Return ONLY JSON with this exact structure:\n"
             "{\n"
@@ -9370,7 +9395,22 @@ async def _sie_social_observed_step(business_name: str, platforms: dict, city: s
             entry.setdefault("platform", p)
             entry.setdefault("handle_or_url", platforms.get(p, ""))
             if entry.get("data_label") == "OBSERVED":
-                entry.setdefault("note", "")
+                # Deterministic backstop: prompt compliance alone isn't a guarantee. Web
+                # search regularly surfaces an unrelated same-keyword company (e.g.
+                # searching "Sohscape Jaipur linkedin" once returned a page for
+                # "Jaipur Social", a different business entirely) — if the business's
+                # own name doesn't appear anywhere in the source snippet, this is a
+                # real number about the WRONG business, not this one's data.
+                if not _sie_name_appears_in_snippet(business_name, entry.get("source_snippet", "")):
+                    logger.warning(f"[SIE] {p} OBSERVED entry rejected — {business_name!r} not found in its source_snippet")
+                    entry.update({
+                        "data_label": "NOT_VERIFIED", "approx_followers": None, "activity_level": None,
+                        "content_themes": [], "notable_mentions": None,
+                        "note": "Research returned a page that couldn't be confirmed as this business's — "
+                                "treating as unverified rather than risk misattributing another company's data.",
+                    })
+                else:
+                    entry.setdefault("note", "")
             else:
                 entry["data_label"] = "NOT_VERIFIED"
                 entry.setdefault("note", "Connect this account for verified insights (coming in a future update).")
