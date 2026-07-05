@@ -23,6 +23,7 @@ import re
 import random
 import time
 import traceback as _traceback
+import difflib
 import hmac
 import hashlib
 import base64
@@ -9230,8 +9231,25 @@ async def _sie_youtube_step(youtube_url: str) -> dict:
     }
 
 
+def _sie_name_similarity(a: str, b: str) -> float:
+    """0-1 fuzzy similarity, with a boost for exact substring containment
+    (handles 'Sohscape' vs 'Sohscape Digital Marketing Agency')."""
+    a, b = (a or "").lower().strip(), (b or "").lower().strip()
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return max(0.6, difflib.SequenceMatcher(None, a, b).ratio())
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
 async def _sie_gbp_step(business_name: str, city: str) -> dict:
-    """Step 4 — Google Business Profile (VERIFIED via Places API)."""
+    """
+    Step 4 — Google Business Profile (VERIFIED via Places API).
+    Places Text Search can return loosely-related results (or the most
+    popular business in the city) even when nothing actually matches —
+    a real name-similarity threshold is required before calling anything
+    "found", otherwise an unrelated business gets mislabeled VERIFIED.
+    """
     if not business_name:
         return {"found": False, "data_label": "NOT_VERIFIED", "note": "No business name available to search."}
     try:
@@ -9243,17 +9261,23 @@ async def _sie_gbp_step(business_name: str, city: str) -> dict:
         return {"found": False, "data_label": "NOT_VERIFIED",
                 "note": f"No Google Business Profile found for '{business_name}' in {city}."}
 
-    def _match_score(r):
-        name = (r.get("name") or "").lower()
-        target = business_name.lower()
-        exact = 1 if (target in name or name in target) else 0
-        return (exact, r.get("user_ratings_total", 0) or 0)
+    _MATCH_THRESHOLD = 0.45
+    scored = [(_sie_name_similarity(business_name, r.get("name", "")), r) for r in results]
+    scored.sort(key=lambda t: (t[0], t[1].get("user_ratings_total", 0) or 0), reverse=True)
+    best_score, best = scored[0]
 
-    results.sort(key=_match_score, reverse=True)
-    best = results[0]
+    if best_score < _MATCH_THRESHOLD:
+        return {
+            "found": False, "data_label": "NOT_VERIFIED",
+            "note": (f"No confidently-matching Google Business Profile found for '{business_name}' in {city} — "
+                     f"closest result was '{best.get('name', '')}', which didn't match closely enough to report "
+                     "as this business."),
+        }
+
+    close_matches = [r for score, r in scored if score >= _MATCH_THRESHOLD]
     match_note = (
-        f"{len(results)} possible matches found in {city} — picked the closest name match with the most reviews."
-        if len(results) > 1 else None
+        f"{len(close_matches)} possible matches found in {city} — picked the closest name match with the most reviews."
+        if len(close_matches) > 1 else None
     )
 
     return {
