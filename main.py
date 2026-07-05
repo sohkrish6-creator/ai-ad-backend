@@ -258,6 +258,13 @@ CREATE TABLE IF NOT EXISTS autonomous_plan_memory (
     created_at      TEXT,
     updated_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS social_intel_memory (
+    id              BIGSERIAL PRIMARY KEY,
+    business_key    TEXT UNIQUE NOT NULL,
+    data            TEXT,
+    created_at      TEXT,
+    updated_at      TEXT
+);
 """
 
 def _create_memory_tables():
@@ -268,7 +275,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -319,6 +326,7 @@ _MEMORY_TABLES = {
     "result":      "result_memory",
     "prospect":    "prospect_memory",
     "autonomous_plan": "autonomous_plan_memory",
+    "social_intel":    "social_intel_memory",
 }
 
 def _json_val(v):
@@ -8946,6 +8954,764 @@ async def cricket_ads_optimize(request: CricketOptimizeRequest):
         return {"success": False, "error": "customer_id is required"}
     url_stub, industry_stub, city_stub = _cricket_perf_key_parts(cid)
     return await _run_ai_optimizer_core(url_stub, industry_stub, city_stub)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SOCIAL INTELLIGENCE ENGINE (SIE) — complete social/digital presence audit
+#  from ONE input. Orchestrates existing engines (website_intelligence, Google
+#  Places, a new YouTube channel-stats lookup, Marketing Brain memory) plus
+#  Tavily-based OBSERVED research for platforms with no queryable API.
+#
+#  HONESTY RULE (absolute): every datapoint carries a data_label —
+#  VERIFIED (real API call), OBSERVED (public web research via Tavily/
+#  Firecrawl), INFERRED (AI reasoning from available signals), or
+#  NOT_VERIFIED (nothing reliable found). Nothing is ever invented.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SIE_INPUT_TYPES = ("website", "instagram", "facebook", "linkedin", "youtube", "business_name", "gbp")
+
+_SIE_SOCIAL_LINK_PATTERNS = {
+    "instagram": re.compile(r'https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)', re.I),
+    "facebook":  re.compile(r'https?://(?:www\.)?facebook\.com/([A-Za-z0-9_.\-]+)', re.I),
+    "linkedin":  re.compile(r'https?://(?:www\.)?linkedin\.com/(?:company|in)/([A-Za-z0-9_\-]+)', re.I),
+    "youtube":   re.compile(r'https?://(?:www\.)?youtube\.com/(?:channel/|c/|@)([A-Za-z0-9_\-]+)', re.I),
+}
+_SIE_SOCIAL_LINK_IGNORE = {
+    "instagram": {"p", "explore", "accounts", "reel", "reels", "stories", "direct"},
+    "facebook":  {"sharer", "share.php", "plugins", "tr", "dialog", "help", "policies", "ads", "profile.php"},
+    "linkedin":  {"company", "in", "sharing", "shareArticle"},
+    "youtube":   {"watch", "results", "playlist", "embed"},
+}
+
+
+def _sie_extract_social_links(text_blob: str) -> dict:
+    """Pull social profile links out of crawled website markdown/HTML or
+    Tavily research text. Returns {platform: url} for whichever platforms
+    have a real-looking profile link (not a share/plugin/watch URL)."""
+    found = {}
+    if not text_blob:
+        return found
+    for platform, pattern in _SIE_SOCIAL_LINK_PATTERNS.items():
+        for m in pattern.finditer(text_blob):
+            handle = m.group(1)
+            if handle.lower() in _SIE_SOCIAL_LINK_IGNORE.get(platform, set()):
+                continue
+            if platform not in found:
+                found[platform] = m.group(0).split("?")[0].rstrip("/")
+    return found
+
+
+async def fetch_youtube_channel_stats(handle_or_url: str) -> dict:
+    """
+    Look up a SPECIFIC channel's public stats via youtube/v3/channels — this is
+    distinct from fetch_youtube_search/fetch_youtube_video_stats above (which
+    search for competitive content by keyword, not a single channel's own
+    numbers). Accepts a handle ('@sohscape'), a channel URL, or a bare ID.
+    Returns {} if not found / not configured — never raises.
+    """
+    if not YOUTUBE_API_KEY or not handle_or_url:
+        return {}
+    raw = handle_or_url.strip()
+    m = re.search(r'youtube\.com/(?:channel/|c/|@)([A-Za-z0-9_\-]+)', raw, re.I)
+    if m:
+        raw = m.group(1)
+    raw = raw.lstrip("@")
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            for extra in ({"forHandle": f"@{raw}"}, {"id": raw}):
+                resp = await c.get(
+                    "https://www.googleapis.com/youtube/v3/channels",
+                    params={"key": YOUTUBE_API_KEY, "part": "snippet,statistics", **extra},
+                )
+                items = resp.json().get("items", [])
+                if items:
+                    ch = items[0]
+                    stats = ch.get("statistics", {})
+                    snippet = ch.get("snippet", {})
+                    return {
+                        "channel_id":       ch.get("id", ""),
+                        "title":            snippet.get("title", ""),
+                        "subscriber_count": (None if stats.get("hiddenSubscriberCount")
+                                             else int(stats.get("subscriberCount", 0))),
+                        "video_count":      int(stats.get("videoCount", 0)),
+                        "view_count":       int(stats.get("viewCount", 0)),
+                        "published_at":     snippet.get("publishedAt", "")[:10],
+                    }
+    except Exception as _e:
+        logger.warning(f"[SIE] YouTube channel lookup failed: {_e}")
+    return {}
+
+
+async def fetch_youtube_channel_recent_videos(channel_id: str, max_results: int = 6) -> list:
+    """Recent uploads for one channel — used for publishing frequency/engagement."""
+    if not YOUTUBE_API_KEY or not channel_id:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "key": YOUTUBE_API_KEY, "channelId": channel_id, "part": "snippet",
+                    "order": "date", "type": "video", "maxResults": max_results,
+                },
+            )
+            items = resp.json().get("items", [])
+        video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+        stats = await fetch_youtube_video_stats(video_ids)
+        stats_map = {s["videoId"]: s for s in stats}
+        out = []
+        for it in items:
+            vid = it.get("id", {}).get("videoId")
+            if not vid:
+                continue
+            s = stats_map.get(vid, {})
+            out.append({
+                "title":        it["snippet"]["title"],
+                "published_at": it["snippet"]["publishedAt"][:10],
+                "views":        s.get("views", 0),
+                "likes":        s.get("likes", 0),
+                "comments":     s.get("comments", 0),
+                "url":          f"https://www.youtube.com/watch?v={vid}",
+            })
+        return out
+    except Exception as _e:
+        logger.warning(f"[SIE] YouTube recent videos fetch failed: {_e}")
+        return []
+
+
+async def _sie_discover_platforms(input_value: str, input_type: str, city: str) -> dict:
+    """
+    Step 1 — Discovery. If input is a website: Firecrawl it and extract social
+    links present on the page. If input is a handle/business name: Tavily
+    search to discover the website + other public profiles.
+    """
+    site_content = ""
+    website_url = ""
+    extracted = {}
+
+    if input_type == "website":
+        website_url = input_value.strip()
+        if not re.match(r'^https?://', website_url, re.I):
+            website_url = f"https://{website_url}"
+        if FIRECRAWL_API_KEY:
+            site_content = await fetch_firecrawl(website_url)
+        if not site_content:
+            try:
+                async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+                    r = await c.get(website_url, headers={"User-Agent": "Mozilla/5.0"})
+                    site_content = r.text
+            except Exception:
+                site_content = ""
+        extracted = _sie_extract_social_links(site_content)
+    else:
+        research = await fetch_tavily(
+            f"{input_value} {city} official website Instagram Facebook LinkedIn YouTube"
+        )
+        site_content = research or ""
+        extracted = _sie_extract_social_links(research or "")
+        m = re.search(r'https?://(?:www\.)?([a-z0-9\-]+\.[a-z]{2,})(?:/\S*)?', research or "", re.I)
+        if m:
+            candidate = m.group(0).split()[0].rstrip(').,')
+            if not any(p in candidate for p in ("instagram.com", "facebook.com", "linkedin.com", "youtube.com")):
+                website_url = candidate
+
+        if input_type in ("instagram", "facebook", "linkedin", "youtube"):
+            handle = input_value.strip()
+            if not re.match(r'^https?://', handle, re.I):
+                base = {"instagram": "instagram.com", "facebook": "facebook.com",
+                        "linkedin": "linkedin.com/in", "youtube": "youtube.com"}[input_type]
+                handle = f"https://{base}/{handle.lstrip('@')}"
+            extracted.setdefault(input_type, handle)
+
+    platforms = []
+    for platform in ("website", "instagram", "facebook", "linkedin", "youtube"):
+        url = website_url if platform == "website" else extracted.get(platform, "")
+        if url:
+            is_direct_input = (platform == "website" and input_type == "website")
+            platforms.append({
+                "platform": platform, "url": url, "status": "found",
+                "confidence": 95 if is_direct_input else 65,
+                "data_label": "VERIFIED" if is_direct_input else "OBSERVED",
+            })
+        else:
+            platforms.append({"platform": platform, "url": "", "status": "not_found",
+                               "confidence": 0, "data_label": "NOT_VERIFIED"})
+
+    return {"website": website_url, "platforms": platforms, "site_content": site_content[:4000]}
+
+
+async def _sie_business_understanding(website_url: str, industry: str, city: str,
+                                       site_content: str, input_value: str) -> dict:
+    """
+    Step 2 — Business Understanding. Reuse Marketing Brain memory if it
+    exists (memory_reused: true). Otherwise a lightweight single GPT call
+    derives business name/positioning/industry from crawled/researched
+    content — never re-runs the full Marketing Brain pipeline.
+    """
+    memory_reused = False
+    biz_name, positioning, uvp = "", "", ""
+    detected_industry = industry
+
+    if website_url:
+        mem, _resolved_key = get_memory_with_city_fallback(website_url, industry, city)
+        bm = mem.get("business", {}) if mem else {}
+        if bm:
+            memory_reused = True
+            biz_name = bm.get("business_name", "") or ""
+            positioning = bm.get("positioning", "") or ""
+            uvp = bm.get("uvp", "") or ""
+            dna = bm.get("business_dna")
+            if isinstance(dna, dict):
+                detected_industry = dna.get("detected_industry", industry) or industry
+
+    if not memory_reused:
+        try:
+            prompt = (
+                "From the content below, identify this business's name, industry, one-line positioning, and "
+                "unique value proposition. Be specific — cite what's actually in the content, don't invent.\n\n"
+                f"INPUT: {input_value}\nCITY: {city}\n\nCONTENT:\n{(site_content or '')[:2500]}\n\n"
+                'Return ONLY JSON: {"business_name":"...","industry":"...","positioning":"...","uvp":"..."}'
+            )
+            resp = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, temperature=0.3, max_tokens=300,
+            )
+            parsed = json.loads(resp.choices[0].message.content)
+            biz_name = parsed.get("business_name") or input_value
+            detected_industry = parsed.get("industry") or industry
+            positioning = parsed.get("positioning", "")
+            uvp = parsed.get("uvp", "")
+        except Exception as _e:
+            logger.warning(f"[SIE] Business understanding fallback GPT call failed: {_e}")
+            biz_name = input_value
+
+    return {
+        "business_name": biz_name or input_value,
+        "industry":      detected_industry or industry,
+        "positioning":   positioning,
+        "uvp":           uvp,
+        "memory_reused": memory_reused,
+        "data_label":    "VERIFIED" if memory_reused else "INFERRED",
+    }
+
+
+async def _sie_youtube_step(youtube_url: str) -> dict:
+    """Step 3 — YouTube (VERIFIED via YouTube Data API), or an honest NOT_VERIFIED."""
+    if not youtube_url:
+        return {"found": False, "data_label": "NOT_VERIFIED",
+                "note": "No YouTube channel discovered for this business."}
+    stats = await fetch_youtube_channel_stats(youtube_url)
+    if not stats:
+        return {"found": False, "data_label": "NOT_VERIFIED",
+                "note": "Channel link found but could not retrieve public stats (private, deleted, or API quota)."}
+
+    recent = await fetch_youtube_channel_recent_videos(stats.get("channel_id", ""), max_results=6)
+    freq_note = "Not enough recent videos to estimate publishing frequency."
+    if len(recent) >= 2:
+        try:
+            dates = sorted((datetime.strptime(v["published_at"], "%Y-%m-%d") for v in recent), reverse=True)
+            gaps = [(dates[i] - dates[i + 1]).days for i in range(len(dates) - 1)]
+            if gaps:
+                freq_note = f"~1 video every {round(sum(gaps) / len(gaps))} days (based on last {len(recent)} uploads)"
+        except Exception:
+            pass
+
+    return {
+        "found":                True,
+        "channel_id":           stats.get("channel_id", ""),
+        "channel_title":        stats.get("title", ""),
+        "subscriber_count":     stats.get("subscriber_count"),
+        "video_count":          stats.get("video_count", 0),
+        "view_count":           stats.get("view_count", 0),
+        "recent_videos":        recent,
+        "publishing_frequency": freq_note,
+        "data_label":           "VERIFIED",
+    }
+
+
+async def _sie_gbp_step(business_name: str, city: str) -> dict:
+    """Step 4 — Google Business Profile (VERIFIED via Places API)."""
+    if not business_name:
+        return {"found": False, "data_label": "NOT_VERIFIED", "note": "No business name available to search."}
+    try:
+        results = await fetch_google_places(business_name, city, max_results=5)
+    except Exception as _e:
+        logger.warning(f"[SIE] Places search failed: {_e}")
+        results = []
+    if not results:
+        return {"found": False, "data_label": "NOT_VERIFIED",
+                "note": f"No Google Business Profile found for '{business_name}' in {city}."}
+
+    def _match_score(r):
+        name = (r.get("name") or "").lower()
+        target = business_name.lower()
+        exact = 1 if (target in name or name in target) else 0
+        return (exact, r.get("user_ratings_total", 0) or 0)
+
+    results.sort(key=_match_score, reverse=True)
+    best = results[0]
+    match_note = (
+        f"{len(results)} possible matches found in {city} — picked the closest name match with the most reviews."
+        if len(results) > 1 else None
+    )
+
+    return {
+        "found":           True,
+        "name":            best.get("name", ""),
+        "rating":          best.get("rating"),
+        "review_count":    best.get("user_ratings_total", 0),
+        "address":         best.get("address", ""),
+        "website":         best.get("website", ""),
+        "business_status": best.get("business_status", ""),
+        "match_note":      match_note,
+        "data_label":      "VERIFIED",
+    }
+
+
+async def _sie_website_step(website_url: str, business_key: str, industry: str, city: str) -> dict:
+    """Step 5 — Website Intelligence (VERIFIED). Thin wrapper around the
+    existing website_intelligence engine — no duplicated audit logic."""
+    if not website_url:
+        return {"found": False, "data_label": "NOT_VERIFIED", "note": "No website to audit."}
+    try:
+        outcome = await website_intelligence(WebsiteIntelligenceRequest(
+            url=website_url, business_key=business_key, industry=industry, city=city,
+        ))
+        if not outcome.get("success"):
+            return {"found": False, "data_label": "NOT_VERIFIED",
+                    "note": outcome.get("error", "Website audit failed.")}
+        audit = dict(outcome.get("audit", {}))
+        audit["found"] = True
+        audit["data_label"] = "VERIFIED"
+        return audit
+    except Exception as _e:
+        logger.error(f"[SIE] Website step failed: {_e}")
+        return {"found": False, "data_label": "NOT_VERIFIED", "note": f"Website audit error: {_e}"}
+
+
+async def _sie_social_observed_step(business_name: str, platforms: dict, city: str) -> dict:
+    """
+    Step 6 — Instagram/Facebook/LinkedIn (OBSERVED only). Tavily research for
+    publicly observable signals. NEVER outputs exact engagement rates, growth
+    curves, or fake follower percentages — only what the research snippets
+    actually say, labeled OBSERVED with a source snippet, or NOT_VERIFIED.
+    """
+    targets = ("instagram", "facebook", "linkedin")
+    queries = [
+        fetch_tavily(
+            f"{business_name} {city} {p} page followers activity reviews mentions"
+            + (f" {platforms[p]}" if platforms.get(p) else "")
+        )
+        for p in targets
+    ]
+    results = await asyncio.gather(*queries, return_exceptions=True)
+    research_by_platform = {p: (r if isinstance(r, str) else "") for p, r in zip(targets, results)}
+
+    combined = "\n\n".join(f"=== {p.upper()} ===\n{txt[:800]}" for p, txt in research_by_platform.items() if txt)
+    if not combined.strip():
+        return {
+            p: {"platform": p, "handle_or_url": platforms.get(p, ""), "data_label": "NOT_VERIFIED",
+                "note": "No reliable public data found. Connect this account for verified insights (coming in a future update)."}
+            for p in targets
+        }
+
+    try:
+        prompt = (
+            f"You are researching the PUBLIC social media presence of {business_name} in {city} using ONLY the "
+            "research snippets below. NEVER invent exact follower counts, engagement rates, or growth "
+            "percentages — only report what the snippets actually say. If a snippet mentions an approximate "
+            "follower count or activity level, report it AS MENTIONED with the source context. If nothing "
+            "reliable is found for a platform, say so explicitly and label it NOT_VERIFIED.\n\n"
+            f"{combined}\n\n"
+            "Return ONLY JSON with this exact structure:\n"
+            "{\n"
+            '  "instagram": {"approx_followers": "as mentioned in research, or null", "activity_level": "...", '
+            '"content_themes": ["...","..."], "notable_mentions": "...", "source_snippet": "...", '
+            '"data_label": "OBSERVED or NOT_VERIFIED", "note": "..."},\n'
+            '  "facebook": {"approx_followers": "...", "activity_level": "...", "content_themes": ["...","..."], '
+            '"notable_mentions": "...", "source_snippet": "...", "data_label": "...", "note": "..."},\n'
+            '  "linkedin": {"approx_followers": "...", "activity_level": "...", "content_themes": ["...","..."], '
+            '"notable_mentions": "...", "source_snippet": "...", "data_label": "...", "note": "..."}\n'
+            "}"
+        )
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, temperature=0.3, max_tokens=900,
+        )
+        parsed = json.loads(resp.choices[0].message.content)
+        for p in targets:
+            entry = parsed.get(p) or {}
+            entry.setdefault("platform", p)
+            entry.setdefault("handle_or_url", platforms.get(p, ""))
+            if entry.get("data_label") == "OBSERVED":
+                entry.setdefault("note", "")
+            else:
+                entry["data_label"] = "NOT_VERIFIED"
+                entry.setdefault("note", "Connect this account for verified insights (coming in a future update).")
+            parsed[p] = entry
+        return parsed
+    except Exception as _e:
+        logger.error(f"[SIE] Social observed synthesis failed: {_e}")
+        return {
+            p: {"platform": p, "handle_or_url": platforms.get(p, ""), "data_label": "NOT_VERIFIED",
+                "note": f"Research synthesis failed: {_e}"}
+            for p in targets
+        }
+
+
+async def _sie_competitor_step(business_name: str, industry: str, city: str, memory: dict) -> dict:
+    """Step 7 — Competitor Social Comparison. Reuses cached Marketing Brain
+    competitor memory if present; otherwise fresh Tavily-based discovery +
+    qualitative GPT comparison (no invented follower/engagement numbers)."""
+    cached = (memory or {}).get("competitor", {}).get("competitors") if memory else None
+    if isinstance(cached, str):
+        try:
+            cached = json.loads(cached)
+        except Exception:
+            cached = None
+    if cached and isinstance(cached, list):
+        return {
+            "competitors": [
+                ({"name": c, "data_label": "VERIFIED"} if isinstance(c, str) else {**c, "data_label": "VERIFIED"})
+                for c in cached[:3]
+            ],
+            "source": "Marketing Brain memory",
+            "data_label": "VERIFIED",
+        }
+
+    research = await fetch_tavily(
+        f"top competitors of {business_name} {industry} {city} social media presence Instagram Facebook"
+    )
+    if not research:
+        return {"competitors": [], "data_label": "NOT_VERIFIED", "note": "No competitor research data available."}
+    try:
+        prompt = (
+            f"From this research, identify 2-3 REAL competitors of {business_name} ({industry} in {city}) and "
+            "compare their social media activity level, content style, and positioning qualitatively — do not "
+            "invent exact follower counts or engagement metrics.\n\n"
+            f"RESEARCH:\n{research[:1500]}\n\n"
+            'Return ONLY JSON: {"competitors": [{"name":"...","activity_level":"...","content_style":"...",'
+            '"positioning":"..."}], "where_ahead": ["...","..."], "where_behind": ["...","..."]}'
+        )
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, temperature=0.4, max_tokens=700,
+        )
+        parsed = json.loads(resp.choices[0].message.content)
+        for c in parsed.get("competitors", []):
+            c["data_label"] = "OBSERVED"
+        parsed["data_label"] = "OBSERVED"
+        parsed["source"] = "Live web research"
+        return parsed
+    except Exception as _e:
+        logger.error(f"[SIE] Competitor step failed: {_e}")
+        return {"competitors": [], "data_label": "NOT_VERIFIED", "note": str(_e)}
+
+
+async def _sie_content_intelligence_step(business_name: str, industry: str, city: str, positioning: str) -> dict:
+    """Step 8 — Content Intelligence (INFERRED, one GPT call). 30-day calendar
+    (30 reels + 30 carousels + 30 stories) must never come back short — same
+    backfill pattern already proven for the Cricket Media Buying Brain."""
+    prompt = (
+        "You are a social media content strategist. Generate a complete content intelligence report for this "
+        "business — every idea must be SPECIFIC to this business, industry, and city. No generic filler like "
+        "'post a customer testimonial' — name the actual angle.\n\n"
+        f"Business: {business_name} | Industry: {industry} | City: {city}\n"
+        f"Positioning: {positioning or 'not available'}\n\n"
+        "Return ONLY JSON with this exact structure:\n"
+        "{\n"
+        '  "best_topics": ["...","...","...","...","..."],\n'
+        '  "content_gaps": ["...","...","..."],\n'
+        '  "posting_schedule": "...",\n'
+        '  "hook_styles": ["...","...","..."],\n'
+        '  "calendar": {\n'
+        '    "reels": [30 single-line specific reel ideas],\n'
+        '    "carousels": [30 single-line specific carousel ideas],\n'
+        '    "stories": [30 single-line specific story ideas]\n'
+        "  }\n"
+        "}\n"
+        "The calendar arrays MUST have EXACTLY 30 items each — no fewer. Each idea is ONE line, specific to "
+        f"{business_name} in {city}, not generic filler."
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, temperature=0.6, max_tokens=4000,
+        )
+        result = json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.error(f"[SIE] Content intelligence GPT call failed: {_e}")
+        result = {"error": str(_e)}
+
+    _sie_content_singular = {"reels": "reel", "carousels": "carousel", "stories": "story"}
+    calendar = result.setdefault("calendar", {})
+    for field in ("reels", "carousels", "stories"):
+        singular = _sie_content_singular[field]
+        items = calendar.get(field) or []
+        if len(items) < 30:
+            need = 30 - len(items)
+            logger.warning(f"[SIE] content calendar {field!r} short ({len(items)}/30) — backfilling {need}")
+            try:
+                fill_prompt = (
+                    f"Generate exactly {need} more specific, distinct {singular} ideas for {business_name} "
+                    f"({industry} in {city}) — each ONE line, no generic filler, different from these existing "
+                    f"ones: {json.dumps(items[:10])}\n"
+                    f'Return ONLY JSON: {{"{field}": [...]}} with exactly {need} items.'
+                )
+                fill_resp = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model="gpt-4o", messages=[{"role": "user", "content": fill_prompt}],
+                    response_format={"type": "json_object"}, temperature=0.6, max_tokens=800,
+                )
+                extra = json.loads(fill_resp.choices[0].message.content).get(field) or []
+                items = items + extra
+            except Exception as _be:
+                logger.warning(f"[SIE] Backfill for {field} failed: {_be}")
+            if len(items) < 30:
+                # Deterministic last-resort pad — clearly generic placeholder text,
+                # never presented as a real data point, just guarantees array length.
+                items = items + [
+                    f"{business_name} {singular} idea #{i + 1} — customize before publishing"
+                    for i in range(30 - len(items))
+                ]
+            calendar[field] = items[:30] if len(items) > 30 else items
+    result["calendar"] = calendar
+    result["data_label"] = "INFERRED"
+    return result
+
+
+def _sie_brand_health(youtube: dict, gbp: dict, website: dict, social: dict, content: dict) -> dict:
+    """
+    Step 9 — Brand Health Engine. Deterministic scoring from the actual
+    gathered signals — never a GPT guess. Sections backed only by OBSERVED/
+    INFERRED data are capped at 70 confidence, per the honesty rule.
+    """
+    def _confidence_for(label):
+        return {"VERIFIED": 90, "OBSERVED": 70, "INFERRED": 70}.get(label, 30)
+
+    website_label = "VERIFIED" if website.get("found") else "NOT_VERIFIED"
+    website_score = website.get("overall_score", 0) if website.get("found") else 0
+
+    if youtube.get("found"):
+        subs = youtube.get("subscriber_count") or 0
+        if subs >= 50000: yt_score = 90
+        elif subs >= 10000: yt_score = 75
+        elif subs >= 1000: yt_score = 55
+        elif subs > 0: yt_score = 35
+        else: yt_score = 20  # channel exists but subs hidden/zero
+        youtube_label = "VERIFIED"
+    else:
+        yt_score, youtube_label = 0, "NOT_VERIFIED"
+
+    if gbp.get("found"):
+        rating = gbp.get("rating") or 0
+        reviews = gbp.get("review_count") or 0
+        gbp_score = min(100, round((rating / 5 * 60) + min(reviews, 200) / 200 * 40))
+        gbp_label = "VERIFIED"
+    else:
+        gbp_score, gbp_label = 0, "NOT_VERIFIED"
+
+    observed_platforms = [p for p in ("instagram", "facebook", "linkedin")
+                           if isinstance(social.get(p), dict) and social[p].get("data_label") == "OBSERVED"]
+    social_score = round(len(observed_platforms) / 3 * 100) if social else 0
+    social_label = "OBSERVED" if observed_platforms else "NOT_VERIFIED"
+
+    has_calendar = bool((content or {}).get("calendar", {}).get("reels"))
+    content_score = 60 if has_calendar else 0
+    content_label = "INFERRED" if has_calendar else "NOT_VERIFIED"
+
+    weights = {"website": 0.30, "youtube": 0.15, "google_business": 0.20, "social_presence": 0.20, "content": 0.15}
+    scores = {"website": website_score, "youtube": yt_score, "google_business": gbp_score,
+              "social_presence": social_score, "content": content_score}
+    labels = {"website": website_label, "youtube": youtube_label, "google_business": gbp_label,
+              "social_presence": social_label, "content": content_label}
+    overall = round(sum(scores[k] * weights[k] for k in weights))
+    overall_confidence = round(sum(_confidence_for(labels[k]) * weights[k] for k in weights))
+
+    return {
+        "website":         {"score": website_score, "data_label": website_label, "confidence": _confidence_for(website_label)},
+        "youtube":         {"score": yt_score, "data_label": youtube_label, "confidence": _confidence_for(youtube_label)},
+        "google_business": {"score": gbp_score, "data_label": gbp_label, "confidence": _confidence_for(gbp_label)},
+        "social_presence": {"score": social_score, "data_label": social_label, "confidence": _confidence_for(social_label)},
+        "content":         {"score": content_score, "data_label": content_label, "confidence": _confidence_for(content_label)},
+        "overall":         {"score": overall, "data_label": "MIXED", "confidence": overall_confidence},
+    }
+
+
+async def _sie_growth_engine(business_name: str, industry: str, city: str, brand_health: dict,
+                              website: dict, social: dict, competitor: dict, content: dict) -> dict:
+    """Step 10 — Growth Engine. Quick wins / 30-day / 90-day / organic-vs-paid
+    split, gated by an explicit paid-campaign-readiness verdict when signals
+    are weak rather than recommending spend the business isn't ready for."""
+    rec_shape = ('{"observation":"...","evidence":"...","confidence":0,"expected_impact":"...","risk":"...",'
+                 '"priority":"high/medium/low","next_action":"..."}')
+    context = (
+        f"Business: {business_name} | Industry: {industry} | City: {city}\n"
+        f"Brand Health: {json.dumps(brand_health, ensure_ascii=False)}\n"
+        f"Website audit: overall_score={website.get('overall_score')}, quick_wins={website.get('quick_wins')}\n"
+        f"Social signals: {json.dumps({k: v.get('activity_level') for k, v in social.items() if isinstance(v, dict)}, ensure_ascii=False)}\n"
+        f"Competitor gaps: {json.dumps(competitor.get('where_behind', []), ensure_ascii=False)}\n"
+    )
+    prompt = (
+        "You are a senior growth strategist producing a prioritized action plan from this brand's actual audit "
+        "data above. Every major recommendation needs: observation, evidence, confidence (0-100), "
+        "expected_impact, risk, priority (high/medium/low), next_action.\n\n"
+        f"{context}\n"
+        "Also decide: is this business ready for PAID campaigns right now, or should it fix organic/website "
+        "fundamentals first? Base this on the brand_health.overall score and whether website/social signals are "
+        "strong enough — if overall health is weak (below ~50) or the website has major unresolved issues, say "
+        "clearly it is NOT ready and list the specific reasons, rather than recommending a paid campaign anyway.\n\n"
+        "Return ONLY JSON:\n"
+        "{\n"
+        f'  "quick_wins": [{rec_shape}, {rec_shape}],\n'
+        f'  "plan_30_day": [{rec_shape}, {rec_shape}],\n'
+        f'  "plan_90_day": [{rec_shape}, {rec_shape}],\n'
+        '  "organic_vs_paid_split": "...",\n'
+        '  "paid_campaign_readiness": {"ready": true, "reasons": ["...","..."]},\n'
+        '  "campaign_recommendations": ["...","...","..."]\n'
+        "}"
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, temperature=0.4, max_tokens=1800,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.error(f"[SIE] Growth engine call failed: {_e}")
+        return {"error": str(_e), "quick_wins": [], "plan_30_day": [], "plan_90_day": []}
+
+
+class SocialIntelRequest(BaseModel):
+    input_value: str
+    input_type:  str = "website"
+    city:        str = "Jaipur"
+    industry:    str = ""
+
+
+@app.post("/social-intelligence")
+async def social_intelligence(request: SocialIntelRequest):
+    input_value = (request.input_value or "").strip()
+    input_type  = request.input_type if request.input_type in _SIE_INPUT_TYPES else "website"
+    city        = request.city.strip() or "Jaipur"
+    industry    = (request.industry or "").strip()
+
+    if not input_value:
+        return {"success": False, "error": "input_value is required"}
+
+    warnings = []
+
+    # ── Step 1: Discovery ────────────────────────────────────────────────
+    try:
+        discovery = await _sie_discover_platforms(input_value, input_type, city)
+    except Exception as _e:
+        logger.error(f"[SIE] Discovery step failed: {_e}")
+        return {"success": False, "error": f"Platform discovery failed: {_e}"}
+
+    website_url  = discovery.get("website", "")
+    site_content = discovery.get("site_content", "")
+    platform_map = {p["platform"]: p["url"] for p in discovery["platforms"] if p["url"]}
+
+    business_key = derive_business_key(website_url or input_value, industry, city)
+
+    # ── Step 2: Business Understanding ───────────────────────────────────
+    try:
+        business_summary = await _sie_business_understanding(website_url, industry, city, site_content, input_value)
+    except Exception as _e:
+        logger.error(f"[SIE] Business understanding failed: {_e}")
+        business_summary = {"business_name": input_value, "industry": industry,
+                             "data_label": "INFERRED", "memory_reused": False}
+        warnings.append(f"business_understanding generation failed: {_e}")
+
+    business_name      = business_summary.get("business_name") or input_value
+    resolved_industry  = business_summary.get("industry") or industry
+    prior_memory, _rk  = get_memory_with_city_fallback(website_url or input_value, resolved_industry, city)
+
+    # ── Steps 3-8: PARALLEL with per-step failure isolation ──────────────
+    step_calls = {
+        "youtube":               lambda: _sie_youtube_step(platform_map.get("youtube", "")),
+        "google_business":       lambda: _sie_gbp_step(business_name, city),
+        "website":               lambda: _sie_website_step(website_url, business_key, resolved_industry, city),
+        "social_signals":        lambda: _sie_social_observed_step(business_name, platform_map, city),
+        "competitor_comparison": lambda: _sie_competitor_step(business_name, resolved_industry, city, prior_memory),
+        "content_intelligence":  lambda: _sie_content_intelligence_step(
+            business_name, resolved_industry, city, business_summary.get("positioning", "")
+        ),
+    }
+    step_names = list(step_calls.keys())
+    outcomes = await asyncio.gather(*[step_calls[n]() for n in step_names], return_exceptions=True)
+
+    step_results = {}
+    for name, outcome in zip(step_names, outcomes):
+        if isinstance(outcome, Exception):
+            logger.error(f"[SIE] Step {name!r} raised: {outcome}")
+            step_results[name] = {"data_label": "NOT_VERIFIED", "error": f"{type(outcome).__name__}: {outcome}"}
+            warnings.append(f"{name} step failed: {outcome}")
+        else:
+            step_results[name] = outcome
+
+    youtube_result    = step_results["youtube"]
+    gbp_result        = step_results["google_business"]
+    website_result    = step_results["website"]
+    social_result     = step_results["social_signals"]
+    competitor_result = step_results["competitor_comparison"]
+    content_result    = step_results["content_intelligence"]
+
+    # ── Step 9: Brand Health (deterministic) ─────────────────────────────
+    try:
+        brand_health = _sie_brand_health(youtube_result, gbp_result, website_result, social_result, content_result)
+    except Exception as _e:
+        logger.error(f"[SIE] Brand health scoring failed: {_e}")
+        brand_health = {"error": str(_e)}
+        warnings.append(f"brand_health scoring failed: {_e}")
+
+    # ── Step 10: Growth Engine ────────────────────────────────────────────
+    try:
+        growth = await _sie_growth_engine(
+            business_name, resolved_industry, city, brand_health,
+            website_result, social_result, competitor_result, content_result,
+        )
+    except Exception as _e:
+        logger.error(f"[SIE] Growth engine failed: {_e}")
+        growth = {"error": str(_e)}
+        warnings.append(f"growth_engine generation failed: {_e}")
+
+    result = {
+        "input_value":             input_value,
+        "input_type":              input_type,
+        "city":                    city,
+        "platform_discovery":      discovery["platforms"],
+        "business_summary":        business_summary,
+        "youtube":                 youtube_result,
+        "google_business_profile": gbp_result,
+        "website":                 website_result,
+        "social_signals":          social_result,
+        "competitor_comparison":   competitor_result,
+        "content_intelligence":    content_result,
+        "brand_health":            brand_health,
+        "growth_engine":           growth,
+    }
+
+    result = _clean_banned_words_deep(result)
+
+    try:
+        save_to_memory("social_intel", business_key, {"data": result})
+    except Exception as _se:
+        logger.warning(f"[SIE] Memory save failed: {_se}")
+
+    logger.info(f"[SIE] Done for input={input_value!r} type={input_type!r} business_key={business_key!r} warnings={warnings}")
+    return {
+        "success":       True,
+        "business_key":  business_key,
+        "memory_reused": business_summary.get("memory_reused", False),
+        "warnings":      warnings,
+        "data":          result,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
