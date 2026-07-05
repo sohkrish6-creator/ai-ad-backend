@@ -6160,9 +6160,57 @@ def _add_keywords_sync(ad_group_rn: str, keywords: list, customer_id: str):
     return [r.resource_name for r in resp.results]
 
 
+def _truncate_at_word_boundary(text: str, limit: int) -> str:
+    """Truncate to `limit` chars without cutting a word in half where avoidable."""
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    truncated = text[:limit]
+    last_space = truncated.rfind(" ")
+    # Only back off to the word boundary if it doesn't throw away more than
+    # half the budget — otherwise a single long word would collapse to almost nothing.
+    if last_space > limit * 0.5:
+        truncated = truncated[:last_space]
+    return truncated.rstrip(" ,.-")
+
+
+def _dedupe_preserve_order(items: list) -> list:
+    """Drop case-insensitive duplicates, keeping first occurrence order.
+    Needed because truncation can collapse two distinct headlines/descriptions
+    into identical text, which Google Ads rejects as a duplicate asset."""
+    seen = set()
+    result = []
+    for it in items:
+        key = it.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(it)
+    return result
+
+
 def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
                     final_url: str, customer_id: str):
-    """Synchronous: create a ResponsiveSearchAd in an ad group."""
+    """
+    Synchronous: create a ResponsiveSearchAd in an ad group.
+    Enforces Google Ads character limits (30/90) via word-boundary truncation,
+    then de-duplicates — raises ValueError (never silently proceeds) if that
+    leaves fewer than the Google Ads minimum (3 headlines / 2 descriptions),
+    since sending too few would fail at the API anyway with a less clear error.
+    """
+    clean_headlines    = _dedupe_preserve_order([_truncate_at_word_boundary(h, 30) for h in headlines if str(h).strip()])
+    clean_descriptions = _dedupe_preserve_order([_truncate_at_word_boundary(d, 90) for d in descriptions if str(d).strip()])
+
+    if len(clean_headlines) < 3:
+        raise ValueError(
+            f"Only {len(clean_headlines)} unique headline(s) survived cleanup/truncation "
+            f"(Google Ads requires 3+); original count was {len(headlines)}"
+        )
+    if len(clean_descriptions) < 2:
+        raise ValueError(
+            f"Only {len(clean_descriptions)} unique description(s) survived cleanup/truncation "
+            f"(Google Ads requires 2+); original count was {len(descriptions)}"
+        )
+
     client  = get_google_ads_client()
     svc     = client.get_service("AdGroupAdService")
     op      = client.get_type("AdGroupAdOperation")
@@ -6171,13 +6219,13 @@ def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
     aga.status   = client.enums.AdGroupAdStatusEnum.ENABLED
 
     rsa = aga.ad.responsive_search_ad
-    for h in headlines[:15]:
+    for h in clean_headlines[:15]:
         asset = client.get_type("AdTextAsset")
-        asset.text = str(h)[:30]
+        asset.text = h
         rsa.headlines.append(asset)
-    for d in descriptions[:4]:
+    for d in clean_descriptions[:4]:
         asset = client.get_type("AdTextAsset")
-        asset.text = str(d)[:90]
+        asset.text = d
         rsa.descriptions.append(asset)
     aga.ad.final_urls.append(final_url)
 
@@ -6271,9 +6319,10 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         business_key = derive_business_key(lookup_source, request.industry, request.city)
         logger.info(f"[GADS CREATE] LOOKUP key: '{business_key}'")
 
-        keywords_added  = []
-        ad_created      = None
-        sitelinks_added = []
+        keywords_added    = []
+        ad_created        = None
+        ad_creation_error = None
+        sitelinks_added   = []
         if lookup_source:
             mem, resolved_key = get_memory_with_city_fallback(lookup_source, request.industry, request.city)
             camp_data_raw = mem.get("campaign", {}).get("campaign_data", {}) if mem else {}
@@ -6307,19 +6356,39 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             final_url    = request.url.strip()
             if final_url and not re.match(r'^https?://', final_url, re.I):
                 final_url = f"https://{final_url}"
+
+            logger.info(
+                f"[GADS CREATE] memory assets: keywords={len(kw_list)}, "
+                f"headlines={len(headlines)}, descriptions={len(descriptions)}"
+            )
+
             if len(headlines) >= 3 and len(descriptions) >= 2 and final_url:
                 try:
                     ad_created = await asyncio.to_thread(
                         _create_ad_sync, result["ad_group_rn"], headlines, descriptions, final_url, customer_id
                     )
                     logger.info(f"[GADS-CREATE] Ad created: {ad_created}")
+                except GoogleAdsException as _gae:
+                    ad_creation_error = []
+                    for _e in _gae.failure.errors:
+                        _detail = {"error_code": str(_e.error_code), "message": _e.message, "field": None}
+                        if _e.location:
+                            _detail["field"] = str(_e.location.field_path_elements)
+                        ad_creation_error.append(_detail)
+                    logger.error(f"[GADS-CREATE] Ad creation GoogleAdsException: {ad_creation_error}")
                 except Exception as _ae:
-                    logger.warning(f"[GADS-CREATE] Ad creation failed: {_ae}")
+                    ad_creation_error = str(_ae)
+                    logger.error(f"[GADS-CREATE] Ad creation failed: {_ae}")
             else:
-                logger.info(
-                    f"[GADS-CREATE] Skipping ad creation — headlines={len(headlines)} "
-                    f"descriptions={len(descriptions)} final_url={final_url!r}"
-                )
+                reasons = []
+                if len(headlines) < 3:
+                    reasons.append(f"only {len(headlines)} headline(s) in memory (need 3+)")
+                if len(descriptions) < 2:
+                    reasons.append(f"only {len(descriptions)} description(s) in memory (need 2+)")
+                if not final_url:
+                    reasons.append("no landing page URL provided")
+                ad_creation_error = "Ad not created — " + "; ".join(reasons)
+                logger.warning(f"[GADS-CREATE] Skipping ad creation: {ad_creation_error}")
 
             # Sitelinks — Google Ads' "Ad Strength" grader also checks these;
             # without them a technically-valid RSA still scores lower.
@@ -6332,11 +6401,15 @@ async def gads_create_campaign(request: CreateCampaignRequest):
                     logger.info(f"[GADS-CREATE] Added {len(sitelinks_added)} sitelinks from memory")
                 except Exception as _se:
                     logger.warning(f"[GADS-CREATE] Sitelink creation failed: {_se}")
+        else:
+            ad_creation_error = "Ad not created — no business_key/url provided to look up campaign assets"
 
-        result["keywords_added"] = len(keywords_added)
-        result["ad_created"]     = bool(ad_created)
-        result["ad"]             = ad_created
-        result["sitelinks_added"] = len(sitelinks_added)
+        result["keywords_added"]    = len(keywords_added)
+        result["ad_created"]       = bool(ad_created)
+        result["ads_created"]      = 1 if ad_created else 0
+        result["ad"]               = ad_created
+        result["ad_creation_error"] = ad_creation_error
+        result["sitelinks_added"]  = len(sitelinks_added)
         result["location_target"] = {
             "resource_name": location_resource_name,
             "matched_name":  location_matched_name,
