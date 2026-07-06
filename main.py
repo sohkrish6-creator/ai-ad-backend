@@ -6777,9 +6777,12 @@ async def gads_create_ad(request: CreateAdRequest):
         return {"success": True, **result}
 
     except GoogleAdsException as ex:
-        errors = [e.message for e in ex.failure.errors]
-        logger.error(f"[GADS-AD] API error: {errors}")
-        return {"success": False, "error": "; ".join(errors)}
+        policy_violations = _extract_policy_violations(ex)
+        for _v in policy_violations:
+            if _v["topic"]:
+                logger.info(f"[GADS AD POLICY] topic={_v['topic']}, evidence={_v['evidence']}")
+        logger.error(f"[GADS-AD] API error: {[v['message'] for v in policy_violations]}")
+        return {"success": False, **_build_policy_error_response(policy_violations)}
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[GADS-AD] ERROR: {_e}\n{tb}")
