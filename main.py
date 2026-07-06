@@ -341,14 +341,19 @@ def derive_business_key(url: str, industry: str = "", city: str = "") -> str:
     Single shared key-derivation function used by ALL endpoints (save + lookup).
 
     Non-B2B (url only, no industry):       "sohscape.com"
-    B2B (url + target industry + city):    "sohscape.com::hospitality::jaipur"
-    Industry-only mode (no url):           "hospitality::jaipur"
+    B2B (url + target industry + city):    "sohscape.com::hospitality::mumbai"
+    Industry-only mode (no url):           "hospitality::mumbai"
 
-    City always defaults to "jaipur" when blank so keys are ALWAYS complete
-    and consistent regardless of whether the frontend sent city="" or city="Jaipur".
+    City always defaults to "india" (national scope) when blank — NEVER a
+    specific city — so keys are ALWAYS complete and consistent regardless of
+    whether the frontend sent city="" or a real city, without silently
+    assuming the business is in any one place.
     """
-    # City default: ALWAYS "jaipur" when blank — prevents key mismatches
-    _tc = (city or "").strip().lower() or "jaipur"
+    # City default: ALWAYS "india" (national scope) when blank — never a
+    # specific city. This used to default to "jaipur", which silently
+    # assumed every business with no city was in Jaipur — that assumption
+    # is exactly what this tool must never make.
+    _tc = (city or "").strip().lower() or "india"
 
     if url and url.strip():
         k = url.strip().rstrip("/").lower()
@@ -428,7 +433,7 @@ def get_memory(business_key: str) -> dict:
 def get_memory_with_city_fallback(business_key: str, industry: str = "", city: str = "") -> tuple:
     """
     Returns (memory_dict, key_used).
-    1. Try exact derived key (city defaults to 'jaipur' in derive_business_key).
+    1. Try exact derived key (city defaults to 'india' — national scope — in derive_business_key).
     2. If miss: try the legacy blank-city key (data saved before the city-default fix).
     3. If still miss: LIKE prefix query to find any key matching url::industry::*
     """
@@ -1246,16 +1251,19 @@ For {request.target_industry} businesses in {request.target_city}, include:
     tavily_market = ""
     live_data_used = False
     if TAVILY_API_KEY:
-        city_for_tavily = request.target_city or "Jaipur"
+        # No silent city assumption: blank city means national (India-wide) scope,
+        # never a specific city the user didn't actually provide.
+        city_for_tavily = request.target_city.strip() if request.target_city else ""
+        location_phrase = f"{city_for_tavily} India" if city_for_tavily else "India (nationally)"
         q_competitors = (
             f"List actual {request.business_type} companies and "
-            f"{request.business_type} providers operating in {city_for_tavily} India 2026. "
+            f"{request.business_type} providers operating in {location_phrase} 2026. "
             f"Include local players, not just WeWork or Regus. "
             f"Give company names, locations, pricing if available."
         )
         q_market = (
             f"Digital marketing strategies working for {request.business_type} businesses "
-            f"in {city_for_tavily} India in 2026. "
+            f"in {location_phrase} in 2026. "
             f"What platforms, what content, what offers are getting results right now."
         )
         logger.info(f"[FULL-REPORT] Fetching Tavily data for: {request.business_type}")
@@ -1923,7 +1931,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "('Before wedding season fills up'). BANNED generic patterns in any headline or hook: 'Best services', "
         "'Quality solutions', 'Your trusted partner'.\n\n"
         "=== META ADS LAUNCH KIT ===\n"
-        f"Campaign Name: [exact name — format: CityType_Industry_Goal_{_month_short}, e.g. Jaipur_Coaching_Leads_{_month_short}]\n"
+        f"Campaign Name: [exact name — format: City_Industry_Goal_{_month_short}, e.g. {city_label.replace(' ', '')}_Coaching_Leads_{_month_short}]\n"
         f"Objective: [exact Meta objective — Leads / Traffic / Engagement / Sales — state which and why]\n"
         f"Daily Budget: Rs {int(meta_bdgt / 30)} per day (Rs {meta_bdgt}/month — 50% of total)\n"
         "---\n"
@@ -1947,7 +1955,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "CTA Button: [exact Meta button label]\n"
         "---\n"
         "AD VARIATION 2 — PROOF ANGLE (numbers, results, credibility — must be distinct from Ad 1)\n"
-        "Primary Text: [4-5 lines. Open with a specific result ('Jaipur ke 30+ businesses ne X result paya in 60 days'). No generic claims. Close with exact CTA]\n"
+        f"Primary Text: [4-5 lines. Open with a specific result ('{city_label} ke 30+ businesses ne X result paya in 60 days'). No generic claims. Close with exact CTA]\n"
         "Headline: [max 40 chars — include specific result or number — different from Ad 1]\n"
         "Description: [max 30 chars]\n"
         "CTA Button: [exact Meta button label]\n"
@@ -1963,7 +1971,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "Image/Video for Variation 2: [specific shot — result visual, screenshot, or testimonial format]\n"
         "Image/Video for Variation 3: [urgency creative — countdown, limited-spots visual, or seasonal angle]\n\n"
         "=== GOOGLE ADS LAUNCH KIT ===\n"
-        f"Campaign Name: [exact name — format: City_Industry_Search_{_month_short}, e.g. Jaipur_Coaching_Search_{_month_short}]\n"
+        f"Campaign Name: [exact name — format: City_Industry_Search_{_month_short}, e.g. {city_label.replace(' ', '')}_Coaching_Search_{_month_short}]\n"
         "Campaign Type: Search\n"
         f"Daily Budget: Rs {int(google_bdgt / 30)} per day (Rs {google_bdgt}/month — 40% of total)\n"
         "Bid Strategy:\n"
@@ -1973,8 +1981,8 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "  Reason: [one sentence why this strategy fits the goal]\n"
         "---\n"
         "PRIMARY KEYWORD: Before writing anything below, decide ONE primary keyword phrase for "
-        f"this business — normally [service/industry] + {city_label}, e.g. 'hospitality marketing jaipur' "
-        "or 'hotel booking jaipur'. Reuse this exact phrase (and close variants) in the keyword-match "
+        f"this business — normally [service/industry] + {city_label}, e.g. 'hospitality marketing {city_label.lower()}' "
+        f"or 'hotel booking {city_label.lower()}'. Reuse this exact phrase (and close variants) in the keyword-match "
         "headlines marked below — this drives Google Ads' 'Ad Strength' relevance signal.\n"
         "KEYWORDS (15 minimum — mix of match types, include local + intent keywords)\n"
         "[exact match] keyword 1\n[exact match] keyword 2\n[exact match] keyword 3\n"
@@ -1992,15 +2000,15 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "the same idea in different words scores 'Poor'. Every one of the 15 below must be a genuinely "
         "different angle (not a reword of another headline) and must fit in 30 characters:\n"
         "AD 1 — BENEFIT ANGLE (what they get — specific outcome)\n"
-        "Headline 1: [KEYWORD-MATCH — literally include the PRIMARY KEYWORD phrase + city, e.g. 'Hospitality Marketing Jaipur']\n"
+        f"Headline 1: [KEYWORD-MATCH — literally include the PRIMARY KEYWORD phrase + city, e.g. 'Hospitality Marketing {city_label}']\n"
         "Headline 2: [max 30 chars — include city or specific offer]\n"
         "Headline 3: [max 30 chars — CTA or urgency]\n"
         "Description 1: [80-90 chars MANDATORY — specific benefit with number or proof. Last sentence = CTA. Count characters.]\n"
         "Description 2: [80-90 chars MANDATORY — social proof or differentiator. Last sentence = CTA. Count characters.]\n"
         "---\n"
         "AD 2 — PROOF ANGLE (numbers, results, credibility — completely different from Ad 1)\n"
-        "Headline 1: [KEYWORD-MATCH VARIANT — different word order/synonym of the PRIMARY KEYWORD + city, e.g. 'Jaipur Hospitality Experts', ALSO include a specific result number]\n"
-        "Headline 2: [max 30 chars — who got the result, e.g. 'Jaipur Hotels Trust Us']\n"
+        f"Headline 1: [KEYWORD-MATCH VARIANT — different word order/synonym of the PRIMARY KEYWORD + city, e.g. '{city_label} Hospitality Experts', ALSO include a specific result number]\n"
+        f"Headline 2: [max 30 chars — who got the result, e.g. '{city_label} Hotels Trust Us']\n"
         "Headline 3: [max 30 chars — CTA]\n"
         "Description 1: [80-90 chars MANDATORY — state the specific result and who achieved it. Last sentence = CTA.]\n"
         "Description 2: [80-90 chars MANDATORY — credibility signal (years, clients, industry). Last sentence = CTA.]\n"
@@ -2015,7 +2023,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "---\n"
         "ADDITIONAL RSA HEADLINES (6 more — MANDATORY, brings the total to 15. Each MUST be a completely "
         "different angle from the 9 above and from each other — no rewording of an existing headline):\n"
-        "Headline 10: [KEYWORD-MATCH — the PRIMARY KEYWORD phrase + city, plain and direct, e.g. 'Hotel Booking Jaipur Experts']\n"
+        f"Headline 10: [KEYWORD-MATCH — the PRIMARY KEYWORD phrase + city, plain and direct, e.g. 'Hotel Booking {city_label} Experts']\n"
         "Headline 11: [KEYWORD-MATCH VARIANT — a third distinct phrasing of the PRIMARY KEYWORD + city]\n"
         "Headline 12: [KEYWORD-MATCH VARIANT — a fourth distinct phrasing, e.g. service + 'near' + city or a neighborhood in the city]\n"
         "Headline 13: [FEATURE-FOCUSED — name one concrete deliverable/feature, not a vague benefit]\n"
@@ -4117,7 +4125,7 @@ RULES:
 class OutreachAIRequest(BaseModel):
     url:           str = ""
     industry:      str = ""
-    city:          str = "Jaipur"
+    city:          str = ""
     target_name:   str = ""
     outreach_goal: str = "get meeting"
     # kept for backward compat but no longer the primary key source
@@ -4126,7 +4134,17 @@ class OutreachAIRequest(BaseModel):
 @app.post("/outreach-ai")
 async def outreach_ai(request: OutreachAIRequest):
     industry = (request.industry or "").strip()
-    city     = (request.city     or "Jaipur").strip()
+    city     = (request.city or "").strip()
+    city_display = city or "India (no specific city given)"
+    # Personalization instruction needs a real place name to ask for a "local
+    # landmark" — fall back to an industry-specific (not falsely localized) detail
+    # when no city was provided, rather than inventing a city-specific reference.
+    personalization_scope = (
+        f"THIS business type in {city} — a local landmark, a seasonal event, a known local pain point"
+        if city else
+        f"THIS business type in the {industry or 'this'} industry nationally — a known industry-specific pain "
+        "point, seasonal pattern, or trend (do NOT invent a city or region that wasn't provided)"
+    )
     goal     = (request.outreach_goal or "get meeting").strip()
     target   = (request.target_name   or "").strip()
 
@@ -4182,7 +4200,7 @@ BUSINESS CONTEXT (from memory):
 - Business / Agency: {_bm.get("business_name", "Sohscape")} | UVP: {_bm.get("uvp", "")}
 - Positioning: {_bm.get("positioning", "")}
 - Industry being targeted: {industry or _bm.get("industry", "")}
-- City: {city}
+- City: {city_display}
 - Outreach goal: {goal}
 {f"- Specific target: {target}" if target else ""}
 
@@ -4265,7 +4283,7 @@ Return ONLY a valid JSON object matching this EXACT schema (no markdown, no text
 }}
 
 RULES:
-- WhatsApp and Instagram must mix Hindi/Hinglish naturally — like a real Jaipur agency owner would write. NOT robotic translation.
+- WhatsApp and Instagram must mix Hindi/Hinglish naturally — like a real Indian agency owner would write. NOT robotic translation.
 - Cold email body must be UNDER 150 words. Count carefully.
 - LinkedIn connection_request STRICTLY under 300 characters. Count carefully.
 - Instagram opener STRICTLY 3 lines. No more.
@@ -4273,9 +4291,9 @@ RULES:
 - Every objection response must reference the specific {industry} context.
 - BANNED words in all copy: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Game-changer, Dive in, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.
 - PERSONALIZATION DEPTH: every message (cold_email, linkedin_message, whatsapp, instagram_dm, call_script) must
-  contain at least ONE specific detail that could only apply to THIS business type in {city} — a local landmark,
-  a seasonal event, a known local pain point. A message that could be sent to any business anywhere is a failure —
-  rewrite it with a concrete {city}/{industry}-specific reference before returning.
+  contain at least ONE specific detail that could only apply to {personalization_scope}.
+  A message that could be sent to any business anywhere is a failure — rewrite it with a concrete,
+  specific reference before returning.
 - CONFIDENCE DISCIPLINE: "confidence" must reflect actual evidence available in the context above. Memory-backed
   personalization (business/market/opportunity/offer data all present) = high confidence (80+). Partial memory
   (only some tables populated) = medium (50-70). Little to no memory backing = low (<50). Never give 85+
@@ -4313,14 +4331,16 @@ RULES:
 class KPIEngineRequest(BaseModel):
     url:      str = ""
     industry: str
-    city:     str = "Jaipur"
+    city:     str = ""
     budget:   float = 0.0
     goal:     str = "Lead Generation"
 
 @app.post("/kpi-engine")
 async def kpi_engine(request: KPIEngineRequest):
     industry = (request.industry or "").strip()
-    city     = (request.city     or "Jaipur").strip()
+    city     = (request.city or "").strip()
+    # No city given = national India benchmarks, never a silently-assumed city.
+    city_scope = city or "India (national average)"
     goal     = (request.goal     or "Lead Generation").strip()
     budget   = request.budget or 0.0
 
@@ -4372,7 +4392,7 @@ async def kpi_engine(request: KPIEngineRequest):
     context = f"""
 CAMPAIGN PARAMETERS:
 - Industry: {industry}
-- City: {city}
+- City: {city_scope}
 - Goal: {goal}
 - Budget: {budget_str}
 
@@ -4406,7 +4426,7 @@ WEBSITE HEALTH:
 
     _growth_block = growth_learning_block(industry)
 
-    prompt = f"""You are a performance marketing expert specialising in Indian digital advertising for {industry} businesses in {city}.
+    prompt = f"""You are a performance marketing expert specialising in Indian digital advertising for {industry} businesses in {city_scope}.
 Generate precise, data-driven KPI predictions for this campaign. All numbers must reflect real Indian market benchmarks for this specific industry and city.
 
 {context}
@@ -4422,8 +4442,8 @@ Return ONLY a valid JSON object (no markdown, no text outside JSON) with this EX
   }},
   "predicted_metrics": {{
     "ctr": {{"value": "X.X%", "range": "X%-X%", "benchmark": "industry avg for {industry} on Google/Meta"}},
-    "cpc": {{"value": "₹XX", "range": "₹X-₹X", "benchmark": "avg CPC for {industry} in {city}"}},
-    "cpl": {{"value": "₹XXX", "range": "₹X-₹X", "benchmark": "avg CPL for {industry} in {city}"}},
+    "cpc": {{"value": "₹XX", "range": "₹X-₹X", "benchmark": "avg CPC for {industry} in {city_scope}"}},
+    "cpl": {{"value": "₹XXX", "range": "₹X-₹X", "benchmark": "avg CPL for {industry} in {city_scope}"}},
     "cpa": {{"value": "₹XXX", "range": "₹X-₹X", "benchmark": "avg CPA for {industry}"}},
     "roas": {{"value": "X.Xx", "range": "X-Xx", "benchmark": "expected ROAS for {industry} at this budget"}},
     "reach": {{"value": "XX,XXX", "range": "XX,XXX-XX,XXX"}},
@@ -4515,14 +4535,14 @@ RULES:
 class AutonomousMarketingRequest(BaseModel):
     url:       str = ""
     industry:  str = ""
-    city:      str = "Jaipur"
+    city:      str = ""
     budget:    float = 0.0
     goal_text: str
 
 @app.post("/autonomous-marketing")
 async def autonomous_marketing(request: AutonomousMarketingRequest):
     industry  = (request.industry or "").strip()
-    city      = (request.city     or "Jaipur").strip()
+    city      = (request.city or "").strip()
     budget    = request.budget or 0.0
     goal_text = (request.goal_text or "").strip()
 
@@ -4532,6 +4552,9 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
     _bk_src = (request.url or "").strip()
     memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
     logger.info(f"[AUTONOMOUS] key={norm_key!r} industry={industry!r} city={city!r} budget={budget} goal_text={goal_text!r}")
+
+    # No city given = national India scope, never a silently-assumed city.
+    city_display = city or "India (no specific city given)"
 
     def _safe(d, *keys, dfl="N/A"):
         cur = d
@@ -4560,7 +4583,7 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
     context = (
         "BUSINESS: " + _safe(_bm, "business_name") +
         " | Industry: " + (industry or _safe(_bm, "industry")) +
-        " | City: " + city +
+        " | City: " + city_display +
         " | Monthly Budget: ₹" + str(int(budget)) + "\n"
         "USER'S GOAL (plain language, may be ambiguous — interpret it before deciding anything): \"" + goal_text + "\"\n\n"
         "KNOWN BUSINESS DATA:\n"
@@ -4651,7 +4674,7 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
 class PerformanceIntelligenceRequest(BaseModel):
     url:        str = ""
     industry:   str = ""
-    city:       str = "Jaipur"
+    city:       str = ""
     date_range: str = "30d"
 
 def _parse_days(date_range: str) -> int:
@@ -4762,7 +4785,8 @@ ORDER BY metrics.cost_micros DESC
 async def performance_intelligence(request: PerformanceIntelligenceRequest):
     try:
         industry   = (request.industry or "").strip()
-        city       = (request.city     or "Jaipur").strip()
+        city       = (request.city or "").strip()
+        city_display = city or "India (national average)"
         date_range = (request.date_range or "30d").strip()
         days       = _parse_days(date_range)
         _bk_src    = (request.url or "").strip()
@@ -4856,7 +4880,7 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         prompt = (
             "You are a senior Google Ads performance analyst for an Indian digital marketing agency.\n"
             "Analyse the following campaign performance data and return a JSON report.\n\n"
-            "BUSINESS: " + _sv(_bm, "business_name") + " | Industry: " + industry + " | City: " + city + "\n"
+            "BUSINESS: " + _sv(_bm, "business_name") + " | Industry: " + industry + " | City: " + city_display + "\n"
             "ANALYSIS PERIOD: Last " + str(days) + " days (" + str(perf_data.get("start_date", "N/A")) + " to " + str(perf_data.get("end_date", "N/A")) + ")\n"
             "GOOGLE ADS CONNECTED: " + str(google_ads_connected) + "\n\n"
             "ACTUAL GOOGLE ADS METRICS:\n"
@@ -4976,9 +5000,9 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
 class AIOptimizerRequest(BaseModel):
     url:      str = ""
     industry: str = ""
-    city:     str = "Jaipur"
+    city:     str = ""
 
-async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = "Jaipur") -> dict:
+async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = "") -> dict:
     """
     Core optimizer logic, factored out of the /ai-optimizer endpoint so it can
     also be driven in bulk by /optimizer/run-all (Phase 10 continuous
@@ -4986,7 +5010,8 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
     """
     try:
         industry = (industry or "").strip()
-        city     = (city     or "Jaipur").strip()
+        city     = (city or "").strip()
+        city_display = city or "India (national average)"
         _bk_src  = (url      or "").strip()
 
         logger.info(f"[AI-OPT] url={url!r} industry={industry!r} city={city!r}")
@@ -5121,7 +5146,7 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
         context = (
             "BUSINESS: " + _sv(business_data, "business_name") +
             " | Industry: " + (industry or _sv(business_data, "industry")) +
-            " | City: " + city + "\n\n"
+            " | City: " + city_display + "\n\n"
 
             "=== KPI ENGINE (Expected) ===\n"
             + ("NOT AVAILABLE\n" if not has_kpi else (
@@ -5302,7 +5327,7 @@ async def optimizer_run_all():
             mem = get_memory(bk)
             bm = mem.get("business", {}) or {}
             industry = bm.get("industry", "") or ""
-            city     = bm.get("city", "") or "Jaipur"
+            city     = bm.get("city", "") or ""
             # business_key encodes the url/industry portion; business_memory's own
             # industry/city columns (saved by full-report) are the reliable source
             # since the key itself may be url-only or industry-only depending on mode.
@@ -5345,7 +5370,7 @@ async def optimizer_run_all():
 class ResultCenterRequest(BaseModel):
     url:      str = ""
     industry: str = ""
-    city:     str = "Jaipur"
+    city:     str = ""
 
 def _save_growth_memory(gmp: dict):
     """Insert one row into growth_memory (anonymous, no business_key)."""
@@ -5444,7 +5469,8 @@ def growth_learning_block(industry: str, label: str = "CROSS-BUSINESS LEARNING")
 async def result_center(request: ResultCenterRequest):
     try:
         industry = (request.industry or "").strip()
-        city     = (request.city     or "Jaipur").strip()
+        city     = (request.city or "").strip()
+        city_display = city or "India (national average)"
         _bk_src  = (request.url     or "").strip()
 
         logger.info(f"[RESULT] url={request.url!r} industry={industry!r} city={city!r}")
@@ -5516,7 +5542,7 @@ async def result_center(request: ResultCenterRequest):
         context = (
             "BUSINESS: " + _sv(business_data,"business_name") +
             " | Industry: " + (industry or _sv(business_data,"industry")) +
-            " | City: " + city + "\n\n"
+            " | City: " + city_display + "\n\n"
 
             "=== KPI ENGINE (Predicted) ===\n"
             + ("NOT AVAILABLE\n" if not has_kpi else
@@ -5712,7 +5738,7 @@ def _get_search_terms(industry: str) -> str:
 
 class ProspectDiscoveryRequest(BaseModel):
     industry:       str
-    city:           str  = "Jaipur"
+    city:           str  = ""
     url:            str  = ""
     max_prospects:  int  = 15
 
@@ -5744,14 +5770,17 @@ async def _retry_openai_call(fn, retries: int = 2, base_delay: float = 2.0, labe
 async def prospect_discovery(request: ProspectDiscoveryRequest):
     try:
         industry       = (request.industry or "").strip()
-        city           = (request.city or "Jaipur").strip()
+        city           = (request.city or "").strip()
+        # Prospect discovery genuinely needs a location to search — blank means
+        # search nationally (India) rather than silently assuming a specific city.
+        search_scope   = city or "India"
         max_prospects  = max(5, min(request.max_prospects, 20))
 
         search_terms   = _get_search_terms(industry)
         logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms!r}")
 
         # 1. Text-search Google Places
-        raw_places = await fetch_google_places(search_terms, city, max_results=20)
+        raw_places = await fetch_google_places(search_terms, search_scope, max_results=20)
         google_places_used = bool(raw_places)
         logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results")
 
@@ -5779,11 +5808,11 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         tavily_results = {}
         if TAVILY_API_KEY and enriched:
             tasks_social = [
-                fetch_tavily(f"{p['name']} {city} Instagram Facebook social media")
+                fetch_tavily(f"{p['name']} {search_scope} Instagram Facebook social media")
                 for p in enriched[:6]
             ]
             tasks_ads = [
-                fetch_tavily(f"{p['name']} {city} ads marketing campaigns")
+                fetch_tavily(f"{p['name']} {search_scope} ads marketing campaigns")
                 for p in enriched[:6]
             ]
             social_data, ads_data = await asyncio.gather(
@@ -5816,7 +5845,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             )
 
         prompt = (
-            "You are a B2B prospect scoring expert for a digital marketing agency in " + city + ".\n"
+            "You are a B2B prospect scoring expert for a digital marketing agency in " + search_scope + ".\n"
             "Industry focus: " + industry + "\n\n"
             "Analyse these REAL local businesses found on Google Maps and score them as prospects.\n\n"
             "SCORING RULES:\n"
@@ -5835,9 +5864,9 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             "Return JSON:\n"
             "{\n"
             '  "total_found": ' + str(len(enriched)) + ',\n'
-            '  "city": "' + city + '",\n'
+            '  "city": "' + search_scope + '",\n'
             '  "industry": "' + industry + '",\n'
-            '  "search_query_used": "' + search_terms + ' in ' + city + '",\n'
+            '  "search_query_used": "' + search_terms + ' in ' + search_scope + '",\n'
             '  "data_source": "Google Places API + Tavily",\n'
             '  "top_opportunity": "Name of best prospect and one sentence why",\n'
             '  "prospects": [\n'
@@ -5858,7 +5887,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             '      "why_contact": "specific reason based on real data",\n'
             '      "weakness_found": "specific weakness (no website / 3 reviews only / no Instagram / last post 4 months ago)",\n'
             '      "recommended_service": "Meta Ads Management",\n'
-            '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + city + ' get more customers through [service]. Would love to show you what we did for similar businesses here."\n'
+            '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + search_scope + ' get more customers through [service]. Would love to show you what we did for similar businesses here."\n'
             "    }\n"
             "  ]\n"
             "}\n"
@@ -7137,7 +7166,7 @@ async def meta_ads_delete_campaign(request: DeleteMetaCampaignRequest):
 class SmartAnalysisRequest(BaseModel):
     url:      str
     industry: str   = ""
-    city:     str   = "Jaipur"
+    city:     str   = ""
     budget:   float = 0.0
 
 
@@ -7475,7 +7504,7 @@ async def smart_analysis_plan(request: SmartAnalysisRequest):
 class SmartAnalysisExecuteRequest(BaseModel):
     url:             str
     industry:        str   = ""
-    city:            str   = "Jaipur"
+    city:            str   = ""
     budget:          float = 0.0
     business_key:    str
     brain_result:    dict
@@ -7613,7 +7642,7 @@ async def command_center(request: CommandRequest):
     intent    = classification.get("intent", "unknown")
     extracted = classification.get("extracted", {}) or {}
     industry  = request.industry or extracted.get("industry") or ""
-    city      = request.city or extracted.get("city") or "Jaipur"
+    city      = request.city or extracted.get("city") or ""
     budget    = request.budget or extracted.get("budget") or 0
     goal      = request.goal or extracted.get("goal") or text_cmd
     url       = request.url or ""
@@ -9167,10 +9196,11 @@ async def _sie_business_understanding(website_url: str, industry: str, city: str
 
     if not memory_reused:
         try:
+            city_display = city or "India (no specific city given)"
             prompt = (
                 "From the content below, identify this business's name, industry, one-line positioning, and "
                 "unique value proposition. Be specific — cite what's actually in the content, don't invent.\n\n"
-                f"INPUT: {input_value}\nCITY: {city}\n\nCONTENT:\n{(site_content or '')[:2500]}\n\n"
+                f"INPUT: {input_value}\nCITY: {city_display}\n\nCONTENT:\n{(site_content or '')[:2500]}\n\n"
                 'Return ONLY JSON: {"business_name":"...","industry":"...","positioning":"...","uvp":"..."}'
             )
             resp = await asyncio.to_thread(
@@ -9654,7 +9684,7 @@ async def _sie_growth_engine(business_name: str, industry: str, city: str, brand
 class SocialIntelRequest(BaseModel):
     input_value: str
     input_type:  str = "website"
-    city:        str = "Jaipur"
+    city:        str = ""
     industry:    str = ""
 
 
@@ -9662,8 +9692,13 @@ class SocialIntelRequest(BaseModel):
 async def social_intelligence(request: SocialIntelRequest):
     input_value = (request.input_value or "").strip()
     input_type  = request.input_type if request.input_type in _SIE_INPUT_TYPES else "website"
-    city        = request.city.strip() or "Jaipur"
+    city        = (request.city or "").strip()
     industry    = (request.industry or "").strip()
+    # Google Business Profile / Places lookups and search queries genuinely
+    # need a location — blank means search nationally (India), never a
+    # silently-assumed city. business_key derivation below keeps the raw
+    # (possibly blank) city so memory keys stay consistent.
+    search_scope = city or "India"
 
     if not input_value:
         return {"success": False, "error": "input_value is required"}
@@ -9672,7 +9707,7 @@ async def social_intelligence(request: SocialIntelRequest):
 
     # ── Step 1: Discovery ────────────────────────────────────────────────
     try:
-        discovery = await _sie_discover_platforms(input_value, input_type, city)
+        discovery = await _sie_discover_platforms(input_value, input_type, search_scope)
     except Exception as _e:
         logger.error(f"[SIE] Discovery step failed: {_e}")
         return {"success": False, "error": f"Platform discovery failed: {_e}"}
@@ -9699,12 +9734,12 @@ async def social_intelligence(request: SocialIntelRequest):
     # ── Steps 3-8: PARALLEL with per-step failure isolation ──────────────
     step_calls = {
         "youtube":               lambda: _sie_youtube_step(platform_map.get("youtube", "")),
-        "google_business":       lambda: _sie_gbp_step(business_name, city),
+        "google_business":       lambda: _sie_gbp_step(business_name, search_scope),
         "website":               lambda: _sie_website_step(website_url, business_key, resolved_industry, city),
-        "social_signals":        lambda: _sie_social_observed_step(business_name, platform_map, city),
-        "competitor_comparison": lambda: _sie_competitor_step(business_name, resolved_industry, city, prior_memory),
+        "social_signals":        lambda: _sie_social_observed_step(business_name, platform_map, search_scope),
+        "competitor_comparison": lambda: _sie_competitor_step(business_name, resolved_industry, search_scope, prior_memory),
         "content_intelligence":  lambda: _sie_content_intelligence_step(
-            business_name, resolved_industry, city, business_summary.get("positioning", "")
+            business_name, resolved_industry, search_scope, business_summary.get("positioning", "")
         ),
     }
     step_names = list(step_calls.keys())
@@ -9737,7 +9772,7 @@ async def social_intelligence(request: SocialIntelRequest):
     # ── Step 10: Growth Engine ────────────────────────────────────────────
     try:
         growth = await _sie_growth_engine(
-            business_name, resolved_industry, city, brand_health,
+            business_name, resolved_industry, search_scope, brand_health,
             website_result, social_result, competitor_result, content_result,
         )
     except Exception as _e:
