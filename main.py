@@ -3387,6 +3387,71 @@ async def google_ads_campaigns(days: int = 90):
         logger.error(f"[GOOGLE ADS] campaigns unexpected: {ex}")
         return {"success": False, "error": str(ex)}
 
+@app.get("/google-ads/ad-policy-status")
+async def google_ads_ad_policy_status():
+    """
+    Read-only diagnostic: lists every ad's policy review status, and for any
+    ad with an actual policy finding (not just PROHIBITED/DISAPPROVED as a
+    bare code), the specific topic + evidence text — the same detail
+    _extract_policy_violations() surfaces for a live create-ad call, but for
+    ads that already exist in the account (including ones created before
+    this diagnostic existed).
+    """
+    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    try:
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        query = """
+            SELECT
+                ad_group_ad.ad.id,
+                ad_group_ad.ad.responsive_search_ad.headlines,
+                ad_group_ad.ad.responsive_search_ad.descriptions,
+                ad_group_ad.policy_summary.approval_status,
+                ad_group_ad.policy_summary.review_status,
+                ad_group_ad.policy_summary.policy_topic_entries,
+                campaign.id,
+                campaign.name,
+                ad_group.name
+            FROM ad_group_ad
+            ORDER BY ad_group_ad.ad.id DESC
+            LIMIT 50
+        """
+        rows = list(service.search(customer_id=customer_id, query=query))
+        ads = []
+        for row in rows:
+            aga = row.ad_group_ad
+            findings = []
+            for entry in aga.policy_summary.policy_topic_entries:
+                evidence_texts = []
+                for ev in entry.evidences:
+                    if ev.text_list and ev.text_list.texts:
+                        evidence_texts.extend(str(t) for t in ev.text_list.texts)
+                findings.append({
+                    "topic":       entry.topic,
+                    "entry_type":  entry.type_.name if hasattr(entry.type_, "name") else str(entry.type_),
+                    "evidence":    evidence_texts,
+                    "explanation": _policy_explanation(entry.topic) if entry.topic else None,
+                })
+            ads.append({
+                "campaign_id":     str(row.campaign.id),
+                "campaign_name":   row.campaign.name,
+                "ad_group_name":   row.ad_group.name,
+                "ad_id":           str(aga.ad.id),
+                "approval_status": aga.policy_summary.approval_status.name if hasattr(aga.policy_summary.approval_status, "name") else str(aga.policy_summary.approval_status),
+                "review_status":   aga.policy_summary.review_status.name if hasattr(aga.policy_summary.review_status, "name") else str(aga.policy_summary.review_status),
+                "headlines":       [h.text for h in aga.ad.responsive_search_ad.headlines],
+                "descriptions":    [d.text for d in aga.ad.responsive_search_ad.descriptions],
+                "policy_findings": findings,
+            })
+        return {"success": True, "ads": ads}
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GOOGLE ADS] ad-policy-status error: {errors}")
+        return {"success": False, "error": errors}
+    except Exception as ex:
+        logger.error(f"[GOOGLE ADS] ad-policy-status unexpected: {ex}")
+        return {"success": False, "error": str(ex)}
+
 @app.get("/google-ads/daily")
 async def google_ads_daily(days: int = 90):
     """Daily time-series: date, impressions, clicks, cost_inr."""
