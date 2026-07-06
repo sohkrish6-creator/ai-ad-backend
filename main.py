@@ -1929,7 +1929,15 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "8. CTR-OPTIMIZED HEADLINES: use proven high-CTR patterns — numbers ('3x more bookings'), questions "
         "('Losing weekend footfall?'), specificity (name the city/neighborhood), urgency WITH a real reason "
         "('Before wedding season fills up'). BANNED generic patterns in any headline or hook: 'Best services', "
-        "'Quality solutions', 'Your trusted partner'.\n\n"
+        "'Quality solutions', 'Your trusted partner'.\n"
+        "9. GOOGLE ADS POLICY COMPLIANCE — headlines/descriptions get rejected by Google's ad review if they "
+        "violate these, so avoid them entirely: NO unsubstantiated superlative claims ('best', '#1', 'number one', "
+        "'guaranteed', 'world's best') — Google requires proof it can verify, which ad copy never has; use a "
+        "specific number or result instead ('3x more bookings' not 'the best booking service'). NO trademarked "
+        "brand/competitor names in headlines or descriptions. NO phone numbers written directly in ad text — "
+        "phone numbers only go through Call extensions, never in a headline/description string. NO 'click here' "
+        "or 'click now' — use one of the exact CTAs from rule 3 instead. NO ALL-CAPS words (reads as shouting and "
+        "gets flagged) — normal sentence case only, Hinglish included.\n\n"
         "=== META ADS LAUNCH KIT ===\n"
         f"Campaign Name: [exact name — format: City_Industry_Goal_{_month_short}, e.g. {city_label.replace(' ', '')}_Coaching_Leads_{_month_short}]\n"
         f"Objective: [exact Meta objective — Leads / Traffic / Engagement / Sales — state which and why]\n"
@@ -6226,17 +6234,162 @@ def _dedupe_preserve_order(items: list) -> list:
     return result
 
 
+# ── Google Ads policy handling ───────────────────────────────────────────────
+# Plain-language explanations for the policy topics we see most often on
+# generated ad copy. Falls back to a generic "see Google's policy" message
+# for any topic not in this map — the list of possible topics is not fixed
+# and can change at any time per Google's own docs.
+_POLICY_TOPIC_EXPLANATIONS = {
+    "TRADEMARKS_IN_AD_TEXT":            "Your ad text includes a trademarked term you likely don't have rights to use in ad copy.",
+    "TRADEMARKS":                       "Your ad text includes a trademarked term you likely don't have rights to use.",
+    "MISLEADING_CONTENT":               "Your ad content reads as misleading or exaggerated to Google's reviewers.",
+    "MISREPRESENTATION":                "A claim in your ad copy (often an unverifiable 'best'/'#1'/'guaranteed' claim) isn't backed by evidence Google can confirm.",
+    "UNAPPROVED_SUBSTANCES":            "Your ad appears to reference a substance (alcohol, tobacco, drugs, supplements) that needs certification or isn't allowed to advertise.",
+    "DESTINATION_NOT_WORKING":          "Google couldn't load your landing page — it may be down, redirecting incorrectly, or blocking Google's crawler.",
+    "DESTINATION_MISMATCH":             "Your ad's display/final URL doesn't match what the landing page is actually about.",
+    "INACCURATE_CLAIMS_LANDING_PAGE":   "A claim made in your ad isn't clearly supported on the landing page itself.",
+    "PHONE_NUMBER_IN_AD_TEXT":          "Phone numbers aren't allowed directly in headlines/descriptions — use a Call extension instead.",
+    "EXCESSIVE_CAPITALIZATION_IN_AD_TEXT": "Too many words in ALL CAPS — Google treats this as 'shouting' and restricts it.",
+    "INCORRECT_KEYBOARD_CHARACTERS_IN_AD_TEXT": "Unusual symbols/characters in the ad text aren't allowed.",
+    "UNACCEPTABLE_LANGUAGE":            "The ad text uses language Google considers unacceptable (profanity, slurs, etc).",
+    "GENDER_IN_AD_TEXT":                "The ad text implies a policy-restricted assumption about the reader's gender.",
+    "GUARANTEE_MISUSE":                 "The ad claims a 'guarantee' Google can't verify is genuinely offered.",
+}
+
+def _policy_explanation(topic: str) -> str:
+    return _POLICY_TOPIC_EXPLANATIONS.get(
+        topic,
+        f"Google flagged this ad copy under the '{topic}' policy — see "
+        "https://support.google.com/adspolicy/answer/6008942 for details.",
+    )
+
+def _extract_policy_violations(gae: "GoogleAdsException") -> list:
+    """
+    Pull the SPECIFIC policy topic(s) and offending text out of a
+    GoogleAdsException raised during ad creation — instead of surfacing only
+    the generic "PROHIBITED" error code. Returns one dict per policy_topic_entry:
+    {"topic": "TRADEMARKS_IN_AD_TEXT", "entry_type": "PROHIBITED", "evidence": [...], "message": "..."}
+    Entries with no policy_finding_details (a non-policy error) still get a
+    dict with topic=None so callers can tell "policy violation" apart from
+    "some other Google Ads error".
+    """
+    violations = []
+    for error in gae.failure.errors:
+        pfd = error.details.policy_finding_details if error.details else None
+        entries = list(pfd.policy_topic_entries) if pfd and pfd.policy_topic_entries else []
+        if not entries:
+            violations.append({
+                "topic": None, "entry_type": None, "evidence": [], "message": error.message,
+            })
+            continue
+        for entry in entries:
+            evidence_texts = []
+            for ev in entry.evidences:
+                if ev.text_list and ev.text_list.texts:
+                    evidence_texts.extend(str(t) for t in ev.text_list.texts)
+            violations.append({
+                "topic":      entry.topic,
+                "entry_type": entry.type_.name if hasattr(entry.type_, "name") else str(entry.type_),
+                "evidence":   evidence_texts,
+                "message":    error.message,
+            })
+    return violations
+
+def _build_policy_error_response(violations: list) -> dict:
+    """Turn _extract_policy_violations() output into a user-facing structure
+    the frontend can render as a real error card (topic + offending text +
+    plain-language explanation), not just 'PROHIBITED'."""
+    topics = [v for v in violations if v["topic"]]
+    if not topics:
+        return {"error": "Ad creation failed.", "details": [v["message"] for v in violations]}
+    return {
+        "error": "Ad rejected by Google Ads policy review.",
+        "policy_violations": [
+            {
+                "topic":           v["topic"],
+                "entry_type":      v["entry_type"],
+                "offending_text":  v["evidence"],
+                "explanation":     _policy_explanation(v["topic"]),
+                "message":         v["message"],
+            }
+            for v in topics
+        ],
+    }
+
+# Unsubstantiated superlative/claim patterns — Google's MISREPRESENTATION
+# policy requires these to be backed by evidence it can verify, which
+# GPT-generated ad copy never has, so they're stripped pre-flight rather
+# than left to fail at the API and burn a whole ad.
+_SUPERLATIVE_PATTERNS = [
+    r'\bbest\b', r'#\s?1\b', r'\bnumber\s+one\b', r'\bno\.?\s*1\b',
+    r"\bworld'?s\s+(?:best|no\.?\s*1|number\s+one)\b", r'\btop[\s-]rated\b',
+    r'\bguaranteed?\b', r'\b100%\s+guarantee[d]?\b',
+]
+_PHONE_PATTERN = re.compile(r'(\+?\d[\d\-\s\(\)]{7,}\d)')
+_GENERIC_CTA_PHRASES = ["click here", "click now", "click below"]
+# Acronyms that are legitimately all-caps and shouldn't be de-capitalized.
+_ALLOWED_ACRONYMS = {"SEO", "PPC", "ROI", "FAQ", "GST", "USA", "UK", "AI", "IT", "HR", "CRM", "B2B", "B2C", "D2C", "24X7", "24/7"}
+
+def _policy_precheck_ad_copy(headlines: list, descriptions: list) -> tuple:
+    """
+    Best-effort pre-flight cleaner: strips the most common Google Ads policy
+    triggers from generated ad copy BEFORE sending it to the API — unsubstantiated
+    superlative claims, phone numbers (must use a Call extension instead),
+    generic "click here"-style CTAs, and shouting ALL-CAPS words. Returns
+    (clean_headlines, clean_descriptions, warnings) — this reduces how often
+    a policy rejection happens at all, it doesn't guarantee zero rejections
+    (trademark/destination findings depend on things this can't detect).
+    """
+    warnings = []
+
+    def _decap(m):
+        w = m.group(0)
+        base = w.split("'")[0]
+        if base in _ALLOWED_ACRONYMS:
+            return w
+        if "'" in w:
+            head, _sep, tail = w.partition("'")
+            return head.capitalize() + "'" + tail.lower()
+        return w.capitalize()
+
+    def _fix(text: str) -> str:
+        original = text
+        if _PHONE_PATTERN.search(text):
+            text = _PHONE_PATTERN.sub('', text).strip()
+            warnings.append(f"Removed phone number from ad text: {original!r}")
+        for pat in _SUPERLATIVE_PATTERNS:
+            if re.search(pat, text, re.I):
+                text = re.sub(pat, '', text, flags=re.I)
+                warnings.append(f"Removed unsubstantiated claim ('{pat}') from ad text: {original!r}")
+        for phrase in _GENERIC_CTA_PHRASES:
+            if phrase in text.lower():
+                text = re.sub(re.escape(phrase), '', text, flags=re.I)
+                warnings.append(f"Removed generic CTA phrase '{phrase}' from ad text: {original!r}")
+        text = re.sub(r"\b[A-Z]{4,}(?:'[A-Z]+)?\b", _decap, text)
+        text = re.sub(r'\s{2,}', ' ', text).strip(' -,.')
+        return text
+
+    clean_headlines    = [_fix(str(h)) for h in headlines]
+    clean_descriptions = [_fix(str(d)) for d in descriptions]
+    if warnings:
+        logger.info(f"[GADS AD PRECHECK] Cleaned {len(warnings)} policy-risk pattern(s) before send: {warnings}")
+    return clean_headlines, clean_descriptions, warnings
+
+
 def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
                     final_url: str, customer_id: str):
     """
     Synchronous: create a ResponsiveSearchAd in an ad group.
-    Enforces Google Ads character limits (30/90) via word-boundary truncation,
-    then de-duplicates — raises ValueError (never silently proceeds) if that
+    Runs the policy pre-flight cleaner first (strips common rejection triggers
+    like unsubstantiated superlatives and phone numbers), then enforces
+    Google Ads character limits (30/90) via word-boundary truncation, then
+    de-duplicates — raises ValueError (never silently proceeds) if that
     leaves fewer than the Google Ads minimum (3 headlines / 2 descriptions),
     since sending too few would fail at the API anyway with a less clear error.
     """
-    clean_headlines    = _dedupe_preserve_order([_truncate_at_word_boundary(h, 30) for h in headlines if str(h).strip()])
-    clean_descriptions = _dedupe_preserve_order([_truncate_at_word_boundary(d, 90) for d in descriptions if str(d).strip()])
+    precheck_headlines, precheck_descriptions, _precheck_warnings = _policy_precheck_ad_copy(headlines, descriptions)
+    clean_headlines    = _dedupe_preserve_order([_truncate_at_word_boundary(h, 30) for h in precheck_headlines if str(h).strip()])
+    clean_descriptions = _dedupe_preserve_order([_truncate_at_word_boundary(d, 90) for d in precheck_descriptions if str(d).strip()])
 
     if len(clean_headlines) < 3:
         raise ValueError(
@@ -6407,13 +6560,51 @@ async def gads_create_campaign(request: CreateCampaignRequest):
                     )
                     logger.info(f"[GADS-CREATE] Ad created: {ad_created}")
                 except GoogleAdsException as _gae:
-                    ad_creation_error = []
-                    for _e in _gae.failure.errors:
-                        _detail = {"error_code": str(_e.error_code), "message": _e.message, "field": None}
-                        if _e.location:
-                            _detail["field"] = str(_e.location.field_path_elements)
-                        ad_creation_error.append(_detail)
+                    policy_violations = _extract_policy_violations(_gae)
+                    for _v in policy_violations:
+                        if _v["topic"]:
+                            logger.info(f"[GADS AD POLICY] topic={_v['topic']}, evidence={_v['evidence']}")
+                    ad_creation_error = _build_policy_error_response(policy_violations)
                     logger.error(f"[GADS-CREATE] Ad creation GoogleAdsException: {ad_creation_error}")
+
+                    # If a specific asset (evidence text) is the problem, retry with
+                    # the remaining safe assets rather than failing the ad entirely —
+                    # Google Ads needs a minimum of 3 headlines + 2 descriptions.
+                    offending_texts = [t for _v in policy_violations for t in _v["evidence"] if t]
+                    if offending_texts:
+                        retry_headlines = [h for h in headlines if not any(t.lower() in str(h).lower() for t in offending_texts)]
+                        retry_descriptions = [d for d in descriptions if not any(t.lower() in str(d).lower() for t in offending_texts)]
+                        removed_h = len(headlines) - len(retry_headlines)
+                        removed_d = len(descriptions) - len(retry_descriptions)
+                        if (removed_h or removed_d) and len(retry_headlines) >= 3 and len(retry_descriptions) >= 2:
+                            logger.info(
+                                f"[GADS-CREATE] Retrying ad creation with {removed_h} headline(s) and "
+                                f"{removed_d} description(s) removed (matched policy-violating text)"
+                            )
+                            try:
+                                ad_created = await asyncio.to_thread(
+                                    _create_ad_sync, result["ad_group_rn"], retry_headlines, retry_descriptions, final_url, customer_id
+                                )
+                                ad_creation_error = {
+                                    **ad_creation_error,
+                                    "retried": True,
+                                    "note": (
+                                        f"Ad created successfully after removing {removed_h} headline(s) and "
+                                        f"{removed_d} description(s) that triggered the policy violation above."
+                                    ),
+                                }
+                                logger.info(f"[GADS-CREATE] Ad created on retry: {ad_created}")
+                            except GoogleAdsException as _gae2:
+                                policy_violations2 = _extract_policy_violations(_gae2)
+                                for _v in policy_violations2:
+                                    if _v["topic"]:
+                                        logger.info(f"[GADS AD POLICY] (retry) topic={_v['topic']}, evidence={_v['evidence']}")
+                                ad_creation_error = _build_policy_error_response(policy_violations2)
+                                ad_creation_error["retried"] = True
+                                logger.error(f"[GADS-CREATE] Retry also failed: {ad_creation_error}")
+                            except Exception as _ae2:
+                                ad_creation_error["retry_error"] = str(_ae2)
+                                logger.error(f"[GADS-CREATE] Retry raised non-policy error: {_ae2}")
                 except Exception as _ae:
                     ad_creation_error = str(_ae)
                     logger.error(f"[GADS-CREATE] Ad creation failed: {_ae}")
