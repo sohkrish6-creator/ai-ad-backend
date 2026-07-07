@@ -6581,10 +6581,25 @@ async def _lightweight_business_audience_discovery(url: str, industry: str, city
     except Exception as _e:
         logger.warning(f"[CREATIVE-STUDIO] gather_bi_data failed during discovery: {_e}")
 
-    business_dna = (bi or {}).get("business_dna", {}) if bi else {}
-    business_name = business_dna.get("business_name") or url
-    positioning   = business_dna.get("positioning", "") or business_dna.get("uvp", "")
-    uvp           = business_dna.get("uvp", "")
+    # gather_bi_data() returns {"intelligence": {"business_dna": {...}, "positioning": {...}, ...}, "scores": {...}}
+    # — nested one level deeper than a flat dict. business_dna itself has no
+    # "business_name"/"positioning"/"uvp" fields (its real schema is
+    # detected_industry/business_model/target_geography/unique_value_prop/...);
+    # "positioning" is a SEPARATE nested block with current_positioning/
+    # winning_position. Reading these at the wrong level silently produced an
+    # empty business_dna every time (caught via a live test where a real
+    # business's positioning/uvp came back blank despite a successful crawl).
+    _intelligence = (bi or {}).get("intelligence", {}) if bi else {}
+    business_dna     = _intelligence.get("business_dna", {}) or {}
+    _positioning_blk = _intelligence.get("positioning", {}) or {}
+    business_name    = url
+    uvp              = business_dna.get("unique_value_prop", "")
+    positioning      = _positioning_blk.get("winning_position") or _positioning_blk.get("current_positioning", "") or uvp
+    # target_geography ("Local"/"Regional"/"National"/"International") is a
+    # real, direct signal for the locality determination downstream — surface
+    # it so Creative Studio doesn't have to re-infer national-vs-local purely
+    # from positioning prose.
+    target_geography = business_dna.get("target_geography", "")
 
     audience_out = {"segments": [], "brand_personality": ""}
     try:
@@ -6592,7 +6607,8 @@ async def _lightweight_business_audience_discovery(url: str, industry: str, city
             "Based on this business's real data, identify its target audience psychographics for a creative "
             "marketing brief. Be specific — cite what's actually plausible given the business/industry, don't "
             "invent unrelated demographics.\n\n"
-            f"BUSINESS: {business_name} | Industry: {industry or 'unknown'} | Positioning: {positioning or 'unknown'}\n\n"
+            f"BUSINESS: {business_name} | Industry: {industry or 'unknown'} | Positioning: {positioning or 'unknown'} "
+            f"| Target geography: {target_geography or 'unknown'}\n\n"
             'Return ONLY JSON: {"segments": [{"segment":"...","pain_points":"...","desires":"...",'
             '"content_they_respond_to":"..."}], "brand_personality": "one line describing this brand\'s personality"}'
         )
@@ -6608,6 +6624,7 @@ async def _lightweight_business_audience_discovery(url: str, industry: str, city
         "business": {
             "business_name": business_name, "industry": industry, "city": city,
             "business_dna": business_dna, "uvp": uvp, "positioning": positioning,
+            "target_geography": target_geography,
         },
         "audience": {"segments": audience_out.get("segments", [])},
         "brand_personality": audience_out.get("brand_personality", ""),
@@ -6871,7 +6888,7 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
         data_context = (
             f"TODAY'S REAL DATE: {_today} (use this for any seasonal angle — never invent an occasion that hasn't happened)\n"
             f"BUSINESS DNA AVAILABLE: {has_business_dna}{' (from fresh discovery just now)' if discovery_ran else ''}\n"
-            + (f"  - Business: {_sv(_bm, 'business_name')} | Positioning: {_sv(_bm, 'positioning')} | UVP: {_sv(_bm, 'uvp')}\n" if has_business_dna else "  - No Business DNA available — base creative direction on industry + objective only.\n")
+            + (f"  - Business: {_sv(_bm, 'business_name')} | Positioning: {_sv(_bm, 'positioning')} | UVP: {_sv(_bm, 'uvp')} | Target geography: {_sv(_bm, 'target_geography')}\n" if has_business_dna else "  - No Business DNA available — base creative direction on industry + objective only.\n")
             + f"AUDIENCE INTELLIGENCE AVAILABLE: {has_audience_data}{' (from fresh discovery just now)' if discovery_ran else ''}\n"
             + (f"  - Segments (pain points/desires/content preferences): {segments_summary}\n" if has_audience_data else "  - No audience segments available — base targeting assumptions on industry norms only.\n")
             + (
@@ -6946,9 +6963,11 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
             "- seasonal_intelligence.current_relevant_occasions must be real, currently-relevant occasions given "
             "TODAY'S REAL DATE above — never invent a festival or date that isn't real or isn't actually near.\n"
             "- LOCALIZATION — determine business_locality BEFORE deciding anything about city visuals:\n"
-            "  1. Look at the business's real positioning/UVP/industry above (and whether it reads as e-commerce, "
-            "D2C, ships/delivers nationally, or is an online-only service) versus whether the city given is "
-            "actually mentioned or implied as this business's own physical operating base.\n"
+            "  1. Look at the business's real positioning/UVP/industry/Target geography above (and whether it "
+            "reads as e-commerce, D2C, ships/delivers nationally, or is an online-only service) versus whether the "
+            "city given is actually mentioned or implied as this business's own physical operating base. If "
+            "Target geography says 'National' or 'International', treat that as strong evidence toward "
+            "national_or_online — do not override a clear National/International signal with a guess.\n"
             "  2. If the business is national, online, D2C, or e-commerce — or there is no evidence it is "
             "physically tied to the given city — set business_locality='national_or_online', use_or_skip='skip', "
             "and city_elements=[]. A national supplement/D2C/e-commerce brand must NEVER get city landmarks "
