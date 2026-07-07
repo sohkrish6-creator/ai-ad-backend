@@ -6579,7 +6579,10 @@ async def creative_director(request: CreativeDirectorRequest):
             '  "localization": {"city_elements":["..."],"use_or_skip":"use/skip — explain why, tied to the city given (or say skip if no city was given)"},\n'
             '  "concepts": [\n'
             '    {"name":"Concept A","angle":"Authority","headline":"...","subheadline":"...","cta":"...","visual_concept":"...",'
-            '"image_prompt":"FULL production-ready prompt: subject, environment, camera, lighting, composition, mood, color palette, depth, branding space, typography space, commercial photography style, negative prompt, render quality"},\n'
+            '"image_prompt":"a single flowing descriptive paragraph — NOT a label:value list, NOT prefixed with any '
+            'meta-text like \'production-ready prompt:\' — that naturally covers the subject, environment, camera/lens, '
+            'lighting, composition, mood, color palette, depth of field, reserved branding space, reserved typography '
+            'space, and commercial photography style, ending with \'Negative prompt: ...\' and \'Render quality: ...\' "},\n'
             '    {"name":"Concept B","angle":"Lifestyle","headline":"...","subheadline":"...","cta":"...","visual_concept":"...","image_prompt":"..."},\n'
             '    {"name":"Concept C","angle":"Emotional","headline":"...","subheadline":"...","cta":"...","visual_concept":"...","image_prompt":"..."}\n'
             '  ],\n'
@@ -6590,10 +6593,13 @@ async def creative_director(request: CreativeDirectorRequest):
             "Rules:\n"
             "- The 3 concepts MUST use 3 genuinely different psychological angles (Authority, Lifestyle, Emotional) — "
             "not 3 variations of the same idea.\n"
-            "- Every image_prompt must be a single, complete, ready-to-paste string covering: subject, environment, "
-            "camera/lens, lighting, composition, mood, color palette (matching color_psychology above), depth of "
-            "field, negative space reserved for branding, negative space reserved for typography, commercial "
-            "photography style reference, an explicit negative prompt (what to avoid), and a render-quality tag.\n"
+            "- Every image_prompt must read as natural, richly-descriptive prose (the way a professional prompts "
+            "Midjourney/DALL-E), covering: subject, environment, camera/lens, lighting, composition, mood, color "
+            "palette (matching color_psychology above), depth of field, negative space reserved for branding, "
+            "negative space reserved for typography, commercial photography style reference, an explicit negative "
+            "prompt (what to avoid), and a render-quality tag. NEVER start it with a meta-label like 'production-"
+            "ready prompt:' or write it as a comma-separated 'field is value' list — write it the way you'd actually "
+            "type it into an image generator.\n"
             "- seasonal_intelligence.current_relevant_occasions must be real, currently-relevant occasions given "
             "TODAY'S REAL DATE above — never invent a festival or date that isn't real or isn't actually near.\n"
             "- localization: only include city_elements if a specific city was actually given AND it's genuinely "
