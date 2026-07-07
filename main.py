@@ -6849,8 +6849,15 @@ async def ad_to_creative(request: AdToCreativeRequest):
         if not _bk_src and not campaign_id:
             return {"success": False, "error": "Provide either a campaign_id or a url/business_key for manual mode."}
 
-        norm_key_base = derive_business_key(_bk_src, industry, city) if _bk_src else f"campaign::{campaign_id}"
-        norm_key = f"{norm_key_base}::campaign::{campaign_id}" if campaign_id else norm_key_base
+        if _bk_src:
+            norm_key_base = derive_business_key(_bk_src, industry, city)
+            norm_key = f"{norm_key_base}::campaign::{campaign_id}" if campaign_id else norm_key_base
+        else:
+            # No business context resolved at all (e.g. campaign predates
+            # activity_log tracking) — the campaign_id alone IS the key, not a
+            # suffix on top of an already campaign-only base.
+            norm_key_base = f"campaign::{campaign_id}"
+            norm_key = norm_key_base
 
         memory, _resolved = get_memory_with_city_fallback(_bk_src, industry, city) if _bk_src else ({}, norm_key_base)
         logger.info(f"[AD-TO-CREATIVE] key={norm_key!r} campaign_id={campaign_id!r} tables={list(memory.keys())}")
