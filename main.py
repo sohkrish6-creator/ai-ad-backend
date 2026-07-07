@@ -3388,7 +3388,7 @@ async def google_ads_campaigns(days: int = 90):
         return {"success": False, "error": str(ex)}
 
 @app.get("/google-ads/ad-policy-status")
-async def google_ads_ad_policy_status():
+async def google_ads_ad_policy_status(campaign_id: str = ""):
     """
     Read-only diagnostic: lists every ad's policy review status, and for any
     ad with an actual policy finding (not just PROHIBITED/DISAPPROVED as a
@@ -3396,23 +3396,48 @@ async def google_ads_ad_policy_status():
     _extract_policy_violations() surfaces for a live create-ad call, but for
     ads that already exist in the account (including ones created before
     this diagnostic existed).
+
+    Optional campaign_id filters to one campaign, and also reports its
+    ad_groups directly (with their ad_group.id) — so a campaign showing
+    zero ad_group_ad rows here can be distinguished from one with no
+    ad_group at all, before pushing a fresh ad into the right ad group.
     """
     customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    campaign_id = (campaign_id or "").strip()
     try:
         client  = get_google_ads_client()
         service = client.get_service("GoogleAdsService")
-        query = """
+
+        ad_groups = []
+        if campaign_id:
+            ag_query = f"""
+                SELECT ad_group.id, ad_group.name, ad_group.status
+                FROM ad_group
+                WHERE campaign.id = {campaign_id}
+            """
+            ag_rows = list(service.search(customer_id=customer_id, query=ag_query))
+            ad_groups = [
+                {"ad_group_id": str(r.ad_group.id), "name": r.ad_group.name,
+                 "status": r.ad_group.status.name if hasattr(r.ad_group.status, "name") else str(r.ad_group.status)}
+                for r in ag_rows
+            ]
+
+        where_clause = f"WHERE campaign.id = {campaign_id}" if campaign_id else ""
+        query = f"""
             SELECT
                 ad_group_ad.ad.id,
                 ad_group_ad.ad.responsive_search_ad.headlines,
                 ad_group_ad.ad.responsive_search_ad.descriptions,
+                ad_group_ad.status,
                 ad_group_ad.policy_summary.approval_status,
                 ad_group_ad.policy_summary.review_status,
                 ad_group_ad.policy_summary.policy_topic_entries,
                 campaign.id,
                 campaign.name,
+                ad_group.id,
                 ad_group.name
             FROM ad_group_ad
+            {where_clause}
             ORDER BY ad_group_ad.ad.id DESC
             LIMIT 50
         """
@@ -3435,15 +3460,17 @@ async def google_ads_ad_policy_status():
             ads.append({
                 "campaign_id":     str(row.campaign.id),
                 "campaign_name":   row.campaign.name,
+                "ad_group_id":     str(row.ad_group.id),
                 "ad_group_name":   row.ad_group.name,
                 "ad_id":           str(aga.ad.id),
+                "ad_status":       aga.status.name if hasattr(aga.status, "name") else str(aga.status),
                 "approval_status": aga.policy_summary.approval_status.name if hasattr(aga.policy_summary.approval_status, "name") else str(aga.policy_summary.approval_status),
                 "review_status":   aga.policy_summary.review_status.name if hasattr(aga.policy_summary.review_status, "name") else str(aga.policy_summary.review_status),
                 "headlines":       [h.text for h in aga.ad.responsive_search_ad.headlines],
                 "descriptions":    [d.text for d in aga.ad.responsive_search_ad.descriptions],
                 "policy_findings": findings,
             })
-        return {"success": True, "ads": ads}
+        return {"success": True, "ads": ads, "ad_groups": ad_groups}
     except GoogleAdsException as ex:
         errors = [e.message for e in ex.failure.errors]
         logger.error(f"[GOOGLE ADS] ad-policy-status error: {errors}")
@@ -6487,7 +6514,40 @@ def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
 
     resp   = svc.mutate_ad_group_ads(customer_id=customer_id, operations=[op])
     ad_rn  = resp.results[0].resource_name
+
+    # Never trust the mutate response's resource_name alone as proof the ad
+    # actually persisted — read it back immediately. Without this, a caller
+    # can end up reporting "ad created" for an ad that doesn't really exist
+    # (e.g. this call raised nothing, but caller code elsewhere set the flag
+    # optimistically before/without checking the actual mutate result).
+    if not _verify_ad_group_ad_exists(ad_rn, customer_id):
+        raise RuntimeError(
+            f"Ad mutation returned {ad_rn!r} but the resource did not verify as "
+            "persisted on read-back — treating this as a failed ad creation."
+        )
     return {"ad_id": ad_rn.split("/")[-1], "resource_name": ad_rn, "status": "ENABLED"}
+
+
+def _verify_ad_group_ad_exists(ad_rn: str, customer_id: str) -> bool:
+    """
+    Read a just-created ad_group_ad back via GAQL to confirm it genuinely
+    exists and isn't REMOVED — the ground-truth check behind _create_ad_sync's
+    return value, so "ad_created: true" in an API response always means an
+    ad really is there, never just that a mutate call didn't raise.
+    """
+    try:
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        query = f"SELECT ad_group_ad.status FROM ad_group_ad WHERE ad_group_ad.resource_name = '{ad_rn}'"
+        rows = list(service.search(customer_id=customer_id, query=query))
+        if not rows:
+            return False
+        status = rows[0].ad_group_ad.status
+        status_name = status.name if hasattr(status, "name") else str(status)
+        return status_name not in ("REMOVED", "UNKNOWN", "UNSPECIFIED")
+    except Exception as _ve:
+        logger.warning(f"[GADS-AD] Post-creation verification query failed for {ad_rn!r}: {_ve}")
+        return False
 
 
 def _create_sitelinks_sync(campaign_rn: str, sitelinks: list, customer_id: str):
