@@ -484,6 +484,178 @@ def get_memory_with_city_fallback(business_key: str, industry: str = "", city: s
     return {}, norm_key
 
 
+# ── Activity Log (History page) ──────────────────────────────────────────────
+# Single append-only table every major module + campaign push writes one row
+# to on success — the one place "what has this tool ever done" can be answered
+# from, since every module's own report otherwise only lives in localStorage
+# on whichever browser generated it.
+_ACTIVITY_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS activity_log (
+    id            BIGSERIAL PRIMARY KEY,
+    activity_type TEXT,
+    business_key  TEXT,
+    business_name TEXT,
+    url           TEXT,
+    industry      TEXT,
+    city          TEXT,
+    summary       TEXT,
+    reference_id  TEXT,
+    created_at    TEXT
+);
+"""
+
+try:
+    with engine.connect() as _al_conn:
+        _al_ddl = _ACTIVITY_LOG_DDL
+        if _is_sqlite:
+            _al_ddl = _al_ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        _al_conn.execute(text(_al_ddl))
+        _al_conn.commit()
+    logger.info("[ACTIVITY] activity_log table created/verified")
+except Exception as _ale:
+    logger.warning(f"[ACTIVITY] Could not create activity_log table: {_ale}")
+
+
+def log_activity(activity_type: str, business_key: str = "", business_name: str = "",
+                  url: str = "", industry: str = "", city: str = "",
+                  summary: str = "", reference_id: str = "") -> None:
+    """
+    Record one row to activity_log. Called at the end of every major module's
+    successful run and every campaign push — best-effort (never raises, so a
+    logging failure can never break the actual module response). reference_id
+    is the Google/Meta campaign_id for campaign pushes, blank otherwise.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO activity_log "
+                "(activity_type, business_key, business_name, url, industry, city, summary, reference_id, created_at) "
+                "VALUES (:at, :bk, :bn, :url, :ind, :cit, :sm, :rid, :ca)"
+            ), {
+                "at": activity_type, "bk": business_key or "", "bn": business_name or "",
+                "url": url or "", "ind": industry or "", "cit": city or "",
+                "sm": summary or "", "rid": reference_id or "",
+                "ca": datetime.utcnow().isoformat(),
+            })
+        logger.info(f"[ACTIVITY] logged type={activity_type!r} business={business_name or business_key!r} ref={reference_id!r}")
+    except Exception as _e:
+        logger.warning(f"[ACTIVITY] log_activity failed (non-fatal): {_e}")
+
+
+@app.get("/activity/list")
+async def activity_list(limit: int = 50, type: str = "", business_key: str = ""):
+    """Recent activity across the whole tool, newest first — the History page's Activity tab."""
+    try:
+        limit = max(1, min(limit, 200))
+        clauses = []
+        params = {"lim": limit}
+        if type.strip():
+            clauses.append("activity_type = :at")
+            params["at"] = type.strip()
+        if business_key.strip():
+            clauses.append("business_key = :bk")
+            params["bk"] = business_key.strip()
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, activity_type, business_key, business_name, url, industry, city, "
+                    "summary, reference_id, created_at FROM activity_log "
+                    f"{where} ORDER BY id DESC LIMIT :lim"
+                ),
+                params,
+            ).mappings().all()
+        return {"success": True, "activity": [dict(r) for r in rows]}
+    except Exception as _e:
+        logger.error(f"[ACTIVITY] list failed: {_e}")
+        return {"success": False, "error": str(_e), "activity": []}
+
+
+@app.get("/activity/business/{business_key}")
+async def activity_for_business(business_key: str):
+    """Full activity history for one business — every report + campaign push ever logged against this key."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, activity_type, business_key, business_name, url, industry, city, "
+                    "summary, reference_id, created_at FROM activity_log "
+                    "WHERE business_key = :bk ORDER BY id DESC"
+                ),
+                {"bk": business_key},
+            ).mappings().all()
+        return {"success": True, "business_key": business_key, "activity": [dict(r) for r in rows]}
+    except Exception as _e:
+        logger.error(f"[ACTIVITY] business history failed for {business_key!r}: {_e}")
+        return {"success": False, "error": str(_e), "activity": []}
+
+
+# ── Report Snapshots (History page "restore this report") ───────────────────
+# activity_log records THAT something happened; this stores the actual full
+# response so the History page can genuinely reopen a past report exactly as
+# it was generated, not just re-derive an approximation from the structured
+# memory tables (which only keep extracted pieces, not the full formatted
+# text sections a report like Marketing Brain returns).
+_REPORT_SNAPSHOT_DDL = """
+CREATE TABLE IF NOT EXISTS report_snapshot (
+    id            BIGSERIAL PRIMARY KEY,
+    module        TEXT NOT NULL,
+    business_key  TEXT NOT NULL,
+    response_json TEXT,
+    created_at    TEXT
+);
+"""
+
+try:
+    with engine.connect() as _rs_conn:
+        _rs_ddl = _REPORT_SNAPSHOT_DDL
+        if _is_sqlite:
+            _rs_ddl = _rs_ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        _rs_conn.execute(text(_rs_ddl))
+        _rs_conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_report_snapshot_module_key "
+            "ON report_snapshot (module, business_key)"
+        ))
+        _rs_conn.commit()
+    logger.info("[SNAPSHOT] report_snapshot table created/verified")
+except Exception as _rse:
+    logger.warning(f"[SNAPSHOT] Could not create report_snapshot table: {_rse}")
+
+
+def save_report_snapshot(module: str, business_key: str, response: dict) -> None:
+    """Upsert the full response for one module+business_key — best-effort, never raises."""
+    if not business_key:
+        return
+    try:
+        now = datetime.utcnow().isoformat()
+        payload = json.dumps(response, ensure_ascii=False, default=str)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO report_snapshot (module, business_key, response_json, created_at) "
+                "VALUES (:m, :bk, :rj, :ca) "
+                "ON CONFLICT(module, business_key) DO UPDATE SET response_json=:rj, created_at=:ca"
+            ), {"m": module, "bk": business_key, "rj": payload, "ca": now})
+    except Exception as _e:
+        logger.warning(f"[SNAPSHOT] save_report_snapshot failed for module={module!r} key={business_key!r}: {_e}")
+
+
+@app.get("/report-snapshot")
+async def get_report_snapshot(module: str, business_key: str):
+    """Fetch the last full saved response for one module+business_key — powers the History page's 'restore report' click-through."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT response_json, created_at FROM report_snapshot WHERE module = :m AND business_key = :bk"),
+                {"m": module, "bk": business_key},
+            ).first()
+        if not row:
+            return {"success": False, "error": "No snapshot found for this module/business_key"}
+        return {"success": True, "response": json.loads(row[0]), "created_at": row[1]}
+    except Exception as _e:
+        logger.error(f"[SNAPSHOT] get_report_snapshot failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -1756,7 +1928,14 @@ For {request.target_industry} businesses in {request.target_city}, include:
             if _purged:
                 logger.info(f"[MEMORY] Purged stale plain-URL key {_stale_key!r} from: {_purged}")
 
-    return {
+    log_activity(
+        "marketing_brain", business_key=_mem_key,
+        business_name=_dna.get("business_name") or request.business_type,
+        url=request.url, industry=request.target_industry, city=request.target_city,
+        summary="Marketing Brain report generated",
+    )
+
+    _response = {
         "success": True,
         "url": request.url,
         # Backward-compatible keys (existing frontend reads these)
@@ -1790,6 +1969,8 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "meta_ad_library_link": meta_link,
         "google_ads_link":      google_link,
     }
+    save_report_snapshot("marketing_brain", _mem_key, _response)
+    return _response
 
 class CampaignLaunchKitRequest(BaseModel):
     url: str = ""
@@ -2182,6 +2363,13 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
             "sitelinks":    campaign_assets["sitelinks"],
         }
     })
+
+    log_activity(
+        "campaign_kit", business_key=business_key, business_name=biz_label,
+        url=request.url, industry=request.industry, city=request.city,
+        summary=f"Campaign Launch Kit generated — {len(campaign_assets['keywords'])} keywords, "
+                f"{len(campaign_assets['headlines'])} headlines, {len(campaign_assets['descriptions'])} descriptions",
+    )
 
     return {
         "success":        True,
@@ -3754,12 +3942,21 @@ Respond ONLY with a valid JSON object — no markdown, no explanation, just the 
     # ── Save to opportunity_memory ────────────────────────────────────────────
     save_to_memory("opportunity", norm_key, {"opportunity_data": opportunity})
 
-    return {
+    log_activity(
+        "opportunity_engine", business_key=norm_key,
+        business_name=(memory.get("business", {}) or {}).get("business_name", ""),
+        url=request.business_key, industry=request.industry, city=request.city,
+        summary="Opportunity Engine report generated",
+    )
+
+    _response = {
         "success":      True,
         "memory_used":  True,
         "business_key": norm_key,
         "opportunity":  opportunity,
     }
+    save_report_snapshot("opportunity_engine", norm_key, _response)
+    return _response
 
 # ── Offer Intelligence ────────────────────────────────────────────────────────
 
@@ -3889,12 +4086,21 @@ Respond ONLY with valid JSON — no markdown, no explanation:
 
     save_to_memory("offer", norm_key, {"offer_data": offer})
 
-    return {
+    log_activity(
+        "offer_intelligence", business_key=norm_key,
+        business_name=(memory.get("business", {}) or {}).get("business_name", ""),
+        url=request.business_key, industry=request.industry, city=request.city,
+        summary="Offer Intelligence report generated",
+    )
+
+    _response = {
         "success":      True,
         "memory_used":  True,
         "business_key": norm_key,
         "offer":        offer,
     }
+    save_report_snapshot("offer_intelligence", norm_key, _response)
+    return _response
 
 
 # ── Module 14: Website Intelligence ──────────────────────────────────────────
@@ -4035,6 +4241,13 @@ RULES:
         "overall_score": float(audit.get("overall_score", 0)),
     })
     logger.info(f"[WEBSITE-INTEL] Done: key={norm_key!r} score={audit.get('overall_score')}")
+
+    log_activity(
+        "website_intelligence", business_key=norm_key,
+        business_name=(_mem.get("business", {}) or {}).get("business_name", "") if _mem else "",
+        url=url, industry=request.industry, city=request.city,
+        summary=f"Website Intelligence audit — score {audit.get('overall_score', 'N/A')}",
+    )
 
     return {
         "success":      True,
@@ -4210,6 +4423,13 @@ RULES:
         "overall_score":   float(visibility.get("overall_visibility_score", 0)),
     })
     logger.info(f"[VISIBILITY-INTEL] Done: key={norm_key!r} score={visibility.get('overall_visibility_score')}")
+
+    log_activity(
+        "visibility_intelligence", business_key=norm_key,
+        business_name=(_mem.get("business", {}) or {}).get("business_name", "") if _mem else "",
+        url=url, industry=industry, city=city,
+        summary=f"Visibility Intelligence report — score {visibility.get('overall_visibility_score', 'N/A')}",
+    )
 
     return {
         "success":      True,
@@ -4418,6 +4638,13 @@ RULES:
     save_to_memory("outreach", norm_key, {"outreach_data": outreach})
     logger.info(f"[OUTREACH-AI] Done: key={norm_key!r} confidence={outreach.get('confidence')}")
 
+    log_activity(
+        "outreach_ai", business_key=norm_key,
+        business_name=(memory.get("business", {}) or {}).get("business_name", ""),
+        url=request.url, industry=industry, city=city,
+        summary="Outreach AI scripts generated",
+    )
+
     return {
         "success":      True,
         "memory_used":  True,
@@ -4619,12 +4846,21 @@ RULES:
     })
     logger.info(f"[KPI-ENGINE] Done: key={norm_key!r} confidence={kpi.get('confidence')}")
 
-    return {
+    log_activity(
+        "kpi_engine", business_key=norm_key,
+        business_name=(memory.get("business", {}) or {}).get("business_name", ""),
+        url=request.url, industry=industry, city=city,
+        summary=f"KPI Engine prediction — goal: {goal}",
+    )
+
+    _response = {
         "success":      True,
         "memory_used":  True,
         "business_key": norm_key,
         "kpi":          kpi,
     }
+    save_report_snapshot("kpi_engine", norm_key, _response)
+    return _response
 
 
 # ── Autonomous Marketing Engine (Phase 9) ────────────────────────────────────
@@ -4760,6 +4996,13 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
         "budget":    budget,
     })
     logger.info(f"[AUTONOMOUS] Done: key={norm_key!r} confidence={plan.get('confidence')}")
+
+    log_activity(
+        "autonomous_marketing", business_key=norm_key,
+        business_name=(memory.get("business", {}) or {}).get("business_name", ""),
+        url=request.url, industry=industry, city=city,
+        summary=f"Autonomous Marketing plan generated — goal: {goal_text}",
+    )
 
     return {
         "success":      True,
@@ -5077,6 +5320,13 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         })
         logger.info(f"[PERF-INTEL] Done: key={norm_key!r} health={performance.get('overall_health')} connected={google_ads_connected}")
 
+        log_activity(
+            "performance_intelligence", business_key=norm_key,
+            business_name=_bm.get("business_name", ""),
+            url=request.url, industry=industry, city=city,
+            summary=f"Performance Intelligence report — health {performance.get('overall_health', 'N/A')}",
+        )
+
         return {
             "success":              True,
             "google_ads_connected": google_ads_connected,
@@ -5381,6 +5631,13 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
 
         save_to_memory("optimizer", norm_key, {"optimizer_data": optimizer})
         logger.info(f"[AI-OPT] Done: key={norm_key!r} confidence={optimizer.get('confidence')}")
+
+        log_activity(
+            "ai_optimizer", business_key=norm_key,
+            business_name=business_data.get("business_name", ""),
+            url=url, industry=industry, city=city,
+            summary="AI Optimizer recommendations generated",
+        )
 
         return {
             "success":     True,
@@ -5784,6 +6041,13 @@ async def result_center(request: ResultCenterRequest):
 
         logger.info(f"[RESULT] Done: key={norm_key!r} score={result_obj.get('overall_score')} verdict={result_obj.get('campaign_verdict')}")
 
+        log_activity(
+            "result_center", business_key=norm_key,
+            business_name=business_data.get("business_name", ""),
+            url=request.url, industry=industry, city=city,
+            summary=f"Result Center report — verdict: {result_obj.get('campaign_verdict', 'N/A')}",
+        )
+
         return {
             "success":     True,
             "memory_used": True,
@@ -6038,6 +6302,13 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     ), {"k": prospect_key, "d": json.dumps(result_obj), "ind": industry, "cit": city, "ca": _now, "ua": _now})
         await asyncio.to_thread(_save_prospect)
         logger.info(f"[PROSPECT] Saved to prospect_memory key={prospect_key!r}")
+
+        log_activity(
+            "prospect_discovery", business_key=prospect_key,
+            business_name=f"{industry} prospects" if industry else "Prospect search",
+            url=request.url, industry=industry, city=city,
+            summary=f"Prospect Discovery — {len(result_obj.get('prospects', []))} prospects found",
+        )
 
         return {
             "success":            True,
@@ -6771,6 +7042,18 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         }
         result["google_ads_dashboard"] = f"https://ads.google.com/aw/campaigns?campaignId={result['campaign_id']}"
         logger.info(f"[GADS-CREATE] Done: campaign_id={result['campaign_id']}")
+
+        log_activity(
+            "google_campaign_created", business_key=business_key,
+            business_name=request.url or request.campaign_name,
+            url=request.url, industry=request.industry, city=request.city,
+            summary=(
+                f"{result.get('status', 'PAUSED')}, {len(keywords_added)} keywords, "
+                f"{'ad created' if ad_created else 'ad NOT created'}"
+            ),
+            reference_id=result["campaign_id"],
+        )
+
         return {"success": True, **result}
 
     except GoogleAdsException as ex:
@@ -7056,6 +7339,79 @@ async def meta_ads_campaigns():
         tb = _traceback.format_exc()
         logger.error(f"[META ADS] campaigns unexpected error: {type(ex).__name__}: {ex}\n{tb}")
         return {"success": False, "error": f"{type(ex).__name__}: {ex}"}
+
+
+@app.get("/campaigns/all")
+async def campaigns_all():
+    """
+    Single source of truth for "what campaigns exist" — aggregates every
+    campaign this tool has visibility into across Google Ads AND Meta, each
+    with a direct dashboard link. Backs the History page's Campaigns tab.
+    Each platform's failure is isolated so one platform being unconfigured
+    doesn't hide the other's real campaigns.
+    """
+    campaigns = []
+    errors = {}
+
+    # ── Google Ads ────────────────────────────────────────────────────────────
+    try:
+        customer_id = _gads_customer_id()
+        if customer_id:
+            def _fetch_gads():
+                client  = get_google_ads_client()
+                service = client.get_service("GoogleAdsService")
+                query = "SELECT campaign.id, campaign.name, campaign.status FROM campaign ORDER BY campaign.id DESC"
+                return list(service.search(customer_id=customer_id, query=query))
+
+            rows = await asyncio.to_thread(_fetch_gads)
+            for row in rows:
+                cid = str(row.campaign.id)
+                campaigns.append({
+                    "platform":       "google",
+                    "campaign_id":    cid,
+                    "name":           row.campaign.name,
+                    "status":         row.campaign.status.name if hasattr(row.campaign.status, "name") else str(row.campaign.status),
+                    "dashboard_link": f"https://ads.google.com/aw/campaigns?campaignId={cid}",
+                })
+        else:
+            errors["google"] = "GOOGLE_ADS_CUSTOMER_ID not configured"
+    except GoogleAdsException as ex:
+        errors["google"] = "; ".join(e.message for e in ex.failure.errors)
+        logger.error(f"[CAMPAIGNS-ALL] Google Ads fetch failed: {errors['google']}")
+    except Exception as ex:
+        errors["google"] = str(ex)
+        logger.error(f"[CAMPAIGNS-ALL] Google Ads fetch unexpected error: {ex}")
+
+    # ── Meta Ads ──────────────────────────────────────────────────────────────
+    try:
+        from facebook_business.adobjects.adaccount import AdAccount
+        from facebook_business.adobjects.campaign import Campaign
+
+        _, account_id = get_meta_ads_client()
+        dashboard_link = f"https://business.facebook.com/adsmanager/manage/campaigns?act={account_id.replace('act_', '')}"
+
+        def _fetch_meta():
+            account = AdAccount(account_id)
+            return list(account.get_campaigns(fields=[
+                Campaign.Field.id, Campaign.Field.name, Campaign.Field.status,
+            ]))
+
+        rows = await asyncio.to_thread(_fetch_meta)
+        for c in rows:
+            campaigns.append({
+                "platform":       "meta",
+                "campaign_id":    c.get(Campaign.Field.id),
+                "name":           c.get(Campaign.Field.name),
+                "status":         c.get(Campaign.Field.status),
+                "dashboard_link": dashboard_link,
+            })
+    except RuntimeError as ex:
+        errors["meta"] = str(ex)
+    except Exception as ex:
+        errors["meta"] = str(ex)
+        logger.error(f"[CAMPAIGNS-ALL] Meta Ads fetch unexpected error: {ex}")
+
+    return {"success": True, "campaigns": campaigns, "errors": errors}
 
 
 @app.get("/meta-ads/performance")
@@ -7373,6 +7729,15 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
                 f"Ad Set ID: {adset_id}"
             )
             logger.info(f"[META ADS CREATE] Stopping after AdSet (no creative_id): {message}")
+
+            log_activity(
+                "meta_campaign_created", business_key=resolved_business_key,
+                business_name=request.url or campaign_name,
+                url=request.url, industry=request.industry, city=request.city,
+                summary="PAUSED, ad set created, ad creative pending manual step",
+                reference_id=campaign_id,
+            )
+
             return {
                 "success":               True,
                 "action_needed":         True,
@@ -7414,6 +7779,14 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         ad_id = ad.get(Ad.Field.id)
         created["ad_id"] = ad_id
         logger.info(f"[META ADS CREATE] Ad created: {ad_id}")
+
+        log_activity(
+            "meta_campaign_created", business_key=resolved_business_key,
+            business_name=request.url or campaign_name,
+            url=request.url, industry=request.industry, city=request.city,
+            summary="PAUSED, ad created",
+            reference_id=campaign_id,
+        )
 
         return {
             "success":                 True,
@@ -7809,6 +8182,11 @@ async def smart_analysis(request: SmartAnalysisRequest):
         plan["business_key"], request.url, plan["decision"]["business_model"],
         plan["decision"]["modules_run"], response,
     )
+    log_activity(
+        "smart_analysis", business_key=plan["business_key"], business_name=request.url,
+        url=request.url, industry=request.industry, city=request.city,
+        summary=f"Smart Analysis — {len(plan['decision']['modules_run'])} modules run",
+    )
     return response
 
 
@@ -7852,6 +8230,11 @@ async def smart_analysis_execute(request: SmartAnalysisExecuteRequest):
         "total_time_seconds": total_time,
     }
     _save_smart_analysis_history(request.business_key, request.url, request.business_model, request.modules_to_run, response)
+    log_activity(
+        "smart_analysis", business_key=request.business_key, business_name=request.url,
+        url=request.url, industry=request.industry, city=request.city,
+        summary=f"Smart Analysis — {len(request.modules_to_run)} modules run",
+    )
     return response
 
 
@@ -8895,6 +9278,14 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         logger.warning(f"[CRICKET] Memory save error: {_se}")
 
     logger.info(f"[CRICKET] Done for url={request.url!r} city={request.city!r} business_type={business_type!r} memory_reused={memory_reused} warnings={warnings}")
+
+    log_activity(
+        "sports_analysis", business_key=biz_key,
+        business_name=request.url or business_type,
+        url=request.url, industry=business_type, city=request.city,
+        summary="Sports Growth Engine analysis generated",
+    )
+
     return {
         "success":        True,
         "data":           result,
@@ -10123,6 +10514,14 @@ async def social_intelligence(request: SocialIntelRequest):
         logger.warning(f"[SIE] Memory save failed: {_se}")
 
     logger.info(f"[SIE] Done for input={input_value!r} type={input_type!r} business_key={business_key!r} warnings={warnings}")
+
+    log_activity(
+        "social_intel", business_key=business_key,
+        business_name=business_summary.get("business_name") or input_value,
+        url=website_url or input_value, industry=industry, city=city,
+        summary="Social Intelligence audit generated",
+    )
+
     return {
         "success":       True,
         "business_key":  business_key,
