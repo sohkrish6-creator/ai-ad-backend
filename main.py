@@ -6640,6 +6640,33 @@ def _creative_score_is_empty(score: dict) -> bool:
     return not score or all(float(score.get(f, 0) or 0) == 0 for f in _CREATIVE_SCORE_FIELDS)
 
 
+async def _generate_missing_image_prompt(concept: dict, business_context: str) -> str:
+    """Targeted single-concept image_prompt generation — used when the main
+    call returns a concept with the field missing/empty entirely, instead of
+    regenerating the whole response for one dropped field."""
+    try:
+        prompt = (
+            "Write ONE production-ready image-generation prompt for this ad creative concept, as natural, "
+            "richly-descriptive prose the way a professional would actually type it into Midjourney/DALL-E — "
+            "covering subject, environment, camera/lens, lighting, composition, mood, color palette, depth of "
+            "field, reserved space for branding and typography, commercial photography style, ending with "
+            "'Negative prompt: ...' and 'Render quality: ...'. NEVER prefix it with a meta-label like "
+            "'production-ready prompt:' and NEVER write it as a comma-separated field:value list.\n\n"
+            f"Business context: {business_context}\n"
+            f"Concept: headline={concept.get('headline')!r}, subheadline={concept.get('subheadline')!r}, "
+            f"visual_direction={concept.get('visual_direction')!r}\n\n"
+            'Return ONLY JSON: {"image_prompt": "..."}'
+        )
+        resp = await asyncio.to_thread(
+            client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, max_tokens=350, temperature=0.5,
+        )
+        return json.loads(resp.choices[0].message.content).get("image_prompt", "").strip()
+    except Exception as _e:
+        logger.warning(f"[CREATIVE-STUDIO] Targeted image_prompt generation failed: {_e}")
+        return ""
+
+
 async def _rescore_concept(concept: dict, business_context: str) -> dict:
     """Targeted single-concept rescoring — used only when the main call
     returns a concept with no real score data, instead of regenerating
@@ -6983,7 +7010,9 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
         # ── Fix the known "concepts B/C come back 0/100" bug: normalize every
         # concept's score deterministically, and if a concept has NO real score
         # data at all, do a targeted single-concept rescore rather than
-        # regenerating the whole response ────────────────────────────────────
+        # regenerating the whole response. Same treatment for image_prompt —
+        # observed live: GPT can drop the field entirely on 2 of 3 concepts
+        # while still returning everything else for them. ───────────────────
         business_context_for_scoring = f"{_sv(_bm, 'business_name')} ({industry or 'unspecified industry'}), objective: {objective}"
         for concept in output["concepts"]:
             score = concept.get("creative_score") or {}
@@ -6991,6 +7020,11 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
                 concept["creative_score"] = await _rescore_concept(concept, business_context_for_scoring)
             else:
                 concept["creative_score"] = _normalize_creative_score(score)
+
+            if not (concept.get("image_prompt") or "").strip():
+                logger.warning(f"[CREATIVE-STUDIO] Concept {concept.get('variant_name')!r} missing image_prompt — generating it via targeted follow-up")
+                generated = await _generate_missing_image_prompt(concept, business_context_for_scoring)
+                concept["image_prompt"] = generated or "N/A — regenerate to get this concept's image prompt"
 
         # ── data_sources_used / data_sufficiency: real, computed — never GPT-generated ─
         output["data_sources_used"] = {
