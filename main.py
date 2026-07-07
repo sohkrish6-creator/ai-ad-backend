@@ -4480,15 +4480,6 @@ async def outreach_ai(request: OutreachAIRequest):
     industry = (request.industry or "").strip()
     city     = (request.city or "").strip()
     city_display = city or "India (no specific city given)"
-    # Personalization instruction needs a real place name to ask for a "local
-    # landmark" — fall back to an industry-specific (not falsely localized) detail
-    # when no city was provided, rather than inventing a city-specific reference.
-    personalization_scope = (
-        f"THIS business type in {city} — a local landmark, a seasonal event, a known local pain point"
-        if city else
-        f"THIS business type in the {industry or 'this'} industry nationally — a known industry-specific pain "
-        "point, seasonal pattern, or trend (do NOT invent a city or region that wasn't provided)"
-    )
     goal     = (request.outreach_goal or "get meeting").strip()
     target   = (request.target_name   or "").strip()
 
@@ -4520,6 +4511,26 @@ async def outreach_ai(request: OutreachAIRequest):
     _ofm  = memory.get("offer",     {})
     _wm   = memory.get("website",   {})
     _vm   = memory.get("visibility", {})
+
+    # Personalization instruction: a "local landmark" reference is only valid
+    # if THIS business genuinely operates physically in the given city — a
+    # national/online/D2C/e-commerce brand must never get a city landmark
+    # injected just because a city field happened to be filled in. GPT gets
+    # the real positioning/UVP and must decide locality itself rather than
+    # being told to assume the given city is this business's home turf.
+    if city:
+        personalization_scope = (
+            f"THIS business in {city} — but FIRST check the business context below (positioning/UVP): if this "
+            f"reads as a national, online, D2C, or e-commerce brand with no evidence it's physically based in "
+            f"{city}, use an industry-specific pain point/seasonal trend nationally instead (do NOT reference "
+            f"{city} or any local landmark). Only reference a real local landmark/local detail in {city} if the "
+            f"business context clearly shows it's a local physical business actually operating there."
+        )
+    else:
+        personalization_scope = (
+            f"THIS business type in the {industry or 'this'} industry nationally — a known industry-specific pain "
+            "point, seasonal pattern, or trend (do NOT invent a city or region that wasn't provided)"
+        )
 
     def _safe_list(val):
         if isinstance(val, list): return val
@@ -6876,7 +6887,10 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
             '  "typography": {"style":"...","recommended_fonts":["...","..."],"why":"..."},\n'
             '  "layout_blueprint": {"hierarchy":"...","logo_placement":"...","cta_placement":"...","visual_flow":"...","eye_path":"..."},\n'
             '  "seasonal_intelligence": {"current_relevant_occasions":["..."],"recommendation":"..."},\n'
-            '  "localization": {"city_elements":["..."],"use_or_skip":"use/skip — explain why, tied to the city given (or say skip if no city was given)"},\n'
+            '  "localization": {"business_locality":"local_to_city / national_or_online / unclear",'
+            '"locality_reasoning":"the specific evidence used to decide this — e.g. \'D2C e-commerce brand shipping '
+            'pan-India, no mention of Jaipur as a physical base\' or \'this is a physical hotel operating in Jaipur\'",'
+            '"city_elements":["..."],"use_or_skip":"use/skip"},\n'
             '  "concepts": [\n'
             '    {"variant_id":"A","variant_name":"Direct Response","headline":"...","subheadline":"...","caption":"...","cta":"...","hashtags":["...","..."],'
             '"visual_direction":"...","image_prompt":"a single flowing descriptive paragraph — NOT a label:value list, NOT prefixed with any meta-text '
@@ -6904,9 +6918,24 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
             "comma-separated 'field is value' list.\n"
             "- seasonal_intelligence.current_relevant_occasions must be real, currently-relevant occasions given "
             "TODAY'S REAL DATE above — never invent a festival or date that isn't real or isn't actually near.\n"
-            "- localization: only include city_elements if a specific city was actually given AND it's genuinely "
-            "relevant to visual identity (e.g. Jaipur → Hawa Mahal silhouette, pink-city tones); otherwise set "
-            "use_or_skip to 'skip' and leave city_elements empty.\n"
+            "- LOCALIZATION — determine business_locality BEFORE deciding anything about city visuals:\n"
+            "  1. Look at the business's real positioning/UVP/industry above (and whether it reads as e-commerce, "
+            "D2C, ships/delivers nationally, or is an online-only service) versus whether the city given is "
+            "actually mentioned or implied as this business's own physical operating base.\n"
+            "  2. If the business is national, online, D2C, or e-commerce — or there is no evidence it is "
+            "physically tied to the given city — set business_locality='national_or_online', use_or_skip='skip', "
+            "and city_elements=[]. A national supplement/D2C/e-commerce brand must NEVER get city landmarks "
+            "injected just because a city field happened to be filled in — the city there is targeting context "
+            "only, not this brand's home turf.\n"
+            "  3. ONLY set business_locality='local_to_city' and use_or_skip='use' when this is a genuinely local "
+            "physical business (a hotel, restaurant, clinic, or local service) that actually operates IN that city "
+            "— then city_elements may reference real, distinctive local landmarks/architecture/tones (e.g. Jaipur "
+            "→ Hawa Mahal silhouette, pink-city tones).\n"
+            "  4. If you are not confident which applies, default to 'unclear' and use_or_skip='skip' — never "
+            "guess toward injecting landmarks.\n"
+            "  5. When use_or_skip is 'skip', no concept's headline, visual_direction, or image_prompt may "
+            "reference the given city's landmarks/architecture — the creatives should read as national-audience "
+            "work, not local-city work.\n"
             "- ab_prediction.confidence MUST be honest: cap at 45 or below unless real performance data is available "
             "above (then you may go higher, referencing the actual data). Never claim confidence from creative-"
             "specific win-rate data that was not provided — growth_memory does not contain that.\n"
@@ -6930,6 +6959,26 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
 
         output = _clean_banned_words_deep(output)
         output = _backfill_creative_studio(output, _CREATIVE_STUDIO_VARIANTS)
+
+        # ── Deterministic safety net for the "landmarks injected into a
+        # national/D2C brand" bug: never trust GPT's own use_or_skip alone —
+        # force skip whenever business_locality isn't explicitly local_to_city,
+        # regardless of what GPT put in city_elements. ───────────────────────
+        _loc = output.get("localization") or {}
+        if _loc.get("business_locality") != "local_to_city":
+            if _loc.get("city_elements") or _loc.get("use_or_skip") == "use":
+                logger.warning(
+                    f"[CREATIVE-STUDIO] Overriding localization — GPT set use_or_skip="
+                    f"{_loc.get('use_or_skip')!r} with city_elements={_loc.get('city_elements')!r} despite "
+                    f"business_locality={_loc.get('business_locality')!r}; forcing skip."
+                )
+            _loc["city_elements"] = []
+            _loc["use_or_skip"] = "skip"
+            if not _loc.get("business_locality"):
+                _loc["business_locality"] = "unclear"
+            if not _loc.get("locality_reasoning"):
+                _loc["locality_reasoning"] = "Not enough evidence this business is physically tied to the given city — defaulting to skip."
+        output["localization"] = _loc
 
         # ── Fix the known "concepts B/C come back 0/100" bug: normalize every
         # concept's score deterministically, and if a concept has NO real score
