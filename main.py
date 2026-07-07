@@ -5013,6 +5013,213 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
 
 
 # ── Module 20: Performance Intelligence ──────────────────────────────────────
+# Shared, honesty-first helpers used by BOTH Performance Intelligence and AI
+# Optimizer: statistical-significance guard, composite health scoring,
+# conversion-cause diagnosis, and confidence breakdown. These are computed
+# deterministically in Python — not left to GPT — because they encode hard
+# numeric/factual rules (e.g. "a 10% CTR campaign can't score 0 health") that
+# an LLM can silently violate even with a prompt instruction telling it not to.
+
+_DATA_SUFFICIENCY_THRESHOLDS = {"min_spend": 500, "min_impressions": 1000, "min_clicks": 100}
+
+def _check_data_sufficiency(impressions: int, clicks: int, spend: float) -> dict:
+    """Statistical significance guard — flags small-sample data so confidence
+    and recommendations downstream can be honestly downgraded instead of
+    treating a handful of clicks as a confirmed trend."""
+    t = _DATA_SUFFICIENCY_THRESHOLDS
+    insufficient = spend < t["min_spend"] or impressions < t["min_impressions"] or clicks < t["min_clicks"]
+    banner = None
+    if insufficient:
+        banner = (
+            f"⚠️ INSUFFICIENT DATA: This campaign has only {impressions} impressions and ₹{spend:.0f} spend. "
+            f"Recommendations below are preliminary — collect more data (target: {t['min_impressions']}+ impressions, "
+            f"₹{t['min_spend']}+ spend) before acting on bid/budget changes."
+        )
+    return {"insufficient_data": insufficient, "banner": banner, "thresholds": t}
+
+
+_TRACKING_STATUS_LABELS = {
+    "NOT_CONVERSION_TRACKED":                        "not set up",
+    "UNKNOWN":                                        "status unknown/unverified",
+    "UNSPECIFIED":                                    "status unknown/unverified",
+    "CONVERSION_TRACKING_MANAGED_BY_SELF":            "set up (self-managed)",
+    "CONVERSION_TRACKING_MANAGED_BY_THIS_MANAGER":    "set up (managed by this manager account)",
+    "CONVERSION_TRACKING_MANAGED_BY_ANOTHER_MANAGER": "set up (managed by another manager account)",
+}
+_TRACKING_VERIFIED_STATUSES = {
+    "CONVERSION_TRACKING_MANAGED_BY_SELF",
+    "CONVERSION_TRACKING_MANAGED_BY_THIS_MANAGER",
+    "CONVERSION_TRACKING_MANAGED_BY_ANOTHER_MANAGER",
+}
+
+def _fetch_conversion_tracking_status() -> str:
+    """Real GAQL signal for whether conversion tracking is actually set up on
+    this account — used instead of guessing, so the conversion diagnosis and
+    Tracking Health sub-score are grounded in a fact, not an assumption."""
+    try:
+        customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+        client  = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+        rows = list(service.search(
+            customer_id=customer_id,
+            query="SELECT customer.conversion_tracking_setting.conversion_tracking_status FROM customer LIMIT 1",
+        ))
+        if rows:
+            status = rows[0].customer.conversion_tracking_setting.conversion_tracking_status
+            return status.name if hasattr(status, "name") else str(status)
+        return "UNKNOWN"
+    except Exception as _e:
+        logger.warning(f"[TRACKING-STATUS] Could not fetch conversion tracking status: {_e}")
+        return "UNKNOWN"
+
+
+def _compute_health_scores(ctr: float, cpc: float, conversions: float, clicks: int,
+                            benchmark_ctr: float, benchmark_cpc: float, tracking_status: str) -> dict:
+    """
+    Composite health score — Traffic Health (CTR/CPC vs benchmark), Conversion
+    Health (conversion rate, only scored if tracking is verified), Tracking
+    Health (is tracking actually set up). Weighted so strong traffic metrics
+    alone can carry a campaign to a respectable score even with zero/unverified
+    conversion data — a campaign getting cheap, high-CTR clicks should never
+    show 0/100 just because conversions haven't been confirmed yet.
+    """
+    ctr_ratio = (ctr / benchmark_ctr) if benchmark_ctr > 0 else 1.0
+    cpc_ratio = (benchmark_cpc / cpc) if cpc > 0 and benchmark_cpc > 0 else 1.0
+    traffic_health = round(max(0, min(100,
+        (min(ctr_ratio, 2.0) / 2.0) * 50 + (min(cpc_ratio, 2.0) / 2.0) * 50
+    )))
+
+    tracking_score_map = {
+        "CONVERSION_TRACKING_MANAGED_BY_SELF":            100,
+        "CONVERSION_TRACKING_MANAGED_BY_THIS_MANAGER":    100,
+        "CONVERSION_TRACKING_MANAGED_BY_ANOTHER_MANAGER": 80,
+        "NOT_CONVERSION_TRACKED":                         0,
+        "UNKNOWN":                                         40,
+        "UNSPECIFIED":                                     40,
+    }
+    tracking_health   = tracking_score_map.get(tracking_status, 40)
+    tracking_verified = tracking_status in _TRACKING_VERIFIED_STATUSES
+
+    if clicks <= 0:
+        conversion_health = None   # no traffic yet — nothing to assess
+    elif not tracking_verified:
+        conversion_health = None   # can't trust "0 conversions" as real signal if tracking isn't confirmed
+    else:
+        conv_rate = (conversions / clicks) * 100
+        conversion_health = round(max(0, min(100, (conv_rate / 2.0) * 100)))  # 2% conv rate ≈ 100
+
+    if conversion_health is None:
+        overall = round(traffic_health * 0.65 + tracking_health * 0.35)
+    else:
+        overall = round(traffic_health * 0.40 + conversion_health * 0.35 + tracking_health * 0.25)
+
+    return {
+        "traffic_health":    traffic_health,
+        "conversion_health": conversion_health,   # None = "not enough signal to assess yet"
+        "tracking_health":   tracking_health,
+        "overall_health":    overall,
+    }
+
+
+def _conversion_diagnosis(clicks: int, conversions: float, ctr: float, tracking_status: str) -> list:
+    """
+    Ranked, evidence-based causes for 0 conversions despite clicks. Percentages
+    are deterministic, not GPT-invented: tracking status is a real queried
+    signal weighted first, the rest split by CTR (high CTR + 0 conversions
+    points at the landing page/offer rather than audience intent, and vice
+    versa). Returns [] when there's nothing to diagnose (no clicks yet, or
+    conversions are already happening).
+    """
+    if clicks <= 0 or conversions > 0:
+        return []
+
+    tracking_label    = _TRACKING_STATUS_LABELS.get(tracking_status, "status unknown/unverified")
+    tracking_verified = tracking_status in _TRACKING_VERIFIED_STATUSES
+
+    if tracking_status == "NOT_CONVERSION_TRACKED":
+        tracking_pct = 55
+    elif not tracking_verified:
+        tracking_pct = 45
+    else:
+        tracking_pct = 15
+
+    remaining = 100 - tracking_pct
+    if ctr >= 3.0:
+        weights = {"landing_page": 0.45, "audience": 0.20, "offer": 0.35}
+    elif ctr < 1.0:
+        weights = {"landing_page": 0.30, "audience": 0.45, "offer": 0.25}
+    else:
+        weights = {"landing_page": 0.38, "audience": 0.30, "offer": 0.32}
+
+    diagnosis = [
+        {
+            "cause": f"Conversion tracking {tracking_label}",
+            "likelihood_pct": tracking_pct,
+            "check_fix": (
+                "Check Google Ads → Goals → Conversions: confirm a conversion action exists, the tag is installed "
+                "on the confirmation/thank-you page, and it's firing (use Tag Assistant or GTM preview mode)."
+                if not tracking_verified else
+                "Tracking is set up at the account level — verify the specific conversion action for THIS campaign "
+                "is attached and actually firing on the real thank-you/confirmation page (not just the form page)."
+            ),
+        },
+        {
+            "cause": "Landing page isn't converting (no clear CTA/form, slow load, mobile issues)",
+            "likelihood_pct": round(remaining * weights["landing_page"]),
+            "check_fix": "Open the landing page on mobile: is there ONE clear form/CTA above the fold? Check PageSpeed Insights — over 3s load time kills conversions.",
+        },
+        {
+            "cause": "Wrong audience intent — clicks aren't from people ready to act",
+            "likelihood_pct": round(remaining * weights["audience"]),
+            "check_fix": "Check the Search Terms report for irrelevant queries; confirm keyword match types aren't too broad.",
+        },
+        {
+            "cause": "Offer mismatch — what's promised in the ad doesn't match the landing page, or the offer isn't compelling",
+            "likelihood_pct": round(remaining * weights["offer"]),
+            "check_fix": "Compare the ad headline/description promise to the landing page headline word-for-word — do they match? Consider a lower-commitment offer.",
+        },
+    ]
+    diagnosis.sort(key=lambda d: -d["likelihood_pct"])
+    return diagnosis
+
+
+def _confidence_breakdown(google_ads_connected: bool, has_account_history: bool,
+                           industry: str, has_conversion_data: bool) -> dict:
+    """
+    Honest confidence breakdown — every field here is a real, checked signal.
+    cross_business_learning.record_count is the ACTUAL row count from
+    growth_memory for this industry (never a made-up number like '143
+    campaigns') — get_growth_learning() runs a real SQL COUNT-equivalent query.
+    """
+    growth = get_growth_learning(industry) if industry else {"sample_size": 0, "entries": []}
+    n = growth.get("sample_size", 0)
+    return {
+        "google_ads_live_data":         bool(google_ads_connected),
+        "account_performance_history":  bool(has_account_history),
+        "cross_business_learning": {
+            "available":    n > 0,
+            "record_count": n,
+            "label": f"{n} real record(s) from other {industry} businesses run through Adsoh" if n > 0 else "No cross-business records yet for this industry",
+        },
+        "industry_benchmarks":              "general (not this specific industry unless KPI Engine has run)",
+        "this_campaign_conversion_data":    bool(has_conversion_data),
+    }
+
+
+def _parse_pct_generic(v) -> float:
+    try:
+        s = str(v).replace("%", "").replace(",", "").strip()
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
+
+def _parse_money_generic(v) -> float:
+    try:
+        s = str(v).replace("RS", "").replace("₹", "").replace(",", "").strip()
+        return float(s) if s else 0.0
+    except Exception:
+        return 0.0
+
 
 class PerformanceIntelligenceRequest(BaseModel):
     url:        str = ""
@@ -5139,12 +5346,14 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         # ── Memory + Google Ads in parallel ──────────────────────────────────
         memory, norm_key = get_memory_with_city_fallback(_bk_src, industry, city)
         logger.info(f"[PERF-INTEL] key={norm_key!r} memory_tables={list(memory.keys())}")
+        has_account_history = bool(memory.get("performance"))
 
-        perf_data, campaign_rows = await asyncio.gather(
+        perf_data, campaign_rows, tracking_status = await asyncio.gather(
             asyncio.to_thread(_fetch_gads_performance, days),
             asyncio.to_thread(_fetch_gads_campaigns,  days),
+            asyncio.to_thread(_fetch_conversion_tracking_status),
         )
-        logger.info(f"[PERF-INTEL] gads_perf={perf_data} campaigns={len(campaign_rows)}")
+        logger.info(f"[PERF-INTEL] gads_perf={perf_data} campaigns={len(campaign_rows)} tracking_status={tracking_status}")
 
         google_ads_connected = perf_data.get("connected", False)
 
@@ -5177,6 +5386,49 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         cpa  = float(perf_data.get("cpa_inr", 0.0))
         roas = round(conv / cost, 2) if cost > 0 and conv > 0 else 0.0
         zero_spend = (cost == 0 and imp == 0)
+
+        # ── Benchmarks: prefer KPI Engine's own predicted CTR/CPC (already
+        # industry-tailored) over a generic fallback — track which was used so
+        # the confidence breakdown can honestly say "general" vs industry-specific.
+        _pred_ctr = _parse_pct_generic(_exp("ctr"))
+        _pred_cpc = _parse_money_generic(_exp("cpc"))
+        benchmark_ctr    = _pred_ctr if _pred_ctr > 0 else 2.0
+        benchmark_cpc    = _pred_cpc if _pred_cpc > 0 else 20.0
+        benchmark_source = "kpi_engine_prediction" if (_pred_ctr > 0 or _pred_cpc > 0) else "generic_search_benchmark"
+
+        # ── Deterministic, honesty-first computations (never left to GPT) ─────
+        data_sufficiency   = _check_data_sufficiency(imp, clk, cost)
+        health_scores      = _compute_health_scores(ctr, cpc, conv, clk, benchmark_ctr, benchmark_cpc, tracking_status)
+        conversion_diag    = _conversion_diagnosis(clk, conv, ctr, tracking_status)
+        confidence_bkdown  = _confidence_breakdown(google_ads_connected, has_account_history, industry, has_conversion_data=(conv > 0))
+        has_active_campaign_with_data = any(
+            row.get("status") == "ENABLED" and row.get("impressions", 0) > 0 for row in campaign_rows
+        )
+
+        # ── Impact quantification: only estimate using KPI Engine's own
+        # predicted CPC/CPA (never an invented conversion rate) ───────────────
+        _pred_cpa = _parse_money_generic(_exp("cpa"))
+        impact_quantification = None
+        if clk > 0 and conv == 0 and _pred_cpc > 0 and _pred_cpa > 0:
+            implied_rate = _pred_cpc / _pred_cpa
+            potential_leads = round(clk * implied_rate, 1)
+            impact_quantification = {
+                "basis": "Estimated from KPI Engine's predicted CPC/CPA implied conversion rate — this campaign has 0 tracked conversions, so this is NOT a measured rate.",
+                "clicks_with_no_tracked_conversion": clk,
+                "implied_conversion_rate_pct": round(implied_rate * 100, 2),
+                "estimated_potential_leads": potential_leads,
+                "note": (
+                    f"{clk} clicks with 0 tracked conversions — if even {round(implied_rate * 100, 1)}% converted at the "
+                    f"KPI Engine's predicted rate, that's an estimated {potential_leads} lead(s) currently invisible, "
+                    "most likely due to a tracking or landing-page issue rather than zero real interest."
+                ),
+            }
+        elif clk > 0 and conv == 0:
+            impact_quantification = {
+                "basis": "No KPI Engine prediction available to base an estimate on.",
+                "clicks_with_no_tracked_conversion": clk,
+                "note": f"{clk} clicks with 0 tracked conversions. Run KPI Engine first for an industry-calibrated estimate.",
+            }
 
         _bm = memory.get("business", {})
         def _sv(d, k, dfl=""):
@@ -5215,17 +5467,27 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         ]
         _camp_json = json.dumps(_camp_list, ensure_ascii=False)
 
+        # Ground-truth signal for "are there really zero active campaigns" —
+        # per-campaign data, not the account-level aggregate, which can
+        # diverge from it. GPT is told never to claim "no active campaigns"
+        # when this is True; Python enforces it afterward regardless.
         zero_note = (
-            "NOTE: Google Ads shows zero spend and zero impressions — account has no active campaigns or date range returned no data."
-            if zero_spend else ""
+            "NOTE: Google Ads shows zero spend and zero impressions across the WHOLE account for this date range."
+            if zero_spend and not has_active_campaign_with_data else ""
         )
 
+        sufficiency_note = data_sufficiency["banner"] or ""
+        tracking_note = f"CONVERSION TRACKING STATUS (real, queried): {tracking_status} ({_TRACKING_STATUS_LABELS.get(tracking_status, 'unknown')})\n"
+
         prompt = (
-            "You are a senior Google Ads performance analyst for an Indian digital marketing agency.\n"
+            "You are a senior Google Ads performance analyst for an Indian digital marketing agency. You think in "
+            "terms of DECISIONS, not just descriptions — every report leads with what to do, not just what happened.\n"
             "Analyse the following campaign performance data and return a JSON report.\n\n"
             "BUSINESS: " + _sv(_bm, "business_name") + " | Industry: " + industry + " | City: " + city_display + "\n"
             "ANALYSIS PERIOD: Last " + str(days) + " days (" + str(perf_data.get("start_date", "N/A")) + " to " + str(perf_data.get("end_date", "N/A")) + ")\n"
-            "GOOGLE ADS CONNECTED: " + str(google_ads_connected) + "\n\n"
+            "GOOGLE ADS CONNECTED: " + str(google_ads_connected) + "\n"
+            + tracking_note +
+            "HAS AT LEAST ONE ENABLED CAMPAIGN WITH REAL IMPRESSIONS: " + str(has_active_campaign_with_data) + "\n\n"
             "ACTUAL GOOGLE ADS METRICS:\n"
             "- Impressions: " + str(imp) + "\n"
             "- Clicks: " + str(clk) + "\n"
@@ -5245,6 +5507,7 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
             "- Conversions: " + _exp("conversions") + "\n\n"
             "CAMPAIGN BREAKDOWN:\n" + campaign_summary + "\n\n"
             + (zero_note + "\n\n" if zero_note else "")
+            + (sufficiency_note + "\n\n" if sufficiency_note else "")
             + "Return ONLY valid JSON (no markdown, no text outside JSON) with this EXACT schema:\n"
             '{\n'
             '  "date_range": "' + date_range + ' (' + str(days) + ' days)",\n'
@@ -5259,24 +5522,37 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
             '    "roas": "' + str(roas) + 'x"\n'
             '  },\n'
             '  "expected_vs_actual": [\n'
-            '    {"metric":"CTR","expected":"' + _exp("ctr") + '","actual":"' + str(ctr) + '%","status":"below/on_track/above","gap":"numeric gap with sign","action":"specific action"},\n'
+            '    {"metric":"CTR","expected":"' + _exp("ctr") + '","actual":"' + str(ctr) + '%","status":"below/on_track/above","gap":"numeric gap with sign","action":"specific action — MUST mention the sample size (impressions/clicks) if data is insufficient, e.g. \'...but based on only N impressions, too small to confirm\'"},\n'
             '    {"metric":"CPC","expected":"' + _exp("cpc") + '","actual":"RS' + str(cpc) + '","status":"below/on_track/above","gap":"numeric gap","action":"specific action"},\n'
             '    {"metric":"Conversions","expected":"' + _exp("conversions") + '","actual":"' + str(conv) + '","status":"below/on_track/above","gap":"numeric gap","action":"specific action"},\n'
             '    {"metric":"ROAS","expected":"' + _exp("roas") + '","actual":"' + str(roas) + 'x","status":"below/on_track/above","gap":"numeric gap","action":"specific action"},\n'
             '    {"metric":"Cost","expected":"N/A","actual":"RS' + str(cost) + '","status":"on_track","gap":"0","action":"budget pacing assessment"}\n'
             '  ],\n'
             '  "campaign_breakdown": ' + _camp_json + ',\n'
-            '  "top_insight": "single most important thing happening now — specific, data-backed",\n'
+            '  "top_insight": "single most important thing happening now — specific, data-backed, MUST reference sample size if small",\n'
             '  "biggest_problem": "single most urgent issue to fix — specific, data-backed, no fluff",\n'
             '  "quick_wins": ["action 1 with expected impact","action 2","action 3"],\n'
-            '  "ai_analysis": "2-3 paragraphs on overall performance, what is working, what needs fixing. Specific to the numbers above.",\n'
-            '  "overall_health": 0,\n'
-            '  "trend": "improving/stable/declining"\n'
+            '  "ai_analysis": "2-3 paragraphs on overall performance, what is working, what needs fixing. Specific to the numbers above. If data is insufficient, say so explicitly and frame confidently-worded conclusions as preliminary.",\n'
+            '  "trend": "improving/stable/declining",\n'
+            '  "decision_summary": {\n'
+            '    "top_problems": [{"problem":"...","impact":"high/medium/low"}],\n'
+            '    "top_actions": [{"action":"...","expected_impact":"...","effort":"low/medium/high"}],\n'
+            '    "expected_improvement_if_actioned": "range, explicitly labeled as a projection, not a guarantee",\n'
+            '    "overall_confidence": 0\n'
+            '  }\n'
             '}\n\n'
             "Rules:\n"
-            "- Replace overall_health with an integer 0-100 based on CTR, ROAS, conversions relative to benchmarks.\n"
+            "- Do NOT include an overall_health field — health scoring is computed separately from real thresholds, not by you.\n"
             "- Fill campaign_breakdown performance_rating: good (CTR>2% or conv>0), average (CTR 1-2%), poor (CTR<1% and conv=0).\n"
-            "- If zero spend: overall_health=0, trend=stable, top_insight='No active campaigns found — launch a campaign to see performance data'.\n"
+            "- NEVER say 'no active campaigns' or similar in ANY field if HAS AT LEAST ONE ENABLED CAMPAIGN WITH REAL "
+            "IMPRESSIONS above is True — that claim would be factually wrong. Only use that framing if it is False.\n"
+            "- decision_summary.top_problems and top_actions: exactly 3 each, ranked by impact (most impactful first). "
+            "top_actions must each include a realistic effort estimate.\n"
+            "- decision_summary.overall_confidence: an honest 0-100 integer. If insufficient data (see banner above), "
+            "this MUST be 40 or below — do not express high confidence on a small sample.\n"
+            "- SAMPLE SIZE HONESTY: if impressions are low, NEVER celebrate or alarm on a metric without explicitly "
+            "flagging the sample size, e.g. 'CTR of 10.16% is well above benchmark, but based on only 384 impressions — "
+            "too small to confirm as sustained performance. Re-evaluate at 1000+ impressions.'\n"
             "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless.\n"
             "- Return ONLY the JSON. Nothing else."
         )
@@ -5313,6 +5589,36 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
                 for row in campaign_rows[:8]
             ]
 
+        # ── Inject deterministic fields — these are never GPT-generated, so
+        # they can't drift from the real computed values above ───────────────
+        performance["overall_health"]       = health_scores["overall_health"]
+        performance["health_scores"]        = health_scores
+        performance["data_sufficiency"]     = data_sufficiency
+        performance["conversion_diagnosis"] = conversion_diag
+        performance["why_not_converting"]   = conversion_diag
+        performance["confidence_breakdown"] = confidence_bkdown
+        if impact_quantification:
+            performance["impact_quantification"] = impact_quantification
+
+        # ── Enforce the "no active campaigns" claim can't be factually wrong ──
+        if has_active_campaign_with_data:
+            best_campaign = max(campaign_rows, key=lambda r: r.get("impressions", 0))
+            for _field in ("top_insight", "biggest_problem"):
+                _val = str(performance.get(_field, "") or "")
+                if "no active campaign" in _val.lower():
+                    performance[_field] = (
+                        f"'{best_campaign['name']}' is ENABLED with {best_campaign['impressions']} impressions — "
+                        "this account does have active campaign data; re-check the specific metric driving this concern."
+                    )
+
+        # ── Cap decision_summary confidence honestly on small samples ────────
+        _ds = performance.get("decision_summary")
+        if isinstance(_ds, dict) and data_sufficiency["insufficient_data"]:
+            try:
+                _ds["overall_confidence"] = min(int(_ds.get("overall_confidence", 40) or 40), 40)
+            except Exception:
+                _ds["overall_confidence"] = 40
+
         save_to_memory("performance", norm_key, {
             "performance_data": performance,
             "date_range":       date_range,
@@ -5324,7 +5630,8 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
             "performance_intelligence", business_key=norm_key,
             business_name=_bm.get("business_name", ""),
             url=request.url, industry=industry, city=city,
-            summary=f"Performance Intelligence report — health {performance.get('overall_health', 'N/A')}",
+            summary=f"Performance Intelligence report — health {performance.get('overall_health', 'N/A')}"
+                    + (" (insufficient data)" if data_sufficiency["insufficient_data"] else ""),
         )
 
         return {
@@ -5428,6 +5735,31 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
         trend    = performance_data.get("trend", "N/A")
         top_ins  = performance_data.get("top_insight", "")
         big_prob = performance_data.get("biggest_problem", "")
+
+        # ── Inherit the honesty-first computations Performance Intelligence
+        # already saved (so both modules agree on the same numbers) — fall
+        # back to a lightweight local recompute only if this business hasn't
+        # run Performance Intelligence since this feature shipped ───────────
+        _imp  = int(am.get("impressions", 0) or 0)
+        _clk  = int(am.get("clicks", 0) or 0)
+        _cost = _parse_money_generic(am.get("cost", 0))
+        _conv = float(am.get("conversions", 0) or 0)
+        _ctr  = _parse_pct_generic(am.get("ctr", 0))
+        _cpc  = _parse_money_generic(am.get("cpc", 0))
+
+        data_sufficiency = performance_data.get("data_sufficiency") or _check_data_sufficiency(_imp, _clk, _cost)
+        health_scores    = performance_data.get("health_scores")
+        if not health_scores:
+            _pred_ctr  = _parse_pct_generic(_exp("ctr"))
+            _pred_cpc  = _parse_money_generic(_exp("cpc"))
+            _bench_ctr = _pred_ctr if _pred_ctr > 0 else 2.0
+            _bench_cpc = _pred_cpc if _pred_cpc > 0 else 20.0
+            health_scores = _compute_health_scores(_ctr, _cpc, _conv, _clk, _bench_ctr, _bench_cpc, "UNKNOWN")
+        _inherited_diag = performance_data.get("conversion_diagnosis")
+        conversion_diag = _inherited_diag if _inherited_diag is not None else _conversion_diagnosis(_clk, _conv, _ctr, "UNKNOWN")
+        confidence_bkdown = performance_data.get("confidence_breakdown") or _confidence_breakdown(
+            has_perf, has_perf, industry, has_conversion_data=(_conv > 0)
+        )
 
         # ── Summarise below-target metrics from expected_vs_actual ────────────
         below_metrics = [
@@ -5548,12 +5880,15 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
         elif not has_perf:
             missing_note = "NOTE: Performance data not available — base recommendations on KPI targets + pre-launch best practices.\n"
 
+        sufficiency_note = data_sufficiency["banner"] or ""
+
         prompt = (
             "You are a senior Google Ads + Meta Ads optimization strategist for an Indian digital marketing agency.\n"
             "Based on the data below, generate a detailed, actionable optimization plan.\n\n"
             + context + "\n"
-            + missing_note + "\n"
-            "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
+            + missing_note
+            + (sufficiency_note + "\n\n" if sufficiency_note else "\n")
+            + "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
             "{\n"
             '  "overall_verdict": "campaigns need urgent attention / on track / performing well",\n'
             '  "health_change": "improving / stable / declining",\n'
@@ -5589,6 +5924,12 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
             '  "next_test": {\n'
             '    "what_to_test":"...","hypothesis":"...","how_to_measure":"...","duration":"e.g. 2 weeks"\n'
             '  },\n'
+            '  "decision_summary": {\n'
+            '    "top_problems": [{"problem":"...","impact":"high/medium/low"}],\n'
+            '    "top_actions": [{"action":"...","expected_impact":"...","effort":"low/medium/high"}],\n'
+            '    "expected_improvement_if_actioned": "range, explicitly labeled as a projection, not a guarantee",\n'
+            '    "overall_confidence": 0\n'
+            '  },\n'
             '  "confidence": 75\n'
             '}\n\n'
             "Rules:\n"
@@ -5605,6 +5946,12 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
             "- Minimum 2 items in scale, audience, creative, keyword lists. pause_recommendations has no minimum — "
             "leave it empty rather than padding it with a campaign that isn't pause-eligible.\n"
             "- Minimum 5 this_week_actions.\n"
+            "- decision_summary.top_problems and top_actions: exactly 3 each, ranked by impact.\n"
+            "- STATISTICAL SIGNIFICANCE: if the insufficient-data banner above is present, do NOT recommend bid "
+            "increases or budget shifts as confident actions — frame every scale_recommendations/budget_recommendations "
+            "item as conditional, e.g. 'Once this campaign reaches 1000+ impressions, consider...' rather than a "
+            "direct instruction to act now. confidence and decision_summary.overall_confidence MUST be 40 or below "
+            "in this case.\n"
             "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, Boost, "
             "Maximize, Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.\n"
             "- Return ONLY the JSON. Nothing else."
@@ -5629,6 +5976,26 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
         # this is structured JSON, not one raw text blob, so the filter must recurse.
         optimizer = _clean_banned_words_deep(optimizer)
 
+        # ── Inject the same deterministic, honesty-first fields Performance
+        # Intelligence uses — never GPT-generated, so they can't drift ───────
+        optimizer["health_scores"]        = health_scores
+        optimizer["data_sufficiency"]     = data_sufficiency
+        optimizer["conversion_diagnosis"] = conversion_diag
+        optimizer["why_not_converting"]   = conversion_diag
+        optimizer["confidence_breakdown"] = confidence_bkdown
+
+        if data_sufficiency["insufficient_data"]:
+            try:
+                optimizer["confidence"] = min(int(optimizer.get("confidence", 40) or 40), 40)
+            except Exception:
+                optimizer["confidence"] = 40
+            _ds = optimizer.get("decision_summary")
+            if isinstance(_ds, dict):
+                try:
+                    _ds["overall_confidence"] = min(int(_ds.get("overall_confidence", 40) or 40), 40)
+                except Exception:
+                    _ds["overall_confidence"] = 40
+
         save_to_memory("optimizer", norm_key, {"optimizer_data": optimizer})
         logger.info(f"[AI-OPT] Done: key={norm_key!r} confidence={optimizer.get('confidence')}")
 
@@ -5636,7 +6003,7 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
             "ai_optimizer", business_key=norm_key,
             business_name=business_data.get("business_name", ""),
             url=url, industry=industry, city=city,
-            summary="AI Optimizer recommendations generated",
+            summary="AI Optimizer recommendations generated" + (" (insufficient data)" if data_sufficiency["insufficient_data"] else ""),
         )
 
         return {
