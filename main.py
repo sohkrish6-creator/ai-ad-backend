@@ -280,6 +280,13 @@ CREATE TABLE IF NOT EXISTS ad_creative_memory (
     created_at      TEXT,
     updated_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS creative_studio_memory (
+    id              BIGSERIAL PRIMARY KEY,
+    business_key    TEXT UNIQUE NOT NULL,
+    data            TEXT,
+    created_at      TEXT,
+    updated_at      TEXT
+);
 """
 
 def _create_memory_tables():
@@ -290,7 +297,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory", "creative_director_memory", "ad_creative_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory", "creative_director_memory", "ad_creative_memory", "creative_studio_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -344,6 +351,7 @@ _MEMORY_TABLES = {
     "social_intel":    "social_intel_memory",
     "creative_director": "creative_director_memory",
     "ad_creative":       "ad_creative_memory",
+    "creative_studio":   "creative_studio_memory",
 }
 
 def _json_val(v):
@@ -6444,254 +6452,15 @@ async def result_center(request: ResultCenterRequest):
         return {"success": False, "error": str(_e), "traceback": tb}
 
 
-# ── Module 23: AI Creative Director ──────────────────────────────────────────
-# Creative Intelligence Engine: reuses existing Business DNA / audience /
-# growth / performance memory to produce a full creative strategy + 3
-# production-ready image prompts. Does NOT generate images itself — that's a
-# future phase; this generates everything needed to produce them elsewhere.
-
-class CreativeDirectorRequest(BaseModel):
-    url:                str
-    industry:           str = ""
-    city:               str = ""
-    campaign_objective: str = "Leads"
-    offer:              str = ""
-
-_CREATIVE_CONCEPT_ANGLES = ["Authority", "Lifestyle", "Emotional"]
-
-def _backfill_creative_director(creative: dict, angles: list) -> dict:
-    """
-    Schema-ordering + backfill: guarantees exactly one concept per angle, and
-    that ai_creative_review/creative_scores have one entry per concept name —
-    so a partial/malformed GPT response still renders a complete, usable
-    3-concept output instead of leaving sections empty.
-    """
-    concepts = creative.get("concepts") or []
-    concepts = [c for c in concepts if isinstance(c, dict) and c.get("name")]
-    have_names = {c.get("name") for c in concepts}
-    letters = ["A", "B", "C"]
-    for i, angle in enumerate(angles):
-        name = f"Concept {letters[i]}"
-        if name not in have_names and not any(c.get("angle") == angle for c in concepts):
-            concepts.append({
-                "name": name, "angle": angle,
-                "headline": "N/A — GPT did not return this concept", "subheadline": "", "cta": "",
-                "visual_concept": "N/A", "image_prompt": "N/A — regenerate to get this concept's image prompt",
-            })
-    creative["concepts"] = concepts[:3]
-    concept_names = [c["name"] for c in creative["concepts"]]
-
-    def _ensure_per_concept(section_key, field_defaults):
-        section = creative.get(section_key) or {}
-        per = section.get("per_concept") or []
-        by_name = {p.get("concept"): p for p in per if isinstance(p, dict)}
-        fixed = []
-        for name in concept_names:
-            if name in by_name:
-                fixed.append(by_name[name])
-            else:
-                fixed.append({"concept": name, **field_defaults})
-        creative[section_key] = {"per_concept": fixed}
-
-    _ensure_per_concept("ai_creative_review", {
-        "strong": "Not assessed", "weak": "Not assessed", "scroll_stopping": "Not assessed",
-        "cta_standout": "Not assessed", "audience_match": "Not assessed",
-    })
-    _ensure_per_concept("creative_scores", {
-        "visual_appeal": 0, "headline": 0, "cta": 0, "brand_match": 0, "emotional_appeal": 0,
-        "scroll_stopping": 0, "conversion_potential": 0, "overall": 0,
-        "score_reasoning": "Not scored — GPT did not return this concept's scores.",
-    })
-    return creative
-
-
-@app.post("/creative-director")
-async def creative_director(request: CreativeDirectorRequest):
-    try:
-        url      = (request.url or "").strip()
-        industry = (request.industry or "").strip()
-        city     = (request.city or "").strip()
-        objective = (request.campaign_objective or "Leads").strip()
-        offer    = (request.offer or "").strip()
-        city_display = city or "India (no specific city given)"
-
-        if not url:
-            return {"success": False, "error": "url is required"}
-
-        norm_key = derive_business_key(url, industry, city)
-        memory, resolved_key = get_memory_with_city_fallback(url, industry, city)
-        logger.info(f"[CREATIVE-DIR] key={resolved_key!r} tables={list(memory.keys())}")
-
-        _bm = memory.get("business", {}) or {}
-        _am = memory.get("audience", {}) or {}
-        _mm = memory.get("market", {}) or {}
-        _perf_raw = memory.get("performance", {}) or {}
-        if isinstance(_perf_raw, str):
-            try: _perf_raw = json.loads(_perf_raw)
-            except Exception: _perf_raw = {}
-        _perf_data = _perf_raw.get("performance_data", {}) if isinstance(_perf_raw, dict) else {}
-        if isinstance(_perf_data, str):
-            try: _perf_data = json.loads(_perf_data)
-            except Exception: _perf_data = {}
-
-        has_business_dna  = bool(_bm)
-        has_audience_data = bool(_am and (_am.get("segments") if isinstance(_am, dict) else None))
-        has_performance    = bool(_perf_data)
-
-        growth = get_growth_learning(industry) if industry else {"sample_size": 0, "entries": []}
-        growth_records = growth.get("sample_size", 0)
-
-        def _sv(d, k, dfl="N/A"):
-            v = (d or {}).get(k, dfl) if isinstance(d, dict) else dfl
-            return str(v or dfl)
-
-        segments = _am.get("segments") if isinstance(_am, dict) else None
-        if isinstance(segments, str):
-            try: segments = json.loads(segments)
-            except Exception: segments = []
-        segments_summary = json.dumps(segments, ensure_ascii=False)[:500] if segments else "NOT AVAILABLE"
-
-        _today = date.today().strftime("%B %d, %Y")
-
-        # ── Honesty context: tell GPT exactly what's real vs. missing, so it
-        # can't silently assume data it wasn't given ───────────────────────
-        data_context = (
-            f"TODAY'S REAL DATE: {_today} (use this — never invent a festival/occasion that hasn't happened or doesn't exist)\n"
-            f"BUSINESS DNA AVAILABLE: {has_business_dna}\n"
-            + (f"  - Business: {_sv(_bm, 'business_name')} | Positioning: {_sv(_bm, 'positioning')} | UVP: {_sv(_bm, 'uvp')}\n" if has_business_dna else "  - No Business DNA on file — base creative direction on industry + objective only.\n")
-            + f"AUDIENCE INTELLIGENCE AVAILABLE: {has_audience_data}\n"
-            + (f"  - Segments: {segments_summary}\n" if has_audience_data else "  - No audience segments on file — base targeting assumptions on industry norms only.\n")
-            + f"MARKET DATA AVAILABLE: {bool(_mm)}\n"
-            + (f"  - Market gap: {_sv(_mm, 'market_gap')[:200]}\n" if _mm else "")
-            + f"THIS BUSINESS'S OWN PERFORMANCE DATA AVAILABLE: {has_performance}\n"
-            + (f"  - Overall health: {_perf_data.get('overall_health', 'N/A')} | Top insight: {_perf_data.get('top_insight', 'N/A')}\n" if has_performance else "  - No performance history for this business — you have NOT seen any real ad results for it.\n")
-            + f"CROSS-BUSINESS GROWTH MEMORY: {growth_records} real record(s) for the '{industry or 'unspecified'}' industry\n"
-            + ("  - NOTE: growth_memory only contains winning audience/platform/offer/CPL/ROAS patterns — it does NOT contain any data about which CREATIVE ANGLES or images won. Never claim a creative angle 'historically outperforms' based on this.\n" if growth_records else "  - No cross-business records exist for this industry yet.\n")
-        )
-
-        prompt = (
-            "You are an elite Creative Director + Performance Marketing strategist. Produce a complete creative "
-            "strategy and 3 production-ready image-generation prompts for the campaign below. You are NOT generating "
-            "images — you are producing everything needed for a human or another tool to generate them.\n\n"
-            f"BUSINESS URL: {url} | Industry: {industry or 'Not specified'} | City: {city_display}\n"
-            f"CAMPAIGN OBJECTIVE: {objective}\n"
-            f"OFFER: {offer or 'Not specified — infer a reasonable offer angle from the business/industry'}\n\n"
-            + data_context + "\n"
-            + "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
-            "{\n"
-            '  "creative_strategy": {"primary_goal":"...","dominant_emotion":"... (with reasoning)","why":"..."},\n'
-            '  "color_psychology": {"palette":[{"name":"...","hex":"#......","reason":"..."}],"why_for_this_industry":"..."},\n'
-            '  "typography": {"style":"...","recommended_fonts":["...","..."],"why":"..."},\n'
-            '  "layout_blueprint": {"hierarchy":"...","logo_placement":"...","cta_placement":"...","visual_flow":"...","eye_path":"..."},\n'
-            '  "seasonal_intelligence": {"current_relevant_occasions":["..."],"recommendation":"..."},\n'
-            '  "localization": {"city_elements":["..."],"use_or_skip":"use/skip — explain why, tied to the city given (or say skip if no city was given)"},\n'
-            '  "concepts": [\n'
-            '    {"name":"Concept A","angle":"Authority","headline":"...","subheadline":"...","cta":"...","visual_concept":"...",'
-            '"image_prompt":"a single flowing descriptive paragraph — NOT a label:value list, NOT prefixed with any '
-            'meta-text like \'production-ready prompt:\' — that naturally covers the subject, environment, camera/lens, '
-            'lighting, composition, mood, color palette, depth of field, reserved branding space, reserved typography '
-            'space, and commercial photography style, ending with \'Negative prompt: ...\' and \'Render quality: ...\' "},\n'
-            '    {"name":"Concept B","angle":"Lifestyle","headline":"...","subheadline":"...","cta":"...","visual_concept":"...","image_prompt":"..."},\n'
-            '    {"name":"Concept C","angle":"Emotional","headline":"...","subheadline":"...","cta":"...","visual_concept":"...","image_prompt":"..."}\n'
-            '  ],\n'
-            '  "ai_creative_review": {"per_concept":[{"concept":"Concept A","strong":"...","weak":"...","scroll_stopping":"...","cta_standout":"...","audience_match":"..."}]},\n'
-            '  "creative_scores": {"per_concept":[{"concept":"Concept A","visual_appeal":0,"headline":0,"cta":0,"brand_match":0,"emotional_appeal":0,"scroll_stopping":0,"conversion_potential":0,"overall":0,"score_reasoning":"..."}]},\n'
-            '  "ab_prediction": {"likely_winner":"Concept X","why":"...","expected_ctr_difference":"range, e.g. 0.5-1.5pp","confidence":0,"caveat":"prediction based on [what real data / general principles] — not a guarantee"}\n'
-            '}\n\n'
-            "Rules:\n"
-            "- The 3 concepts MUST use 3 genuinely different psychological angles (Authority, Lifestyle, Emotional) — "
-            "not 3 variations of the same idea.\n"
-            "- Every image_prompt must read as natural, richly-descriptive prose (the way a professional prompts "
-            "Midjourney/DALL-E), covering: subject, environment, camera/lens, lighting, composition, mood, color "
-            "palette (matching color_psychology above), depth of field, negative space reserved for branding, "
-            "negative space reserved for typography, commercial photography style reference, an explicit negative "
-            "prompt (what to avoid), and a render-quality tag. NEVER start it with a meta-label like 'production-"
-            "ready prompt:' or write it as a comma-separated 'field is value' list — write it the way you'd actually "
-            "type it into an image generator.\n"
-            "- seasonal_intelligence.current_relevant_occasions must be real, currently-relevant occasions given "
-            "TODAY'S REAL DATE above — never invent a festival or date that isn't real or isn't actually near.\n"
-            "- localization: only include city_elements if a specific city was actually given AND it's genuinely "
-            "relevant to visual identity (e.g. Jaipur → Hawa Mahal silhouette, pink-city tones); if no city was "
-            "given, or the city has no distinctive visual signature worth using, set use_or_skip to 'skip' and "
-            "leave city_elements empty — never invent a generic 'local' cliché.\n"
-            "- ab_prediction.confidence MUST be honest: cap at 45 or below unless THIS BUSINESS'S OWN PERFORMANCE "
-            "DATA is available above (then you may go higher, referencing the actual data). Never claim confidence "
-            "from creative-specific win-rate data that was not provided — growth_memory does not contain that.\n"
-            "- ab_prediction.caveat must explicitly state whether the prediction is based on general design "
-            "principles or actual performance data for this business — never imply a data source that doesn't exist.\n"
-            "- If BUSINESS DNA / AUDIENCE INTELLIGENCE / PERFORMANCE DATA are marked unavailable above, say so "
-            "explicitly in creative_strategy.why rather than inventing specifics about this business.\n"
-            "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, "
-            "Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.\n"
-            "- Return ONLY the JSON. Nothing else."
-        )
-
-        logger.info(f"[CREATIVE-DIR] Sending to GPT-4o (prompt_len={len(prompt)})")
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=4000,
-            temperature=0.5,
-        )
-        raw = resp.choices[0].message.content.strip()
-        logger.info(f"[CREATIVE-DIR] GPT responded (len={len(raw)})")
-        creative = json.loads(raw)
-
-        creative = _clean_banned_words_deep(creative)
-        creative = _backfill_creative_director(creative, _CREATIVE_CONCEPT_ANGLES)
-
-        # ── data_sources_used: real, computed — never GPT-generated ──────────
-        creative["data_sources_used"] = {
-            "business_dna":           has_business_dna,
-            "audience_intelligence":  has_audience_data,
-            "growth_memory_records":  growth_records,
-            "performance_data":       has_performance,
-        }
-
-        save_to_memory("creative_director", norm_key, {"data": creative})
-        logger.info(f"[CREATIVE-DIR] Done: key={norm_key!r} concepts={len(creative.get('concepts', []))}")
-
-        log_activity(
-            "creative_director", business_key=norm_key,
-            business_name=_bm.get("business_name", "") or url,
-            url=url, industry=industry, city=city,
-            summary=f"AI Creative Director — {objective} campaign, 3 concepts generated",
-        )
-
-        return {
-            "success":      True,
-            "memory_used":  bool(memory),
-            "business_key": norm_key,
-            "creative":     creative,
-        }
-
-    except Exception as _e:
-        tb = _traceback.format_exc()
-        logger.error(f"[CREATIVE-DIR] ERROR: {_e}\n{tb}")
-        return {"success": False, "error": str(_e), "traceback": tb}
-
-
-# ── Module 24: Ad-to-Creative Generator ──────────────────────────────────────
-# Campaign-driven counterpart to AI Creative Director: instead of starting
-# from blank-slate business intelligence, this pulls a REAL running/imported
-# campaign's own data (Google or Meta) and generates matching social
-# creatives. Reuses Performance Intelligence's data-sufficiency guard and
-# Creative Director's honesty-labeling discipline rather than duplicating them.
-
-class AdToCreativeRequest(BaseModel):
-    campaign_id:        str  = ""
-    business_key:       str  = ""
-    url:                str  = ""
-    industry:           str  = ""
-    city:               str  = ""
-    campaign_objective: str  = "Leads"
-    offer:              str  = ""
-    ad_copy:            str  = ""
-    headlines:          list = []
-    keywords:           list = []
-    landing_url:        str  = ""
+# ── Module 23: Creative Studio ────────────────────────────────────────────────
+# Unified Creative Intelligence Engine — merges the former AI Creative
+# Director (blank-slate, business-intelligence-driven) and Ad-to-Creative
+# Generator (campaign-driven) into one module + one mode toggle. Reuses
+# Business DNA / audience / growth / performance memory rather than
+# duplicating lookups, and auto-runs a lightweight discovery pass the first
+# time a business has no Marketing Brain memory yet, so creatives are never
+# generic. Does NOT generate images itself — that's a future phase; this
+# generates everything needed to produce them elsewhere.
 
 def _resolve_campaign_by_id(campaign_id: str) -> dict:
     """
@@ -6782,48 +6551,152 @@ def _resolve_business_key_from_campaign(campaign_id: str) -> dict:
         return {}
 
 
-_AD_CREATIVE_VARIANTS = ["Direct Response", "Emotional/Lifestyle", "Authority/Trust"]
+_CREATIVE_STUDIO_VARIANTS = ["Direct Response", "Emotional/Lifestyle", "Authority/Trust"]
+_CREATIVE_SCORE_FIELDS = ["visual_appeal", "headline", "cta", "brand_match", "emotional_appeal", "scroll_stopping", "conversion_potential"]
 
-def _backfill_ad_to_creative(output: dict, variant_names: list) -> dict:
-    """Guarantee exactly one variant per name, each with at least one creative —
-    same schema-ordering + backfill discipline as Creative Director."""
-    variants = output.get("variants") or []
-    variants = [v for v in variants if isinstance(v, dict) and v.get("variant_name")]
-    have_names = {v.get("variant_name") for v in variants}
+
+async def _lightweight_business_audience_discovery(url: str, industry: str, city: str) -> dict:
+    """
+    First-run discovery for Creative Studio when a business has no Marketing
+    Brain memory yet — reuses gather_bi_data() (the same BI engine /full-report
+    itself uses, and it's cached) for business DNA instead of re-crawling and
+    re-extracting from scratch, then one focused GPT call for audience
+    psychographics. Saves both via save_to_memory so every other module
+    benefits from this business's data going forward too — not a throwaway.
+    """
+    bi = None
+    try:
+        bi = await gather_bi_data(url, industry)
+    except Exception as _e:
+        logger.warning(f"[CREATIVE-STUDIO] gather_bi_data failed during discovery: {_e}")
+
+    business_dna = (bi or {}).get("business_dna", {}) if bi else {}
+    business_name = business_dna.get("business_name") or url
+    positioning   = business_dna.get("positioning", "") or business_dna.get("uvp", "")
+    uvp           = business_dna.get("uvp", "")
+
+    audience_out = {"segments": [], "brand_personality": ""}
+    try:
+        prompt = (
+            "Based on this business's real data, identify its target audience psychographics for a creative "
+            "marketing brief. Be specific — cite what's actually plausible given the business/industry, don't "
+            "invent unrelated demographics.\n\n"
+            f"BUSINESS: {business_name} | Industry: {industry or 'unknown'} | Positioning: {positioning or 'unknown'}\n\n"
+            'Return ONLY JSON: {"segments": [{"segment":"...","pain_points":"...","desires":"...",'
+            '"content_they_respond_to":"..."}], "brand_personality": "one line describing this brand\'s personality"}'
+        )
+        resp = await asyncio.to_thread(
+            client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, max_tokens=700, temperature=0.4,
+        )
+        audience_out = json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.warning(f"[CREATIVE-STUDIO] Audience discovery call failed: {_e}")
+
+    return {
+        "business": {
+            "business_name": business_name, "industry": industry, "city": city,
+            "business_dna": business_dna, "uvp": uvp, "positioning": positioning,
+        },
+        "audience": {"segments": audience_out.get("segments", [])},
+        "brand_personality": audience_out.get("brand_personality", ""),
+    }
+
+
+def _normalize_creative_score(score: dict) -> dict:
+    """
+    Deterministic score fix — never trust GPT's own arithmetic for `overall`.
+    Handles the known bug where a concept's sub-scores land around 80 but
+    overall shows up as "8/100" (0-10 scale slip): any sub-score in (0,10] is
+    treated as a 0-10 value and upscaled ×10. overall is ALWAYS recomputed as
+    the average of the 7 sub-scores, so it can never mismatch them.
+    """
+    vals = []
+    for f in _CREATIVE_SCORE_FIELDS:
+        v = score.get(f, 0)
+        try: v = float(v)
+        except Exception: v = 0.0
+        if 0 < v <= 10:
+            v = v * 10
+        v = max(0, min(100, v))
+        score[f] = round(v)
+        vals.append(score[f])
+    score["overall"] = round(sum(vals) / len(vals)) if vals else 0
+    return score
+
+
+def _creative_score_is_empty(score: dict) -> bool:
+    return not score or all(float(score.get(f, 0) or 0) == 0 for f in _CREATIVE_SCORE_FIELDS)
+
+
+async def _rescore_concept(concept: dict, business_context: str) -> dict:
+    """Targeted single-concept rescoring — used only when the main call
+    returns a concept with no real score data, instead of regenerating
+    everything (the old bug: concepts B/C silently coming back 0/100)."""
+    try:
+        prompt = (
+            "Score this ad creative concept honestly on a strict 0-100 scale for each dimension below. "
+            f"Business context: {business_context}\n"
+            f"Concept: headline={concept.get('headline')!r}, subheadline={concept.get('subheadline')!r}, "
+            f"visual_direction={concept.get('visual_direction')!r}, cta={concept.get('cta')!r}\n\n"
+            'Return ONLY JSON: {"visual_appeal":0,"headline":0,"cta":0,"brand_match":0,"emotional_appeal":0,'
+            '"scroll_stopping":0,"conversion_potential":0,"reasoning":"one line explaining the scores"}'
+        )
+        resp = await asyncio.to_thread(
+            client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, max_tokens=300, temperature=0.4,
+        )
+        rescored = json.loads(resp.choices[0].message.content)
+        return _normalize_creative_score(rescored)
+    except Exception as _e:
+        logger.warning(f"[CREATIVE-STUDIO] Targeted rescore failed: {_e}")
+        return _normalize_creative_score({})
+
+
+def _backfill_creative_studio(output: dict, variant_names: list) -> dict:
+    """Guarantee exactly one concept per variant name — schema-ordering +
+    backfill so a partial/malformed GPT response still renders a complete,
+    usable 3-concept output instead of leaving sections empty."""
+    concepts = output.get("concepts") or []
+    concepts = [c for c in concepts if isinstance(c, dict) and c.get("variant_name")]
+    have_names = {c.get("variant_name") for c in concepts}
     letters = ["A", "B", "C"]
     for i, vname in enumerate(variant_names):
         if vname not in have_names:
-            variants.append({
+            concepts.append({
                 "variant_id": letters[i], "variant_name": vname,
-                "creatives": [{
-                    "creative_type": "core_social", "platform": "Instagram/Facebook",
-                    "objective": "N/A", "headline": "N/A — GPT did not return this variant", "subheadline": "",
-                    "caption": "", "cta": "", "hashtags": [], "visual_direction": "N/A",
-                    "image_prompt": "N/A — regenerate to get this variant's creatives",
-                    "design_layout": "N/A", "target_audience": "N/A", "reason_this_matches_campaign": "N/A",
-                    "predicted_strengths": "N/A", "risks": "N/A",
-                    "creative_score": {"value": 0, "reasoning": "Not generated"}, "next_action": "Regenerate",
-                }],
+                "headline": "N/A — GPT did not return this concept", "subheadline": "", "caption": "", "cta": "",
+                "hashtags": [], "visual_direction": "N/A",
+                "image_prompt": "N/A — regenerate to get this concept's image prompt",
+                "design_layout": "N/A", "applicable_platforms_and_sizes": [],
+                "reason_this_matches": "N/A — not generated",
+                "ai_review": {"strong": "Not assessed", "weak": "Not assessed", "scroll_stopping": "Not assessed",
+                              "cta_standout": "Not assessed", "audience_match": "Not assessed"},
+                "creative_score": _normalize_creative_score({}),
             })
-    for v in variants:
-        if not v.get("creatives"):
-            v["creatives"] = [{
-                "creative_type": "core_social", "platform": "Instagram/Facebook",
-                "objective": "N/A", "headline": "N/A — no creatives returned for this variant", "subheadline": "",
-                "caption": "", "cta": "", "hashtags": [], "visual_direction": "N/A",
-                "image_prompt": "N/A — regenerate to get this variant's creatives",
-                "design_layout": "N/A", "target_audience": "N/A", "reason_this_matches_campaign": "N/A",
-                "predicted_strengths": "N/A", "risks": "N/A",
-                "creative_score": {"value": 0, "reasoning": "Not generated"}, "next_action": "Regenerate",
-            }]
-    output["variants"] = variants[:3]
+    output["concepts"] = concepts[:3]
     return output
 
 
-@app.post("/ad-to-creative")
-async def ad_to_creative(request: AdToCreativeRequest):
+class CreativeStudioRequest(BaseModel):
+    mode:               str  = "business"   # "business" | "campaign"
+    campaign_id:        str  = ""
+    business_key:       str  = ""
+    url:                str  = ""
+    industry:           str  = ""
+    city:               str  = ""
+    campaign_objective: str  = "Leads"
+    offer:              str  = ""
+    ad_copy:            str  = ""
+    headlines:          list = []
+    keywords:           list = []
+    landing_url:        str  = ""
+
+
+async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
     try:
-        campaign_id = (request.campaign_id or "").strip()
+        mode = (request.mode or "business").strip().lower()
+        campaign_id = (request.campaign_id or "").strip() if mode == "campaign" else ""
         campaign_info = {}
         resolved_from_log = {}
 
@@ -6840,31 +6713,47 @@ async def ad_to_creative(request: AdToCreativeRequest):
         offer    = (request.offer or "").strip()
         city_display = city or "India (no specific city given)"
 
-        # NOTE: _bk_src must always be a RAW identifier (a url/domain), never an
-        # already-derived business_key — derive_business_key()/get_memory_with_
-        # city_fallback() below do their own derivation, so re-deriving an
-        # already-derived key (e.g. from activity_log's stored business_key
-        # column) would double-suffix it and silently miss real memory.
         _bk_src = request.business_key or url
         if not _bk_src and not campaign_id:
-            return {"success": False, "error": "Provide either a campaign_id or a url/business_key for manual mode."}
+            return {"success": False, "error": "Provide either a campaign_id or a url/business_key."}
 
         if _bk_src:
             norm_key_base = derive_business_key(_bk_src, industry, city)
             norm_key = f"{norm_key_base}::campaign::{campaign_id}" if campaign_id else norm_key_base
         else:
-            # No business context resolved at all (e.g. campaign predates
-            # activity_log tracking) — the campaign_id alone IS the key, not a
-            # suffix on top of an already campaign-only base.
             norm_key_base = f"campaign::{campaign_id}"
             norm_key = norm_key_base
 
         memory, _resolved = get_memory_with_city_fallback(_bk_src, industry, city) if _bk_src else ({}, norm_key_base)
-        logger.info(f"[AD-TO-CREATIVE] key={norm_key!r} campaign_id={campaign_id!r} tables={list(memory.keys())}")
+        logger.info(f"[CREATIVE-STUDIO] key={norm_key!r} mode={mode!r} campaign_id={campaign_id!r} tables={list(memory.keys())}")
 
         _bm = memory.get("business", {}) or {}
         _am = memory.get("audience", {}) or {}
         _campaign_mem = memory.get("campaign", {}) or {}
+
+        segments = _am.get("segments") if isinstance(_am, dict) else None
+        if isinstance(segments, str):
+            try: segments = json.loads(segments)
+            except Exception: segments = []
+
+        discovery_ran = False
+        # ── Core intelligence fix: auto-run lightweight discovery if this
+        # business has no Marketing Brain memory yet, so creatives are never
+        # generic on first use ────────────────────────────────────────────
+        if url and (not _bm or not segments):
+            logger.info(f"[CREATIVE-STUDIO] No Marketing Brain memory for key={norm_key_base!r} — running lightweight discovery first")
+            discovery = await _lightweight_business_audience_discovery(url, industry, city)
+            _bm = discovery["business"]
+            segments = discovery["audience"]["segments"]
+            discovery_ran = True
+            try:
+                save_to_memory("business", norm_key_base, {
+                    "business_name": _bm.get("business_name"), "industry": industry, "city": city,
+                    "business_dna": _bm.get("business_dna"), "uvp": _bm.get("uvp"), "positioning": _bm.get("positioning"),
+                })
+                save_to_memory("audience", norm_key_base, {"segments": segments})
+            except Exception as _e:
+                logger.warning(f"[CREATIVE-STUDIO] Could not persist discovery output: {_e}")
 
         def _load_json_field(mem_dict, table_key, field_key):
             raw = (mem_dict.get(table_key) or {})
@@ -6877,19 +6766,25 @@ async def ad_to_creative(request: AdToCreativeRequest):
                 except Exception: return {}
             return val or {}
 
-        kpi_data    = _load_json_field(memory, "kpi", "kpi_data")
-        _perf_data  = _load_json_field(memory, "performance", "performance_data")
-        _opt_data   = _load_json_field(memory, "optimizer", "optimizer_data")
+        kpi_data   = _load_json_field(memory, "kpi", "kpi_data")
+        _perf_data = _load_json_field(memory, "performance", "performance_data")
 
-        has_campaign_data     = bool(campaign_info)
-        has_performance        = bool(_perf_data) or has_campaign_data
-        has_kpi_prediction     = bool(kpi_data)
-        has_audience           = bool(_am and (_am.get("segments") if isinstance(_am, dict) else None))
+        has_business_dna   = bool(_bm)
+        has_audience_data  = bool(segments)
+        has_campaign_data  = bool(campaign_info)
+        has_performance     = bool(_perf_data) or has_campaign_data
+        has_kpi_prediction  = bool(kpi_data)
 
         growth = get_growth_learning(industry) if industry else {"sample_size": 0, "entries": []}
         growth_records = growth.get("sample_size", 0)
 
-        # ── Real numbers from the campaign itself (if any) ────────────────────
+        def _sv(d, k, dfl="N/A"):
+            v = (d or {}).get(k, dfl) if isinstance(d, dict) else dfl
+            return str(v or dfl)
+
+        segments_summary = json.dumps(segments, ensure_ascii=False)[:600] if segments else "NOT AVAILABLE"
+
+        # ── Campaign-mode real numbers + data sufficiency ────────────────────
         imp  = int(campaign_info.get("impressions", 0) or 0)
         clk  = int(campaign_info.get("clicks", 0) or 0)
         cost = float(campaign_info.get("cost_inr", 0) or 0)
@@ -6897,24 +6792,25 @@ async def ad_to_creative(request: AdToCreativeRequest):
         ctr  = float(campaign_info.get("ctr_pct", 0) or 0)
         cpc  = float(campaign_info.get("avg_cpc_inr", 0) or 0)
 
-        data_sufficiency = _check_data_sufficiency(imp, clk, cost) if has_campaign_data else {
-            "insufficient_data": True, "banner": None, "thresholds": _DATA_SUFFICIENCY_THRESHOLDS,
-        }
-
-        # ── Performance-aware creative-focus notes (only with sufficient real data) ─
+        data_sufficiency = None
         perf_notes = []
-        campaign_name_lower = str(campaign_info.get("name", "")).lower()
-        is_remarketing = any(w in campaign_name_lower for w in ("remarketing", "retarget"))
-        if has_campaign_data and not data_sufficiency["insufficient_data"]:
-            benchmark_ctr = _parse_pct_generic((kpi_data.get("predicted_metrics", {}) or {}).get("ctr", {}).get("value", "")) or 2.0
-            if ctr > benchmark_ctr and conv == 0:
-                perf_notes.append(f"High CTR ({ctr}%) but 0 conversions — creatives should improve trust signals and CTA clarity, not just attention.")
-            elif ctr < 1.0:
-                perf_notes.append(f"Low CTR ({ctr}%) — creatives need stronger scroll-stopping hooks.")
-            if cpc > 0 and cpc > (_parse_money_generic((kpi_data.get("predicted_metrics", {}) or {}).get("cpc", {}).get("value", "")) or 20.0) * 1.5:
-                perf_notes.append(f"High CPC (₹{cpc}) relative to benchmark — creatives should target a more specific niche audience.")
-        if is_remarketing:
-            perf_notes.append("This is a remarketing/retargeting campaign — creatives should lean on proof (testimonial, review, before/after, case study) and a limited-time reminder angle, not cold-audience awareness framing.")
+        if mode == "campaign":
+            data_sufficiency = _check_data_sufficiency(imp, clk, cost) if has_campaign_data else {
+                "insufficient_data": True, "banner": None, "thresholds": _DATA_SUFFICIENCY_THRESHOLDS,
+            }
+            campaign_name_lower = str(campaign_info.get("name", "")).lower()
+            is_remarketing = any(w in campaign_name_lower for w in ("remarketing", "retarget"))
+            if has_campaign_data and not data_sufficiency["insufficient_data"]:
+                benchmark_ctr = _parse_pct_generic((kpi_data.get("predicted_metrics", {}) or {}).get("ctr", {}).get("value", "")) or 2.0
+                if ctr > benchmark_ctr and conv == 0:
+                    perf_notes.append(f"High CTR ({ctr}%) but 0 conversions — creatives should improve trust signals and CTA clarity, not just attention.")
+                elif ctr < 1.0:
+                    perf_notes.append(f"Low CTR ({ctr}%) — creatives need stronger scroll-stopping hooks.")
+                if cpc > 0 and cpc > (_parse_money_generic((kpi_data.get("predicted_metrics", {}) or {}).get("cpc", {}).get("value", "")) or 20.0) * 1.5:
+                    perf_notes.append(f"High CPC (₹{cpc}) relative to benchmark — creatives should target a more specific niche audience.")
+            if is_remarketing:
+                perf_notes.append("This is a remarketing/retargeting campaign — creatives should lean on proof (testimonial, review, before/after, case study) and a limited-time reminder angle, not cold-audience awareness framing.")
+
         performance_notes_block = "\n".join(f"- {n}" for n in perf_notes) or "No specific performance-driven creative adjustment flagged."
 
         objective_focus_map = {
@@ -6924,16 +6820,6 @@ async def ad_to_creative(request: AdToCreativeRequest):
             "branding": "lifestyle + identity + recall",
         }
         objective_focus = objective_focus_map.get(objective.strip().lower(), "trust + problem framing + clear CTA + offer")
-
-        def _sv(d, k, dfl="N/A"):
-            v = (d or {}).get(k, dfl) if isinstance(d, dict) else dfl
-            return str(v or dfl)
-
-        segments = _am.get("segments") if isinstance(_am, dict) else None
-        if isinstance(segments, str):
-            try: segments = json.loads(segments)
-            except Exception: segments = []
-        segments_summary = json.dumps(segments, ensure_ascii=False)[:400] if segments else "NOT AVAILABLE"
 
         campaign_copy = _campaign_mem.get("campaign_data", {}) if isinstance(_campaign_mem, dict) else {}
         if isinstance(campaign_copy, str):
@@ -6946,121 +6832,199 @@ async def ad_to_creative(request: AdToCreativeRequest):
 
         data_context = (
             f"TODAY'S REAL DATE: {_today} (use this for any seasonal angle — never invent an occasion that hasn't happened)\n"
-            f"CAMPAIGN DATA AVAILABLE: {has_campaign_data}\n"
+            f"BUSINESS DNA AVAILABLE: {has_business_dna}{' (from fresh discovery just now)' if discovery_ran else ''}\n"
+            + (f"  - Business: {_sv(_bm, 'business_name')} | Positioning: {_sv(_bm, 'positioning')} | UVP: {_sv(_bm, 'uvp')}\n" if has_business_dna else "  - No Business DNA available — base creative direction on industry + objective only.\n")
+            + f"AUDIENCE INTELLIGENCE AVAILABLE: {has_audience_data}{' (from fresh discovery just now)' if discovery_ran else ''}\n"
+            + (f"  - Segments (pain points/desires/content preferences): {segments_summary}\n" if has_audience_data else "  - No audience segments available — base targeting assumptions on industry norms only.\n")
             + (
-                f"  - Name: {campaign_info.get('name')} | Platform: {campaign_info.get('platform')} | Status: {campaign_info.get('status')}\n"
-                f"  - Real metrics: {imp} impressions, {clk} clicks, ₹{cost} spend, {conv} conversions, CTR {ctr}%, CPC ₹{cpc}\n"
-                if has_campaign_data else "  - No specific campaign pulled — manual/business-level input only.\n"
+                f"CAMPAIGN DATA AVAILABLE: {has_campaign_data}\n"
+                + (
+                    f"  - Name: {campaign_info.get('name')} | Platform: {campaign_info.get('platform')} | Status: {campaign_info.get('status')}\n"
+                    f"  - Real metrics: {imp} impressions, {clk} clicks, ₹{cost} spend, {conv} conversions, CTR {ctr}%, CPC ₹{cpc}\n"
+                    if has_campaign_data else "  - No specific campaign pulled.\n"
+                )
+                + (f"  - DATA SUFFICIENCY: {'INSUFFICIENT — preliminary only' if data_sufficiency and data_sufficiency['insufficient_data'] else 'Sufficient for performance-based claims'}\n" if has_campaign_data else "")
+                + f"PERFORMANCE-DRIVEN CREATIVE NOTES:\n{performance_notes_block}\n"
+                + f"EXISTING AD COPY ON FILE: headlines={existing_headlines[:5] or 'none'} | keywords={[k.get('text') if isinstance(k, dict) else k for k in existing_keywords[:5]] or 'none'}\n"
+                if mode == "campaign" else ""
             )
-            + (f"DATA SUFFICIENCY: {'INSUFFICIENT — preliminary only' if data_sufficiency['insufficient_data'] else 'Sufficient for performance-based claims'}\n" if has_campaign_data else "")
-            + f"PERFORMANCE-DRIVEN CREATIVE NOTES:\n{performance_notes_block}\n"
-            + f"EXISTING AD COPY ON FILE: headlines={existing_headlines[:5] or 'none'} | keywords={[k.get('text') if isinstance(k, dict) else k for k in existing_keywords[:5]] or 'none'}\n"
             + f"MANUAL AD COPY PROVIDED: {request.ad_copy or 'none'}\n"
-            + f"AUDIENCE INTELLIGENCE AVAILABLE: {has_audience}\n"
-            + (f"  - Segments: {segments_summary}\n" if has_audience else "  - No audience segments on file.\n")
             + f"KPI ENGINE PREDICTION AVAILABLE: {has_kpi_prediction}\n"
             + f"CROSS-BUSINESS GROWTH MEMORY: {growth_records} real record(s) for '{industry or 'unspecified'}'\n"
-            + ("  - NOTE: this contains audience/platform/offer/CPL/ROAS patterns only — NOT creative-angle win rates.\n" if growth_records else "")
+            + ("  - NOTE: this contains audience/platform/offer/CPL/ROAS patterns only — NOT creative-angle win rates. Never claim a creative angle 'historically outperforms' based on this.\n" if growth_records else "  - No cross-business records exist for this industry yet.\n")
         )
 
         prompt = (
-            "You are an elite Performance Creative Strategist. Generate matching social-media creatives for the "
-            "REAL campaign/business context below — you are NOT generating images, only the full creative direction "
-            "and production-ready image prompts for a human or another tool to use.\n\n"
+            "You are an elite Creative Director + Performance Marketing strategist. Produce a complete creative "
+            "strategy and 3 production-ready image-generation prompts for the campaign below. You are NOT generating "
+            "images — you are producing everything needed for a human or another tool to generate them.\n\n"
             f"BUSINESS URL: {url or 'Not specified'} | Industry: {industry or 'Not specified'} | City: {city_display}\n"
             f"CAMPAIGN OBJECTIVE: {objective} | Objective-driven creative focus: {objective_focus}\n"
-            f"OFFER: {offer or 'Not specified — infer a reasonable offer angle'}\n\n"
+            f"OFFER: {offer or 'Not specified — infer a reasonable offer angle from the business/industry'}\n\n"
             + data_context + "\n"
+            + "CRITICAL: every concept's visual style, emotion, headline, and image_prompt MUST reflect what the "
+            "REAL audience segments above actually respond to — not a generic stock-photo interpretation of the "
+            "industry. Each concept's reason_this_matches MUST cite the SPECIFIC audience insight (a named pain "
+            "point, desire, or content preference from the segments above) that drove its creative choices. If no "
+            "audience segments are available, say so explicitly instead of inventing one.\n\n"
             + "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
             "{\n"
-            '  "campaign_match_summary": "how these creatives tie to this specific campaign\'s audience/offer/objective",\n'
-            '  "performance_context": "if CAMPAIGN DATA AVAILABLE is True and sufficient: \'Based on this campaign\'s real data: CTR X%, Y conversions...\'; '
-            'if insufficient or unavailable: \'Insufficient performance data — creatives based on objective + audience only\' or similar, honestly",\n'
-            '  "variants": [\n'
-            '    {"variant_id":"A","variant_name":"Direct Response","creatives":[\n'
-            '      {"creative_type":"core_social","platform":"Instagram/Facebook","applicable_sizes":["Instagram Post 1080x1080","Instagram Portrait 1080x1350","Facebook Feed 1200x628"],'
-            '"objective":"...","headline":"...","subheadline":"...","caption":"...","cta":"...","hashtags":["...","..."],'
-            '"visual_direction":"...","image_prompt":"natural descriptive prose, no meta-label prefix, production-ready for Midjourney/DALL-E/Canva",'
-            '"design_layout":"...","target_audience":"...","reason_this_matches_campaign":"...","predicted_strengths":"...","risks":"...",'
-            '"creative_score":{"value":0,"reasoning":"..."},"next_action":"..."},\n'
-            '      {"creative_type":"google_display_banner","platform":"Google Display","applicable_sizes":["1200x628","300x250","728x90"], "...":"same fields as above"},\n'
-            '      {"creative_type":"whatsapp_status","platform":"WhatsApp","applicable_sizes":["1080x1920"], "...":"same fields as above"}\n'
-            '    ]},\n'
-            '    {"variant_id":"B","variant_name":"Emotional/Lifestyle","creatives":[ "same structure" ]},\n'
-            '    {"variant_id":"C","variant_name":"Authority/Trust","creatives":[ "same structure" ]}\n'
-            '  ]\n'
+            '  "intelligence_applied": "plain-language summary of which specific business/audience insights shaped these creatives — cite the actual positioning/segment/pain-point used, or say none were available",\n'
+            '  "performance_context": "' + ('if campaign data is sufficient: \'Based on this campaign\'s real data: CTR X%, Y conversions...\'; if insufficient/unavailable: honest preliminary-data note' if mode == "campaign" else "N/A — business mode, no live campaign data") + '",\n'
+            '  "creative_strategy": {"primary_goal":"...","dominant_emotion":"... (with reasoning tied to the real audience)","why":"..."},\n'
+            '  "color_psychology": {"palette":[{"name":"...","hex":"#......","reason":"..."}],"why_for_this_industry":"..."},\n'
+            '  "typography": {"style":"...","recommended_fonts":["...","..."],"why":"..."},\n'
+            '  "layout_blueprint": {"hierarchy":"...","logo_placement":"...","cta_placement":"...","visual_flow":"...","eye_path":"..."},\n'
+            '  "seasonal_intelligence": {"current_relevant_occasions":["..."],"recommendation":"..."},\n'
+            '  "localization": {"city_elements":["..."],"use_or_skip":"use/skip — explain why, tied to the city given (or say skip if no city was given)"},\n'
+            '  "concepts": [\n'
+            '    {"variant_id":"A","variant_name":"Direct Response","headline":"...","subheadline":"...","caption":"...","cta":"...","hashtags":["...","..."],'
+            '"visual_direction":"...","image_prompt":"a single flowing descriptive paragraph — NOT a label:value list, NOT prefixed with any meta-text '
+            'like \'production-ready prompt:\' — covering subject, environment, camera/lens, lighting, composition, mood, color palette, depth of field, '
+            'reserved branding space, reserved typography space, commercial photography style, ending with \'Negative prompt: ...\' and \'Render quality: ...\'",'
+            '"design_layout":"...","applicable_platforms_and_sizes":["Instagram Post 1080x1080","Instagram Portrait 1080x1350","Story/Reel 1080x1920",'
+            '"Facebook Feed 1200x628","Google Display 1200x628/300x250/728x90","WhatsApp Status 1080x1920"],'
+            '"reason_this_matches":"cite the SPECIFIC audience insight that drove this concept",'
+            '"ai_review":{"strong":"...","weak":"...","scroll_stopping":"...","cta_standout":"...","audience_match":"..."},'
+            '"creative_score":{"visual_appeal":0,"headline":0,"cta":0,"brand_match":0,"emotional_appeal":0,"scroll_stopping":0,"conversion_potential":0,"overall":0,"reasoning":"..."}},\n'
+            '    {"variant_id":"B","variant_name":"Emotional/Lifestyle", "...":"same structure, fully filled — do NOT leave scores at 0"},\n'
+            '    {"variant_id":"C","variant_name":"Authority/Trust", "...":"same structure, fully filled — do NOT leave scores at 0"}\n'
+            '  ],\n'
+            '  "ab_prediction": {"likely_winner":"variant_name","why":"...","expected_ctr_difference":"range, e.g. 0.5-1.5pp","confidence":0,"caveat":"prediction based on [what real data / general principles] — not a guarantee"}\n'
             '}\n\n'
             "Rules:\n"
-            "- All 3 variants required, each a genuinely different creative angle (Direct Response / Emotional-Lifestyle / Authority-Trust).\n"
-            "- Each variant needs exactly: 1 core_social creative + 1 google_display_banner + 1 whatsapp_status. "
-            "If (and only if) this business is B2B (sells to other businesses, not directly to consumers), ALSO add "
-            "one linkedin_post creative to each variant. Do not generate every platform size separately — use "
-            "applicable_sizes to note where the core concept also works.\n"
+            "- The 3 concepts MUST use 3 genuinely different psychological angles (Direct Response / Emotional-"
+            "Lifestyle / Authority-Trust) — not 3 variations of the same idea.\n"
+            "- ALL 3 concepts must be FULLY scored 0-100 on every creative_score dimension — never leave a concept's "
+            "scores at 0 or blank. Every score must have genuine variation reflecting real quality differences.\n"
+            "- Add one LinkedIn-sized concept note in applicable_platforms_and_sizes ONLY if this business is "
+            "genuinely B2B (sells to other businesses, not directly to consumers).\n"
             "- image_prompt: natural, richly-descriptive prose the way a professional would actually type it into "
-            "an image generator — covering subject, environment, lighting, composition, mood, color, negative space "
-            "for branding/typography, style reference, negative prompt, and render quality. NEVER prefix it with a "
-            "meta-label like 'production-ready prompt:' and NEVER write it as a comma-separated field:value list.\n"
-            "- HONESTY: never say 'best-performing' or 'top' about any creative or angle unless CAMPAIGN DATA "
-            "AVAILABLE is True AND DATA SUFFICIENCY is sufficient. If DATA SUFFICIENCY is insufficient, every "
-            "performance-based claim in reason_this_matches_campaign/predicted_strengths must be labeled "
-            "'preliminary — based on limited data'.\n"
-            "- If AUDIENCE INTELLIGENCE / KPI PREDICTION are unavailable, say so in campaign_match_summary rather "
-            "than inventing specifics.\n"
-            "- growth_memory only contains audience/platform/offer/CPL/ROAS patterns — never imply it tells you "
-            "which creative angle wins.\n"
+            "an image generator. NEVER start it with a meta-label like 'production-ready prompt:' or write it as a "
+            "comma-separated 'field is value' list.\n"
+            "- seasonal_intelligence.current_relevant_occasions must be real, currently-relevant occasions given "
+            "TODAY'S REAL DATE above — never invent a festival or date that isn't real or isn't actually near.\n"
+            "- localization: only include city_elements if a specific city was actually given AND it's genuinely "
+            "relevant to visual identity (e.g. Jaipur → Hawa Mahal silhouette, pink-city tones); otherwise set "
+            "use_or_skip to 'skip' and leave city_elements empty.\n"
+            "- ab_prediction.confidence MUST be honest: cap at 45 or below unless real performance data is available "
+            "above (then you may go higher, referencing the actual data). Never claim confidence from creative-"
+            "specific win-rate data that was not provided — growth_memory does not contain that.\n"
+            "- HONESTY: never say 'best-performing' or 'top' about any concept unless real, sufficient campaign "
+            "performance data is available. If data is insufficient, label performance-based claims 'preliminary — "
+            "based on limited data'.\n"
             "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, "
             "Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.\n"
             "- Return ONLY the JSON. Nothing else."
         )
 
-        logger.info(f"[AD-TO-CREATIVE] Sending to GPT-4o (prompt_len={len(prompt)})")
+        logger.info(f"[CREATIVE-STUDIO] Sending to GPT-4o (prompt_len={len(prompt)})")
         resp = await asyncio.to_thread(
             client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=4500,
-            temperature=0.5,
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, max_tokens=4500, temperature=0.5,
         )
         raw = resp.choices[0].message.content.strip()
-        logger.info(f"[AD-TO-CREATIVE] GPT responded (len={len(raw)})")
+        logger.info(f"[CREATIVE-STUDIO] GPT responded (len={len(raw)})")
         output = json.loads(raw)
 
         output = _clean_banned_words_deep(output)
-        output = _backfill_ad_to_creative(output, _AD_CREATIVE_VARIANTS)
+        output = _backfill_creative_studio(output, _CREATIVE_STUDIO_VARIANTS)
 
+        # ── Fix the known "concepts B/C come back 0/100" bug: normalize every
+        # concept's score deterministically, and if a concept has NO real score
+        # data at all, do a targeted single-concept rescore rather than
+        # regenerating the whole response ────────────────────────────────────
+        business_context_for_scoring = f"{_sv(_bm, 'business_name')} ({industry or 'unspecified industry'}), objective: {objective}"
+        for concept in output["concepts"]:
+            score = concept.get("creative_score") or {}
+            if _creative_score_is_empty(score):
+                concept["creative_score"] = await _rescore_concept(concept, business_context_for_scoring)
+            else:
+                concept["creative_score"] = _normalize_creative_score(score)
+
+        # ── data_sources_used / data_sufficiency: real, computed — never GPT-generated ─
         output["data_sources_used"] = {
-            "campaign_data":          has_campaign_data,
-            "performance_data":       bool(_perf_data),
+            "business_dna":           has_business_dna,
+            "audience_intelligence":  has_audience_data,
+            "performance_data":       bool(_perf_data) if mode != "campaign" else (bool(_perf_data) or has_campaign_data),
             "kpi_prediction":         has_kpi_prediction,
-            "audience":               has_audience,
             "growth_memory_records":  growth_records,
         }
-        output["data_sufficiency"] = data_sufficiency
+        if mode == "campaign":
+            output["data_sufficiency"] = data_sufficiency
 
-        save_to_memory("ad_creative", norm_key, {"data": output})
-        logger.info(f"[AD-TO-CREATIVE] Done: key={norm_key!r} variants={len(output.get('variants', []))}")
+        save_to_memory("creative_studio", norm_key, {"data": output})
+        logger.info(f"[CREATIVE-STUDIO] Done: key={norm_key!r} mode={mode!r} concepts={len(output.get('concepts', []))}")
 
         log_activity(
-            "ad_to_creative", business_key=norm_key,
+            "creative_studio", business_key=norm_key,
             business_name=_bm.get("business_name", "") or campaign_info.get("name", "") or url,
             url=url, industry=industry, city=city,
-            summary=f"Ad-to-Creative — {objective} campaign" + (f" ({campaign_info.get('name')})" if campaign_info else " (manual)"),
+            summary=f"Creative Studio ({mode}) — {objective} campaign" + (f" ({campaign_info.get('name')})" if campaign_info else ""),
             reference_id=campaign_id,
         )
 
         return {
-            "success":      True,
-            "memory_used":  bool(memory),
-            "business_key": norm_key,
+            "success":       True,
+            "memory_used":   bool(memory),
+            "discovery_ran": discovery_ran,
+            "business_key":  norm_key,
             "campaign_info": campaign_info or None,
-            "creative":     output,
+            "creative":      output,
         }
 
     except Exception as _e:
         tb = _traceback.format_exc()
-        logger.error(f"[AD-TO-CREATIVE] ERROR: {_e}\n{tb}")
+        logger.error(f"[CREATIVE-STUDIO] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
+
+
+@app.post("/creative-studio")
+async def creative_studio(request: CreativeStudioRequest):
+    return await _run_creative_studio(request)
+
+
+# ── Legacy endpoints (deprecated) — thin wrappers over Creative Studio, kept
+# only so any existing external caller doesn't 404. The frontend uses only
+# /creative-studio going forward. ─────────────────────────────────────────────
+
+class CreativeDirectorRequest(BaseModel):
+    url:                str
+    industry:           str = ""
+    city:               str = ""
+    campaign_objective: str = "Leads"
+    offer:              str = ""
+
+@app.post("/creative-director")
+async def creative_director(request: CreativeDirectorRequest):
+    return await _run_creative_studio(CreativeStudioRequest(
+        mode="business", url=request.url, industry=request.industry, city=request.city,
+        campaign_objective=request.campaign_objective, offer=request.offer,
+    ))
+
+
+class AdToCreativeRequest(BaseModel):
+    campaign_id:        str  = ""
+    business_key:       str  = ""
+    url:                str  = ""
+    industry:           str  = ""
+    city:               str  = ""
+    campaign_objective: str  = "Leads"
+    offer:              str  = ""
+    ad_copy:            str  = ""
+    headlines:          list = []
+    keywords:           list = []
+    landing_url:        str  = ""
+
+@app.post("/ad-to-creative")
+async def ad_to_creative(request: AdToCreativeRequest):
+    return await _run_creative_studio(CreativeStudioRequest(
+        mode="campaign", campaign_id=request.campaign_id, business_key=request.business_key,
+        url=request.url, industry=request.industry, city=request.city,
+        campaign_objective=request.campaign_objective, offer=request.offer, ad_copy=request.ad_copy,
+        headlines=request.headlines, keywords=request.keywords, landing_url=request.landing_url,
+    ))
 
 
 # ── Module 3: Prospect Discovery ─────────────────────────────────────────────
