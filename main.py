@@ -273,6 +273,13 @@ CREATE TABLE IF NOT EXISTS creative_director_memory (
     created_at      TEXT,
     updated_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS ad_creative_memory (
+    id              BIGSERIAL PRIMARY KEY,
+    business_key    TEXT UNIQUE NOT NULL,
+    data            TEXT,
+    created_at      TEXT,
+    updated_at      TEXT
+);
 """
 
 def _create_memory_tables():
@@ -283,7 +290,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory", "creative_director_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory", "creative_director_memory", "ad_creative_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -336,6 +343,7 @@ _MEMORY_TABLES = {
     "autonomous_plan": "autonomous_plan_memory",
     "social_intel":    "social_intel_memory",
     "creative_director": "creative_director_memory",
+    "ad_creative":       "ad_creative_memory",
 }
 
 def _json_val(v):
@@ -6662,6 +6670,389 @@ async def creative_director(request: CreativeDirectorRequest):
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[CREATIVE-DIR] ERROR: {_e}\n{tb}")
+        return {"success": False, "error": str(_e), "traceback": tb}
+
+
+# ── Module 24: Ad-to-Creative Generator ──────────────────────────────────────
+# Campaign-driven counterpart to AI Creative Director: instead of starting
+# from blank-slate business intelligence, this pulls a REAL running/imported
+# campaign's own data (Google or Meta) and generates matching social
+# creatives. Reuses Performance Intelligence's data-sufficiency guard and
+# Creative Director's honesty-labeling discipline rather than duplicating them.
+
+class AdToCreativeRequest(BaseModel):
+    campaign_id:        str  = ""
+    business_key:       str  = ""
+    url:                str  = ""
+    industry:           str  = ""
+    city:               str  = ""
+    campaign_objective: str  = "Leads"
+    offer:              str  = ""
+    ad_copy:            str  = ""
+    headlines:          list = []
+    keywords:           list = []
+    landing_url:        str  = ""
+
+def _resolve_campaign_by_id(campaign_id: str) -> dict:
+    """
+    Look up a real campaign by ID across Google Ads then Meta — returns
+    {"platform", "name", "status", "impressions", "clicks", "cost_inr",
+    "conversions", "ctr_pct", "avg_cpc_inr"} or {} if not found on either.
+    Reuses the exact same fetchers Performance Intelligence and /campaigns/all
+    already use — no duplicated Google/Meta query logic.
+    """
+    try:
+        rows = _fetch_gads_campaigns(90)
+        for row in rows:
+            if str(row.get("campaign_id")) == str(campaign_id):
+                return {**row, "platform": "google"}
+    except Exception as _e:
+        logger.warning(f"[AD-TO-CREATIVE] Google campaign lookup failed: {_e}")
+
+    try:
+        from facebook_business.adobjects.adaccount import AdAccount
+        from facebook_business.adobjects.campaign import Campaign
+        _, account_id = get_meta_ads_client()
+
+        def _fetch_meta_campaign():
+            account = AdAccount(account_id)
+            return list(account.get_campaigns(fields=[Campaign.Field.id, Campaign.Field.name, Campaign.Field.status]))
+
+        meta_campaigns = _fetch_meta_campaign()
+        match = next((c for c in meta_campaigns if str(c.get(Campaign.Field.id)) == str(campaign_id)), None)
+        if match:
+            perf_row = {}
+            try:
+                from facebook_business.adobjects.adsinsights import AdsInsights
+                account = AdAccount(account_id)
+                insight_rows = account.get_insights(
+                    fields=[AdsInsights.Field.impressions, AdsInsights.Field.clicks, AdsInsights.Field.spend,
+                            AdsInsights.Field.ctr, AdsInsights.Field.cpc, AdsInsights.Field.conversions],
+                    params={"date_preset": "last_30d", "level": "campaign",
+                            "filtering": [{"field": "campaign.id", "operator": "EQUAL", "value": campaign_id}]},
+                )
+                insight_rows = list(insight_rows)
+                if insight_rows:
+                    r = insight_rows[0]
+                    perf_row = {
+                        "impressions": int(r.get(AdsInsights.Field.impressions, 0) or 0),
+                        "clicks":      int(r.get(AdsInsights.Field.clicks, 0) or 0),
+                        "cost_inr":    round(float(r.get(AdsInsights.Field.spend, 0) or 0), 2),
+                        "ctr_pct":     round(float(r.get(AdsInsights.Field.ctr, 0) or 0), 2),
+                        "avg_cpc_inr": round(float(r.get(AdsInsights.Field.cpc, 0) or 0), 2),
+                        "conversions": 0.0,
+                    }
+            except Exception as _pe:
+                logger.warning(f"[AD-TO-CREATIVE] Meta insights lookup failed: {_pe}")
+            return {
+                "platform": "meta",
+                "campaign_id": str(match.get(Campaign.Field.id)),
+                "name": match.get(Campaign.Field.name),
+                "status": match.get(Campaign.Field.status),
+                "impressions": 0, "clicks": 0, "cost_inr": 0.0, "conversions": 0.0, "ctr_pct": 0.0, "avg_cpc_inr": 0.0,
+                **perf_row,
+            }
+    except RuntimeError:
+        pass
+    except Exception as _e:
+        logger.warning(f"[AD-TO-CREATIVE] Meta campaign lookup failed: {_e}")
+
+    return {}
+
+
+def _resolve_business_key_from_campaign(campaign_id: str) -> dict:
+    """
+    activity_log already records business_key + reference_id (=campaign_id)
+    for every campaign this tool has ever pushed — reuse that instead of
+    building a separate campaign→business mapping table.
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT business_key, url, industry, city FROM activity_log "
+                    "WHERE activity_type IN ('google_campaign_created', 'meta_campaign_created') "
+                    "AND reference_id = :cid ORDER BY id DESC LIMIT 1"
+                ),
+                {"cid": campaign_id},
+            ).mappings().first()
+        return dict(row) if row else {}
+    except Exception as _e:
+        logger.warning(f"[AD-TO-CREATIVE] business_key lookup from campaign_id failed: {_e}")
+        return {}
+
+
+_AD_CREATIVE_VARIANTS = ["Direct Response", "Emotional/Lifestyle", "Authority/Trust"]
+
+def _backfill_ad_to_creative(output: dict, variant_names: list) -> dict:
+    """Guarantee exactly one variant per name, each with at least one creative —
+    same schema-ordering + backfill discipline as Creative Director."""
+    variants = output.get("variants") or []
+    variants = [v for v in variants if isinstance(v, dict) and v.get("variant_name")]
+    have_names = {v.get("variant_name") for v in variants}
+    letters = ["A", "B", "C"]
+    for i, vname in enumerate(variant_names):
+        if vname not in have_names:
+            variants.append({
+                "variant_id": letters[i], "variant_name": vname,
+                "creatives": [{
+                    "creative_type": "core_social", "platform": "Instagram/Facebook",
+                    "objective": "N/A", "headline": "N/A — GPT did not return this variant", "subheadline": "",
+                    "caption": "", "cta": "", "hashtags": [], "visual_direction": "N/A",
+                    "image_prompt": "N/A — regenerate to get this variant's creatives",
+                    "design_layout": "N/A", "target_audience": "N/A", "reason_this_matches_campaign": "N/A",
+                    "predicted_strengths": "N/A", "risks": "N/A",
+                    "creative_score": {"value": 0, "reasoning": "Not generated"}, "next_action": "Regenerate",
+                }],
+            })
+    for v in variants:
+        if not v.get("creatives"):
+            v["creatives"] = [{
+                "creative_type": "core_social", "platform": "Instagram/Facebook",
+                "objective": "N/A", "headline": "N/A — no creatives returned for this variant", "subheadline": "",
+                "caption": "", "cta": "", "hashtags": [], "visual_direction": "N/A",
+                "image_prompt": "N/A — regenerate to get this variant's creatives",
+                "design_layout": "N/A", "target_audience": "N/A", "reason_this_matches_campaign": "N/A",
+                "predicted_strengths": "N/A", "risks": "N/A",
+                "creative_score": {"value": 0, "reasoning": "Not generated"}, "next_action": "Regenerate",
+            }]
+    output["variants"] = variants[:3]
+    return output
+
+
+@app.post("/ad-to-creative")
+async def ad_to_creative(request: AdToCreativeRequest):
+    try:
+        campaign_id = (request.campaign_id or "").strip()
+        campaign_info = {}
+        resolved_from_log = {}
+
+        if campaign_id:
+            campaign_info = await asyncio.to_thread(_resolve_campaign_by_id, campaign_id)
+            if not campaign_info:
+                return {"success": False, "error": f"No campaign found with ID {campaign_id!r} on Google Ads or Meta."}
+            resolved_from_log = await asyncio.to_thread(_resolve_business_key_from_campaign, campaign_id)
+
+        url      = (request.url or resolved_from_log.get("url") or "").strip()
+        industry = (request.industry or resolved_from_log.get("industry") or "").strip()
+        city     = (request.city or resolved_from_log.get("city") or "").strip()
+        objective = (request.campaign_objective or "Leads").strip()
+        offer    = (request.offer or "").strip()
+        city_display = city or "India (no specific city given)"
+
+        # NOTE: _bk_src must always be a RAW identifier (a url/domain), never an
+        # already-derived business_key — derive_business_key()/get_memory_with_
+        # city_fallback() below do their own derivation, so re-deriving an
+        # already-derived key (e.g. from activity_log's stored business_key
+        # column) would double-suffix it and silently miss real memory.
+        _bk_src = request.business_key or url
+        if not _bk_src and not campaign_id:
+            return {"success": False, "error": "Provide either a campaign_id or a url/business_key for manual mode."}
+
+        norm_key_base = derive_business_key(_bk_src, industry, city) if _bk_src else f"campaign::{campaign_id}"
+        norm_key = f"{norm_key_base}::campaign::{campaign_id}" if campaign_id else norm_key_base
+
+        memory, _resolved = get_memory_with_city_fallback(_bk_src, industry, city) if _bk_src else ({}, norm_key_base)
+        logger.info(f"[AD-TO-CREATIVE] key={norm_key!r} campaign_id={campaign_id!r} tables={list(memory.keys())}")
+
+        _bm = memory.get("business", {}) or {}
+        _am = memory.get("audience", {}) or {}
+        _campaign_mem = memory.get("campaign", {}) or {}
+
+        def _load_json_field(mem_dict, table_key, field_key):
+            raw = (mem_dict.get(table_key) or {})
+            if isinstance(raw, str):
+                try: raw = json.loads(raw)
+                except Exception: raw = {}
+            val = raw.get(field_key, {})
+            if isinstance(val, str):
+                try: return json.loads(val)
+                except Exception: return {}
+            return val or {}
+
+        kpi_data    = _load_json_field(memory, "kpi", "kpi_data")
+        _perf_data  = _load_json_field(memory, "performance", "performance_data")
+        _opt_data   = _load_json_field(memory, "optimizer", "optimizer_data")
+
+        has_campaign_data     = bool(campaign_info)
+        has_performance        = bool(_perf_data) or has_campaign_data
+        has_kpi_prediction     = bool(kpi_data)
+        has_audience           = bool(_am and (_am.get("segments") if isinstance(_am, dict) else None))
+
+        growth = get_growth_learning(industry) if industry else {"sample_size": 0, "entries": []}
+        growth_records = growth.get("sample_size", 0)
+
+        # ── Real numbers from the campaign itself (if any) ────────────────────
+        imp  = int(campaign_info.get("impressions", 0) or 0)
+        clk  = int(campaign_info.get("clicks", 0) or 0)
+        cost = float(campaign_info.get("cost_inr", 0) or 0)
+        conv = float(campaign_info.get("conversions", 0) or 0)
+        ctr  = float(campaign_info.get("ctr_pct", 0) or 0)
+        cpc  = float(campaign_info.get("avg_cpc_inr", 0) or 0)
+
+        data_sufficiency = _check_data_sufficiency(imp, clk, cost) if has_campaign_data else {
+            "insufficient_data": True, "banner": None, "thresholds": _DATA_SUFFICIENCY_THRESHOLDS,
+        }
+
+        # ── Performance-aware creative-focus notes (only with sufficient real data) ─
+        perf_notes = []
+        campaign_name_lower = str(campaign_info.get("name", "")).lower()
+        is_remarketing = any(w in campaign_name_lower for w in ("remarketing", "retarget"))
+        if has_campaign_data and not data_sufficiency["insufficient_data"]:
+            benchmark_ctr = _parse_pct_generic((kpi_data.get("predicted_metrics", {}) or {}).get("ctr", {}).get("value", "")) or 2.0
+            if ctr > benchmark_ctr and conv == 0:
+                perf_notes.append(f"High CTR ({ctr}%) but 0 conversions — creatives should improve trust signals and CTA clarity, not just attention.")
+            elif ctr < 1.0:
+                perf_notes.append(f"Low CTR ({ctr}%) — creatives need stronger scroll-stopping hooks.")
+            if cpc > 0 and cpc > (_parse_money_generic((kpi_data.get("predicted_metrics", {}) or {}).get("cpc", {}).get("value", "")) or 20.0) * 1.5:
+                perf_notes.append(f"High CPC (₹{cpc}) relative to benchmark — creatives should target a more specific niche audience.")
+        if is_remarketing:
+            perf_notes.append("This is a remarketing/retargeting campaign — creatives should lean on proof (testimonial, review, before/after, case study) and a limited-time reminder angle, not cold-audience awareness framing.")
+        performance_notes_block = "\n".join(f"- {n}" for n in perf_notes) or "No specific performance-driven creative adjustment flagged."
+
+        objective_focus_map = {
+            "leads":    "trust + problem framing + clear CTA + offer",
+            "traffic":  "curiosity + click intent",
+            "sales":    "product + urgency + offer + proof",
+            "branding": "lifestyle + identity + recall",
+        }
+        objective_focus = objective_focus_map.get(objective.strip().lower(), "trust + problem framing + clear CTA + offer")
+
+        def _sv(d, k, dfl="N/A"):
+            v = (d or {}).get(k, dfl) if isinstance(d, dict) else dfl
+            return str(v or dfl)
+
+        segments = _am.get("segments") if isinstance(_am, dict) else None
+        if isinstance(segments, str):
+            try: segments = json.loads(segments)
+            except Exception: segments = []
+        segments_summary = json.dumps(segments, ensure_ascii=False)[:400] if segments else "NOT AVAILABLE"
+
+        campaign_copy = _campaign_mem.get("campaign_data", {}) if isinstance(_campaign_mem, dict) else {}
+        if isinstance(campaign_copy, str):
+            try: campaign_copy = json.loads(campaign_copy)
+            except Exception: campaign_copy = {}
+        existing_headlines = request.headlines or (campaign_copy.get("headlines") if isinstance(campaign_copy, dict) else []) or []
+        existing_keywords   = request.keywords or (campaign_copy.get("keywords") if isinstance(campaign_copy, dict) else []) or []
+
+        _today = date.today().strftime("%B %d, %Y")
+
+        data_context = (
+            f"TODAY'S REAL DATE: {_today} (use this for any seasonal angle — never invent an occasion that hasn't happened)\n"
+            f"CAMPAIGN DATA AVAILABLE: {has_campaign_data}\n"
+            + (
+                f"  - Name: {campaign_info.get('name')} | Platform: {campaign_info.get('platform')} | Status: {campaign_info.get('status')}\n"
+                f"  - Real metrics: {imp} impressions, {clk} clicks, ₹{cost} spend, {conv} conversions, CTR {ctr}%, CPC ₹{cpc}\n"
+                if has_campaign_data else "  - No specific campaign pulled — manual/business-level input only.\n"
+            )
+            + (f"DATA SUFFICIENCY: {'INSUFFICIENT — preliminary only' if data_sufficiency['insufficient_data'] else 'Sufficient for performance-based claims'}\n" if has_campaign_data else "")
+            + f"PERFORMANCE-DRIVEN CREATIVE NOTES:\n{performance_notes_block}\n"
+            + f"EXISTING AD COPY ON FILE: headlines={existing_headlines[:5] or 'none'} | keywords={[k.get('text') if isinstance(k, dict) else k for k in existing_keywords[:5]] or 'none'}\n"
+            + f"MANUAL AD COPY PROVIDED: {request.ad_copy or 'none'}\n"
+            + f"AUDIENCE INTELLIGENCE AVAILABLE: {has_audience}\n"
+            + (f"  - Segments: {segments_summary}\n" if has_audience else "  - No audience segments on file.\n")
+            + f"KPI ENGINE PREDICTION AVAILABLE: {has_kpi_prediction}\n"
+            + f"CROSS-BUSINESS GROWTH MEMORY: {growth_records} real record(s) for '{industry or 'unspecified'}'\n"
+            + ("  - NOTE: this contains audience/platform/offer/CPL/ROAS patterns only — NOT creative-angle win rates.\n" if growth_records else "")
+        )
+
+        prompt = (
+            "You are an elite Performance Creative Strategist. Generate matching social-media creatives for the "
+            "REAL campaign/business context below — you are NOT generating images, only the full creative direction "
+            "and production-ready image prompts for a human or another tool to use.\n\n"
+            f"BUSINESS URL: {url or 'Not specified'} | Industry: {industry or 'Not specified'} | City: {city_display}\n"
+            f"CAMPAIGN OBJECTIVE: {objective} | Objective-driven creative focus: {objective_focus}\n"
+            f"OFFER: {offer or 'Not specified — infer a reasonable offer angle'}\n\n"
+            + data_context + "\n"
+            + "Return ONLY valid JSON (no markdown, no text outside JSON) matching this EXACT schema:\n"
+            "{\n"
+            '  "campaign_match_summary": "how these creatives tie to this specific campaign\'s audience/offer/objective",\n'
+            '  "performance_context": "if CAMPAIGN DATA AVAILABLE is True and sufficient: \'Based on this campaign\'s real data: CTR X%, Y conversions...\'; '
+            'if insufficient or unavailable: \'Insufficient performance data — creatives based on objective + audience only\' or similar, honestly",\n'
+            '  "variants": [\n'
+            '    {"variant_id":"A","variant_name":"Direct Response","creatives":[\n'
+            '      {"creative_type":"core_social","platform":"Instagram/Facebook","applicable_sizes":["Instagram Post 1080x1080","Instagram Portrait 1080x1350","Facebook Feed 1200x628"],'
+            '"objective":"...","headline":"...","subheadline":"...","caption":"...","cta":"...","hashtags":["...","..."],'
+            '"visual_direction":"...","image_prompt":"natural descriptive prose, no meta-label prefix, production-ready for Midjourney/DALL-E/Canva",'
+            '"design_layout":"...","target_audience":"...","reason_this_matches_campaign":"...","predicted_strengths":"...","risks":"...",'
+            '"creative_score":{"value":0,"reasoning":"..."},"next_action":"..."},\n'
+            '      {"creative_type":"google_display_banner","platform":"Google Display","applicable_sizes":["1200x628","300x250","728x90"], "...":"same fields as above"},\n'
+            '      {"creative_type":"whatsapp_status","platform":"WhatsApp","applicable_sizes":["1080x1920"], "...":"same fields as above"}\n'
+            '    ]},\n'
+            '    {"variant_id":"B","variant_name":"Emotional/Lifestyle","creatives":[ "same structure" ]},\n'
+            '    {"variant_id":"C","variant_name":"Authority/Trust","creatives":[ "same structure" ]}\n'
+            '  ]\n'
+            '}\n\n'
+            "Rules:\n"
+            "- All 3 variants required, each a genuinely different creative angle (Direct Response / Emotional-Lifestyle / Authority-Trust).\n"
+            "- Each variant needs exactly: 1 core_social creative + 1 google_display_banner + 1 whatsapp_status. "
+            "If (and only if) this business is B2B (sells to other businesses, not directly to consumers), ALSO add "
+            "one linkedin_post creative to each variant. Do not generate every platform size separately — use "
+            "applicable_sizes to note where the core concept also works.\n"
+            "- image_prompt: natural, richly-descriptive prose the way a professional would actually type it into "
+            "an image generator — covering subject, environment, lighting, composition, mood, color, negative space "
+            "for branding/typography, style reference, negative prompt, and render quality. NEVER prefix it with a "
+            "meta-label like 'production-ready prompt:' and NEVER write it as a comma-separated field:value list.\n"
+            "- HONESTY: never say 'best-performing' or 'top' about any creative or angle unless CAMPAIGN DATA "
+            "AVAILABLE is True AND DATA SUFFICIENCY is sufficient. If DATA SUFFICIENCY is insufficient, every "
+            "performance-based claim in reason_this_matches_campaign/predicted_strengths must be labeled "
+            "'preliminary — based on limited data'.\n"
+            "- If AUDIENCE INTELLIGENCE / KPI PREDICTION are unavailable, say so in campaign_match_summary rather "
+            "than inventing specifics.\n"
+            "- growth_memory only contains audience/platform/offer/CPL/ROAS patterns — never imply it tells you "
+            "which creative angle wins.\n"
+            "- BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Leverage, Utilize, "
+            "Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age.\n"
+            "- Return ONLY the JSON. Nothing else."
+        )
+
+        logger.info(f"[AD-TO-CREATIVE] Sending to GPT-4o (prompt_len={len(prompt)})")
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=4500,
+            temperature=0.5,
+        )
+        raw = resp.choices[0].message.content.strip()
+        logger.info(f"[AD-TO-CREATIVE] GPT responded (len={len(raw)})")
+        output = json.loads(raw)
+
+        output = _clean_banned_words_deep(output)
+        output = _backfill_ad_to_creative(output, _AD_CREATIVE_VARIANTS)
+
+        output["data_sources_used"] = {
+            "campaign_data":          has_campaign_data,
+            "performance_data":       bool(_perf_data),
+            "kpi_prediction":         has_kpi_prediction,
+            "audience":               has_audience,
+            "growth_memory_records":  growth_records,
+        }
+        output["data_sufficiency"] = data_sufficiency
+
+        save_to_memory("ad_creative", norm_key, {"data": output})
+        logger.info(f"[AD-TO-CREATIVE] Done: key={norm_key!r} variants={len(output.get('variants', []))}")
+
+        log_activity(
+            "ad_to_creative", business_key=norm_key,
+            business_name=_bm.get("business_name", "") or campaign_info.get("name", "") or url,
+            url=url, industry=industry, city=city,
+            summary=f"Ad-to-Creative — {objective} campaign" + (f" ({campaign_info.get('name')})" if campaign_info else " (manual)"),
+            reference_id=campaign_id,
+        )
+
+        return {
+            "success":      True,
+            "memory_used":  bool(memory),
+            "business_key": norm_key,
+            "campaign_info": campaign_info or None,
+            "creative":     output,
+        }
+
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[AD-TO-CREATIVE] ERROR: {_e}\n{tb}")
         return {"success": False, "error": str(_e), "traceback": tb}
 
 
