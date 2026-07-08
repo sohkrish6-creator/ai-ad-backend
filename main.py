@@ -1177,6 +1177,21 @@ def _dna_dict_has_signal(dna: dict) -> bool:
     return False
 
 
+def _has_real_business_dna(bm: dict) -> bool:
+    """
+    The bug this guards against: a memory 'business' dict wrapper ALWAYS has
+    business_name/industry/city keys even when nothing real was ever found for
+    it — so `bool(bm)` is always True regardless of whether real intelligence
+    was found. Check the actual content instead. Shared by every module that
+    reads business_memory (Creative Studio, Opportunity Engine, Offer
+    Intelligence, KPI Engine, Smart Analysis) so the same real-data standard
+    applies everywhere.
+    """
+    if not bm:
+        return False
+    return bool((bm.get("positioning") or "").strip() or (bm.get("uvp") or "").strip() or (bm.get("business_dna") or {}))
+
+
 def _compute_trust_verdict(has_business_dna: bool, has_audience: bool, extra_note: str = "") -> dict:
     """Single top-level confidence badge — HIGH / MEDIUM / VERIFY_FIRST."""
     if has_business_dna and has_audience:
@@ -4132,11 +4147,27 @@ Respond ONLY with a valid JSON object — no markdown, no explanation, just the 
         summary="Opportunity Engine report generated",
     )
 
+    # ── TRUST & ACCURACY LAYER ────────────────────────────────────────────
+    _has_dna = _has_real_business_dna(bm)
+    _has_aud = bool(am.get("segments"))
+    _has_campaign = bool(memory.get("campaign"))
+    trust_verdict = _compute_trust_verdict(_has_dna, _has_aud)
+    based_on = _compute_based_on_line(_has_dna, _has_aud, _has_campaign)
+    _biz_label = bm.get("business_name") or request.business_key
+    _biz_positioning_txt = bm.get("positioning") or ""
+    _business_context_txt = " ".join([bm.get("industry") or "", _biz_positioning_txt, bm.get("uvp") or "", json.dumps(bm.get("business_dna") or {})])
+    _match_warning = _business_match_sanity_check(_business_context_txt, json.dumps(opportunity), _biz_label, _biz_positioning_txt)
+    _contradiction_warning = _detect_consistency_contradiction(_has_dna, json.dumps(opportunity))
+    validation_warning = _combine_validation_warnings(_match_warning, _contradiction_warning)
+
     _response = {
         "success":      True,
         "memory_used":  True,
         "business_key": norm_key,
         "opportunity":  opportunity,
+        "trust_verdict": trust_verdict,
+        "based_on": based_on,
+        "validation_warning": validation_warning or None,
     }
     save_report_snapshot("opportunity_engine", norm_key, _response)
     return _response
@@ -4276,11 +4307,27 @@ Respond ONLY with valid JSON — no markdown, no explanation:
         summary="Offer Intelligence report generated",
     )
 
+    # ── TRUST & ACCURACY LAYER ────────────────────────────────────────────
+    _has_dna = _has_real_business_dna(bm)
+    _has_aud = bool(am.get("segments"))
+    _has_campaign = bool(memory.get("campaign"))
+    trust_verdict = _compute_trust_verdict(_has_dna, _has_aud)
+    based_on = _compute_based_on_line(_has_dna, _has_aud, _has_campaign)
+    _biz_label = bm.get("business_name") or request.business_key
+    _biz_positioning_txt = bm.get("positioning") or ""
+    _business_context_txt = " ".join([bm.get("industry") or "", _biz_positioning_txt, bm.get("uvp") or "", json.dumps(bm.get("business_dna") or {})])
+    _match_warning = _business_match_sanity_check(_business_context_txt, json.dumps(offer), _biz_label, _biz_positioning_txt)
+    _contradiction_warning = _detect_consistency_contradiction(_has_dna, json.dumps(offer))
+    validation_warning = _combine_validation_warnings(_match_warning, _contradiction_warning)
+
     _response = {
         "success":      True,
         "memory_used":  True,
         "business_key": norm_key,
         "offer":        offer,
+        "trust_verdict": trust_verdict,
+        "based_on": based_on,
+        "validation_warning": validation_warning or None,
     }
     save_report_snapshot("offer_intelligence", norm_key, _response)
     return _response
@@ -5047,11 +5094,27 @@ RULES:
         summary=f"KPI Engine prediction — goal: {goal}",
     )
 
+    # ── TRUST & ACCURACY LAYER ────────────────────────────────────────────
+    _has_dna = _has_real_business_dna(_bm)
+    _has_aud = bool(_segs)
+    _has_campaign = bool(_cm)
+    trust_verdict = _compute_trust_verdict(_has_dna, _has_aud)
+    based_on = _compute_based_on_line(_has_dna, _has_aud, _has_campaign)
+    _biz_label = _bm.get("business_name") or request.url
+    _biz_positioning_txt = _bm.get("positioning") or ""
+    _business_context_txt = " ".join([industry, _biz_positioning_txt, _bm.get("uvp") or "", json.dumps(_bm.get("business_dna") or {})])
+    _match_warning = _business_match_sanity_check(_business_context_txt, json.dumps(kpi), _biz_label, _biz_positioning_txt)
+    _contradiction_warning = _detect_consistency_contradiction(_has_dna, json.dumps(kpi))
+    validation_warning = _combine_validation_warnings(_match_warning, _contradiction_warning)
+
     _response = {
         "success":      True,
         "memory_used":  True,
         "business_key": norm_key,
         "kpi":          kpi,
+        "trust_verdict": trust_verdict,
+        "based_on": based_on,
+        "validation_warning": validation_warning or None,
     }
     save_report_snapshot("kpi_engine", norm_key, _response)
     return _response
@@ -6963,17 +7026,6 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
         if isinstance(segments, str):
             try: segments = json.loads(segments)
             except Exception: segments = []
-
-        def _has_real_business_dna(bm: dict) -> bool:
-            """
-            The bug this guards against: `_bm` is a dict wrapper that ALWAYS
-            has business_name/industry/city keys even when gather_bi_data found
-            NOTHING — so `bool(_bm)` is always True regardless of whether real
-            intelligence was found. Check the actual content instead.
-            """
-            if not bm:
-                return False
-            return bool((bm.get("positioning") or "").strip() or (bm.get("uvp") or "").strip() or (bm.get("business_dna") or {}))
 
         discovery_ran = False
         # ── Core intelligence fix: auto-run lightweight discovery if this
@@ -9474,6 +9526,11 @@ async def smart_analysis(request: SmartAnalysisRequest):
         plan["business_key"], plan["decision"]["modules_run"],
     )
 
+    # ── TRUST & ACCURACY LAYER ────────────────────────────────────────────
+    # Smart Analysis runs Marketing Brain internally as its first step —
+    # reuse that same trust assessment rather than recomputing it, since
+    # brain_result IS a /full-report response and already carries it.
+    _brain = plan["brain_result"] or {}
     response = {
         "success":            True,
         "business_model":     plan["decision"]["business_model"],
@@ -9481,6 +9538,9 @@ async def smart_analysis(request: SmartAnalysisRequest):
         "decision":           plan["decision"],
         "results":            results,
         "total_time_seconds": total_time,
+        "trust_verdict":      _brain.get("trust_verdict"),
+        "based_on":           _brain.get("based_on"),
+        "validation_warning": _brain.get("validation_warning"),
     }
     _save_smart_analysis_history(
         plan["business_key"], request.url, plan["decision"]["business_model"],
@@ -9521,6 +9581,7 @@ async def smart_analysis_execute(request: SmartAnalysisExecuteRequest):
         request.url, request.industry, request.city, request.budget,
         request.business_key, request.modules_to_run,
     )
+    _brain = request.brain_result or {}
     response = {
         "success":            True,
         "business_model":     request.business_model,
@@ -9532,6 +9593,9 @@ async def smart_analysis_execute(request: SmartAnalysisExecuteRequest):
         },
         "results":            results,
         "total_time_seconds": total_time,
+        "trust_verdict":      _brain.get("trust_verdict"),
+        "based_on":           _brain.get("based_on"),
+        "validation_warning": _brain.get("validation_warning"),
     }
     _save_smart_analysis_history(request.business_key, request.url, request.business_model, request.modules_to_run, response)
     log_activity(
