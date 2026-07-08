@@ -1144,6 +1144,137 @@ def _clean_banned_words_deep(obj):
     if isinstance(obj, list): return [_clean_banned_words_deep(v) for v in obj]
     return obj
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# TRUST & ACCURACY LAYER — shared by /full-report (Marketing Brain) and
+# /creative-studio. Born from the sohscape.com wellness-mismatch bug: a
+# wrapper dict that always has SOME keys was treated as "real data present"
+# even when the actual content (positioning/uvp/business_dna) was empty. This
+# layer surfaces one honest verdict to the user instead of letting a
+# generic/off output pass as if it were grounded. All checks here are
+# deterministic Python — never GPT self-assessment — for the same reason the
+# scoring/localization bugs earlier this session were fixed in Python: GPT
+# cannot be trusted to reliably self-report its own confidence.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _dna_dict_has_signal(dna: dict) -> bool:
+    """True only if the business_dna dict has at least one substantive field
+    — not just present keys with empty/placeholder values like "Unknown"."""
+    if not dna:
+        return False
+    def _real(v):
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return bool(v.strip()) and v.strip().lower() not in ("unknown", "n/a", "none", "")
+        if isinstance(v, (list, dict)):
+            return bool(v)
+        return bool(v)
+    for k in ("detected_industry", "business_model", "unique_value_prop", "value_proposition",
+              "positioning_statement", "core_products", "target_geography"):
+        if _real(dna.get(k)):
+            return True
+    return False
+
+
+def _compute_trust_verdict(has_business_dna: bool, has_audience: bool, extra_note: str = "") -> dict:
+    """Single top-level confidence badge — HIGH / MEDIUM / VERIFY_FIRST."""
+    if has_business_dna and has_audience:
+        reason = "Business DNA and audience intelligence were both grounded in real data from the website/crawl."
+    elif has_business_dna or has_audience:
+        gap = "audience data is thin" if has_business_dna else "business DNA is thin"
+        reason = f"Partial real data available — {gap}, so some sections may rely on reasonable assumptions."
+    else:
+        reason = "No real business DNA or audience data could be extracted — this output leans heavily on AI assumptions and may not accurately reflect the business."
+    if extra_note:
+        reason = f"{reason} {extra_note}"
+    level = "HIGH" if (has_business_dna and has_audience) else ("MEDIUM" if (has_business_dna or has_audience) else "VERIFY_FIRST")
+    return {"level": level, "reason": reason}
+
+
+def _compute_based_on_line(has_business_dna: bool, has_audience: bool, has_campaign_data: bool) -> str:
+    dna_mark  = "✓" if has_business_dna else "✗ (none found)"
+    aud_mark  = "✓" if has_audience    else "✗ (none found)"
+    camp_mark = "✓" if has_campaign_data else "✗ (none yet)"
+    if has_business_dna and has_audience:
+        tail = "Treat this as well-grounded."
+    elif has_business_dna or has_audience:
+        tail = "Some sections may be generalized — review before using with a client."
+    else:
+        tail = "This is largely AI inference — verify before using with a client."
+    return f"Based on: your website content {dna_mark}, audience research {aud_mark}, real campaign data {camp_mark}. {tail}"
+
+
+# Vertical keyword buckets for the deterministic business-match sanity check.
+# Deliberately keyword-based rather than a GPT judge call — cheap, fast, and
+# directly catches the exact failure mode observed live (a marketing agency's
+# business_dna paired with wholly-unrelated wellness/mindfulness output).
+_VERTICAL_KEYWORDS = {
+    "wellness_mindfulness": ["wellness", "mindfulness", "meditation", "yoga", "stress relief", "stress management", "harmonious home", "relaxation", "self-care", "holistic healing"],
+    "marketing_advertising": ["marketing agency", "digital marketing", "advertising", "lead generation", "seo ", "ppc", "social media marketing", "brand strategy", "video marketing", "content marketing", "ad campaign", "media buying", "growth marketing"],
+    "food_beverage": ["restaurant", "menu", "cuisine", "dining", "food delivery", "cafe", "bakery", "recipe"],
+    "fitness_gym": ["gym", "fitness", "workout", "personal training", "strength training", "bodybuilding"],
+    "real_estate": ["real estate", "property", "apartment", "villa", "housing project", " plot "],
+    "finance": ["loan", "investment", "insurance", "mutual fund", "banking", "credit card", "financial planning"],
+    "healthcare_medical": ["clinic", "hospital", "doctor", "patient", "medical treatment", "diagnosis", "healthcare"],
+    "beauty_salon": ["salon", "beauty parlor", "skincare", "makeup", "hairstyling", "spa treatment"],
+    "hospitality_travel": ["hotel", "resort", "travel agency", "tourism", "vacation package", "hospitality industry"],
+    "education": ["school", "college", "tuition", "exam prep", "curriculum", "admissions"],
+    "ecommerce_retail": ["e-commerce", "online store", "shopping cart", "product catalog", "retail brand"],
+    "automotive": ["car dealership", "vehicle", "automobile", "auto repair"],
+    "legal": ["law firm", "attorney", "legal services", "lawsuit", "legal advice"],
+}
+
+
+def _detect_verticals(text: str) -> set:
+    t = (text or "").lower()
+    return {vertical for vertical, keywords in _VERTICAL_KEYWORDS.items() if any(kw in t for kw in keywords)}
+
+
+def _business_match_sanity_check(business_context: str, output_context: str, business_label: str, business_positioning: str) -> str:
+    """Returns a validation_warning string if the generated content's theme
+    doesn't overlap at all with the real business's known vertical — empty
+    string if no mismatch is detected (including when there isn't enough
+    signal on either side to compare confidently)."""
+    biz_verticals = _detect_verticals(business_context)
+    out_verticals = _detect_verticals(output_context)
+    if not biz_verticals or not out_verticals:
+        return ""
+    if biz_verticals.isdisjoint(out_verticals):
+        out_label = ", ".join(sorted(v.replace("_", "/") for v in out_verticals))
+        return (
+            f"⚠️ The generated content theme ({out_label}) may not match this business "
+            f"({business_label} — {business_positioning or 'no clear positioning on file'}). "
+            "Please verify before using with a client."
+        )
+    return ""
+
+
+_CONTRADICTION_PHRASES = [
+    "no specific business positioning", "no positioning available", "no positioning was available",
+    "no business dna available", "positioning data not available", "not available, so assumptions",
+]
+
+
+def _detect_consistency_contradiction(has_business_dna: bool, text: str) -> str:
+    """Catches exactly the sohscape.com bug: data_sources_used says DNA is
+    present, but the narrative text still claims no positioning was found."""
+    if not has_business_dna:
+        return ""
+    t = (text or "").lower()
+    for phrase in _CONTRADICTION_PHRASES:
+        if phrase in t:
+            return (
+                "⚠️ This output claims business intelligence was unavailable, but real business data was found. "
+                "The analysis text may be stale or inconsistent — please verify before using with a client."
+            )
+    return ""
+
+
+def _combine_validation_warnings(*warnings: str) -> str:
+    parts = [w for w in warnings if w]
+    return " ".join(parts)
+
 async def fetch_youtube_search(query: str, max_results: int = 10) -> list:
     if not YOUTUBE_API_KEY:
         return []
@@ -1959,9 +2090,37 @@ For {request.target_industry} businesses in {request.target_city}, include:
         summary="Marketing Brain report generated",
     )
 
+    # ── TRUST & ACCURACY LAYER ────────────────────────────────────────────
+    # industry_only_mode never crawls a specific business — it's a static
+    # B2B outreach template for Sohscape's own agency, not grounded in any
+    # analyzed business's real data, so it can never claim HIGH confidence.
+    _trust_has_dna = (not industry_only_mode) and bool(
+        _dna_dict_has_signal(_dna) or (_biz_data.get("uvp") or "").strip() or (_biz_data.get("positioning") or "").strip()
+    )
+    _trust_has_audience = bool(_aud_data.get("segments"))
+    _trust_extra_note = "This is a generic B2B outreach template, not grounded in a specific crawled business." if industry_only_mode else ""
+    trust_verdict = _compute_trust_verdict(_trust_has_dna, _trust_has_audience, _trust_extra_note)
+    based_on = _compute_based_on_line(_trust_has_dna, _trust_has_audience, has_campaign_data=False)
+
+    _biz_label = _biz_data.get("business_name") or request.business_type
+    _biz_positioning_txt = _biz_data.get("positioning") or ""
+    _business_context_txt = " ".join([
+        request.business_type or "", _dna.get("detected_industry", "") or "", _dna.get("detected_sub_industry", "") or "",
+        _biz_positioning_txt, json.dumps(_dna.get("core_products", []) if isinstance(_dna, dict) else []),
+    ])
+    _output_context_txt = " ".join([
+        a_parts.get("BUSINESS UNDERSTANDING:", ""), c_parts.get("AD ASSETS:", ""), c_parts.get("MARKETING PLAN:", ""),
+    ])
+    _match_warning = _business_match_sanity_check(_business_context_txt, _output_context_txt, _biz_label, _biz_positioning_txt)
+    _contradiction_warning = _detect_consistency_contradiction(_trust_has_dna, a_parts.get("BUSINESS UNDERSTANDING:", ""))
+    validation_warning = _combine_validation_warnings(_match_warning, _contradiction_warning)
+
     _response = {
         "success": True,
         "url": request.url,
+        "trust_verdict": trust_verdict,
+        "based_on": based_on,
+        "validation_warning": validation_warning or None,
         # Backward-compatible keys (existing frontend reads these)
         "strategy":       section_a,
         "competitor":     a_parts.get("COMPETITOR INSIGHTS:", section_a),
@@ -7102,6 +7261,36 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
         }
         if mode == "campaign":
             output["data_sufficiency"] = data_sufficiency
+
+        # ── TRUST & ACCURACY LAYER ────────────────────────────────────────
+        _trust_extra_note = "Fresh discovery just ran for this business." if discovery_ran else ""
+        output["trust_verdict"] = _compute_trust_verdict(has_business_dna, has_audience_data, _trust_extra_note)
+        output["based_on"] = _compute_based_on_line(has_business_dna, has_audience_data, has_performance)
+
+        _biz_label = _bm.get("business_name") or url or "this business"
+        _biz_positioning_txt = _bm.get("positioning") or ""
+        _business_context_txt = " ".join([
+            industry or "", _biz_positioning_txt, _bm.get("uvp") or "",
+            json.dumps(_bm.get("business_dna") or {}),
+        ])
+        _output_context_txt = " ".join([
+            json.dumps(output.get("concepts", [])),
+            json.dumps(output.get("creative_strategy", {})),
+            json.dumps(output.get("color_psychology", {})),
+        ])
+        _match_warning = _business_match_sanity_check(_business_context_txt, _output_context_txt, _biz_label, _biz_positioning_txt)
+        _contradiction_warning = _detect_consistency_contradiction(has_business_dna, output.get("intelligence_applied", ""))
+        output["validation_warning"] = _combine_validation_warnings(_match_warning, _contradiction_warning) or None
+
+        # Pre-check: don't let a weak/empty business_dna silently pass as if
+        # the creative were properly grounded — tell the user to run
+        # Marketing Brain first for an accurate result (still generate below,
+        # just flagged clearly).
+        output["needs_marketing_brain"] = not has_business_dna
+        output["needs_marketing_brain_message"] = (
+            "We couldn't confidently read this business from its website. For accurate creatives, run Marketing Brain first."
+            if not has_business_dna else ""
+        )
 
         save_to_memory("creative_studio", norm_key, {"data": output})
         logger.info(f"[CREATIVE-STUDIO] Done: key={norm_key!r} mode={mode!r} concepts={len(output.get('concepts', []))}")
