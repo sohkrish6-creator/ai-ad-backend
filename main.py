@@ -6601,24 +6601,38 @@ async def _lightweight_business_audience_discovery(url: str, industry: str, city
     # from positioning prose.
     target_geography = business_dna.get("target_geography", "")
 
+    # ── Never ask GPT to invent an audience with zero real signal to ground it.
+    # This is exactly how the wellness/mindfulness contamination bug happened:
+    # a business with blank industry AND empty business_dna still got an
+    # audience-discovery call ("Industry: unknown | Positioning: unknown"),
+    # and GPT filled the vacuum with a plausible-sounding but completely
+    # unrelated persona. If there's truly nothing to go on, return no
+    # segments and say so honestly instead of fabricating one. ─────────────
+    has_real_signal = bool(industry.strip() or positioning.strip() or uvp.strip() or business_dna)
     audience_out = {"segments": [], "brand_personality": ""}
-    try:
-        prompt = (
-            "Based on this business's real data, identify its target audience psychographics for a creative "
-            "marketing brief. Be specific — cite what's actually plausible given the business/industry, don't "
-            "invent unrelated demographics.\n\n"
-            f"BUSINESS: {business_name} | Industry: {industry or 'unknown'} | Positioning: {positioning or 'unknown'} "
-            f"| Target geography: {target_geography or 'unknown'}\n\n"
-            'Return ONLY JSON: {"segments": [{"segment":"...","pain_points":"...","desires":"...",'
-            '"content_they_respond_to":"..."}], "brand_personality": "one line describing this brand\'s personality"}'
+    if has_real_signal:
+        try:
+            prompt = (
+                "Based on this business's real data, identify its target audience psychographics for a creative "
+                "marketing brief. Be specific — cite what's actually plausible given the business/industry, don't "
+                "invent unrelated demographics.\n\n"
+                f"BUSINESS: {business_name} | Industry: {industry or 'unknown'} | Positioning: {positioning or 'unknown'} "
+                f"| Target geography: {target_geography or 'unknown'}\n\n"
+                'Return ONLY JSON: {"segments": [{"segment":"...","pain_points":"...","desires":"...",'
+                '"content_they_respond_to":"..."}], "brand_personality": "one line describing this brand\'s personality"}'
+            )
+            resp = await asyncio.to_thread(
+                client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, max_tokens=700, temperature=0.4,
+            )
+            audience_out = json.loads(resp.choices[0].message.content)
+        except Exception as _e:
+            logger.warning(f"[CREATIVE-STUDIO] Audience discovery call failed: {_e}")
+    else:
+        logger.warning(
+            f"[CREATIVE-STUDIO] Skipping audience discovery for {business_name!r} — no industry, positioning, "
+            "UVP, or business_dna available to ground it. Returning no segments rather than hallucinating one."
         )
-        resp = await asyncio.to_thread(
-            client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}, max_tokens=700, temperature=0.4,
-        )
-        audience_out = json.loads(resp.choices[0].message.content)
-    except Exception as _e:
-        logger.warning(f"[CREATIVE-STUDIO] Audience discovery call failed: {_e}")
 
     return {
         "business": {
@@ -6791,24 +6805,48 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
             try: segments = json.loads(segments)
             except Exception: segments = []
 
+        def _has_real_business_dna(bm: dict) -> bool:
+            """
+            The bug this guards against: `_bm` is a dict wrapper that ALWAYS
+            has business_name/industry/city keys even when gather_bi_data found
+            NOTHING — so `bool(_bm)` is always True regardless of whether real
+            intelligence was found. Check the actual content instead.
+            """
+            if not bm:
+                return False
+            return bool((bm.get("positioning") or "").strip() or (bm.get("uvp") or "").strip() or (bm.get("business_dna") or {}))
+
         discovery_ran = False
         # ── Core intelligence fix: auto-run lightweight discovery if this
-        # business has no Marketing Brain memory yet, so creatives are never
-        # generic on first use ────────────────────────────────────────────
-        if url and (not _bm or not segments):
-            logger.info(f"[CREATIVE-STUDIO] No Marketing Brain memory for key={norm_key_base!r} — running lightweight discovery first")
+        # business has no REAL Marketing Brain intelligence yet, so creatives
+        # are never generic on first use. Checks real content, not just "is
+        # there a row" — a business_memory row with empty positioning/uvp/
+        # business_dna (e.g. a previous crawl failure) must still trigger a
+        # retry rather than being treated as "already discovered".
+        if url and (not _has_real_business_dna(_bm) or not segments):
+            logger.info(f"[CREATIVE-STUDIO] No real business intelligence for key={norm_key_base!r} — running lightweight discovery first")
             discovery = await _lightweight_business_audience_discovery(url, industry, city)
             _bm = discovery["business"]
             segments = discovery["audience"]["segments"]
             discovery_ran = True
-            try:
-                save_to_memory("business", norm_key_base, {
-                    "business_name": _bm.get("business_name"), "industry": industry, "city": city,
-                    "business_dna": _bm.get("business_dna"), "uvp": _bm.get("uvp"), "positioning": _bm.get("positioning"),
-                })
-                save_to_memory("audience", norm_key_base, {"segments": segments})
-            except Exception as _e:
-                logger.warning(f"[CREATIVE-STUDIO] Could not persist discovery output: {_e}")
+            # Never cache a failed/weak discovery as if it were reliable — a
+            # transient crawl failure with empty business_dna must NOT poison
+            # this business's memory forever with an empty record that then
+            # blocks (and, worse, an audience-hallucination call that produces
+            # a fabricated persona unrelated to the real business — confirmed
+            # live: sohscape.com once got a wellness/mindfulness audience this
+            # way, from a run where gather_bi_data found nothing real).
+            if _has_real_business_dna(_bm):
+                try:
+                    save_to_memory("business", norm_key_base, {
+                        "business_name": _bm.get("business_name"), "industry": industry, "city": city,
+                        "business_dna": _bm.get("business_dna"), "uvp": _bm.get("uvp"), "positioning": _bm.get("positioning"),
+                    })
+                    save_to_memory("audience", norm_key_base, {"segments": segments})
+                except Exception as _e:
+                    logger.warning(f"[CREATIVE-STUDIO] Could not persist discovery output: {_e}")
+            else:
+                logger.warning(f"[CREATIVE-STUDIO] Discovery for key={norm_key_base!r} found no real business_dna — using this request's (weak) result without caching it, so a later retry can still succeed.")
 
         def _load_json_field(mem_dict, table_key, field_key):
             raw = (mem_dict.get(table_key) or {})
@@ -6824,11 +6862,20 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
         kpi_data   = _load_json_field(memory, "kpi", "kpi_data")
         _perf_data = _load_json_field(memory, "performance", "performance_data")
 
-        has_business_dna   = bool(_bm)
+        has_business_dna   = _has_real_business_dna(_bm)
         has_audience_data  = bool(segments)
         has_campaign_data  = bool(campaign_info)
         has_performance     = bool(_perf_data) or has_campaign_data
         has_kpi_prediction  = bool(kpi_data)
+
+        _segments_preview = json.dumps(segments, ensure_ascii=False)[:200] if segments else "None"
+        logger.info(
+            f"[CREATIVE STUDIO] key={norm_key!r}, business_name={_bm.get('business_name')!r}, "
+            f"positioning={_bm.get('positioning')!r}, uvp={_bm.get('uvp')!r}, "
+            f"has_business_dna={has_business_dna}, has_audience_data={has_audience_data}, "
+            f"audience_source={'fresh_discovery' if discovery_ran else 'existing_memory'}, "
+            f"segments_preview={_segments_preview}"
+        )
 
         growth = get_growth_learning(industry) if industry else {"sample_size": 0, "entries": []}
         growth_records = growth.get("sample_size", 0)
