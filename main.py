@@ -9658,7 +9658,7 @@ class CommandRequest(BaseModel):
 _COMMAND_INTENTS = (
     "full_report", "prospect_discovery", "campaign_launch_kit", "ai_optimizer",
     "opportunity_engine", "kpi_engine", "outreach_ai", "website_intelligence",
-    "offer_intelligence", "autonomous_marketing", "unknown",
+    "offer_intelligence", "autonomous_marketing", "full_campaign_launch", "unknown",
 )
 
 async def _classify_command(text_cmd: str, url: str, industry: str, city: str, budget: float) -> dict:
@@ -9670,7 +9670,8 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "AVAILABLE ACTIONS:\n"
         "- full_report: run the complete Marketing Brain analysis (business/market/competitor/audience/campaign strategy)\n"
         "- prospect_discovery: find a list of prospect businesses in an industry+city, e.g. 'find hotels in Delhi'\n"
-        "- campaign_launch_kit: generate a ready-to-launch Google+Meta Ads campaign kit (keywords, headlines, audiences, budget split)\n"
+        "- campaign_launch_kit: generate a ready-to-launch Google+Meta Ads campaign kit (keywords, headlines, audiences, budget split) "
+        "— pick this when the command wants the KIT/copy/plan written, not an actual live campaign created\n"
         "- ai_optimizer: analyze an existing campaign's performance and recommend pause/scale/creative/budget changes\n"
         "- opportunity_engine: find the highest-ROI audience/offer/platform opportunity for a business, e.g. 'find better audience'\n"
         "- kpi_engine: predict CTR/CPC/CPL/ROAS and budget breakdown for a campaign\n"
@@ -9678,11 +9679,20 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "- website_intelligence: audit a website/landing page for conversion issues, e.g. 'improve landing page'\n"
         "- offer_intelligence: design the best offer/lead magnet/pricing for a business\n"
         "- autonomous_marketing: given a plain budget + goal (e.g. 'budget 5000, need doctor leads'), decide the "
-        "complete campaign plan automatically — pick this when the command states a budget AND a goal together\n"
+        "complete campaign plan automatically — pick this when the command states a budget AND a goal together, but "
+        "does NOT explicitly ask for the ad to actually go live\n"
+        "- full_campaign_launch: understand this business AND actually CREATE a real (paused) Google Ads campaign for "
+        "it end-to-end — pick this when the command clearly wants an ad/campaign actually launched, run, or made "
+        "live, not just planned. Trigger phrases: 'ad chalana hai', 'launch a campaign', 'launch an ad', 'run "
+        "everything for this client', 'get this live', 'start advertising', 'put this on Google Ads'. Needs both a "
+        "url and a budget to actually run — extract whatever is present, leave the rest blank if missing.\n"
         "- unknown: none of the above fit\n\n"
         'Return ONLY JSON: {"intent": "one of the actions above", '
-        '"extracted": {"industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line"}\n'
-        "Only fill \"extracted\" fields you can confidently pull from the command text itself — leave blank/0 if not mentioned."
+        '"extracted": {"url":"", "industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line"}\n'
+        "For \"url\": pull out any website/domain mentioned in the command text itself (e.g. 'sohscape.com', "
+        "'https://...', 'www.foo.in') — this is the ONLY way the system learns the url when the command comes from "
+        "a single free-text box with no separate url field. Only fill \"extracted\" fields you can confidently pull "
+        "from the command text itself — leave blank/0 if not mentioned."
     )
     resp = await asyncio.to_thread(
         client.chat.completions.create,
@@ -9715,10 +9725,16 @@ async def command_center(request: CommandRequest):
     city      = request.city or extracted.get("city") or ""
     budget    = request.budget or extracted.get("budget") or 0
     goal      = request.goal or extracted.get("goal") or text_cmd
-    url       = request.url or ""
+    url       = request.url or extracted.get("url") or ""
 
-    logger.info(f"[COMMAND] text={text_cmd!r} -> intent={intent!r} industry={industry!r} city={city!r} budget={budget}")
+    logger.info(f"[COMMAND] text={text_cmd!r} -> intent={intent!r} url={url!r} industry={industry!r} city={city!r} budget={budget}")
 
+    # Included on every early "missing param" return below so the frontend can
+    # carry these already-known values forward when the user replies in the
+    # same box (e.g. just "10000") instead of losing context on every retry.
+    _pu = {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal}
+
+    extra_fields = {}
     try:
         if intent == "full_report":
             db = SessionLocal()
@@ -9732,7 +9748,7 @@ async def command_center(request: CommandRequest):
 
         elif intent == "prospect_discovery":
             if not industry:
-                return {"success": False, "intent": intent, "error": "Missing industry — try 'find [industry] in [city]'"}
+                return {"success": False, "intent": intent, "error": "Missing industry — try 'find [industry] in [city]'", "params_used": _pu}
             result = await prospect_discovery(ProspectDiscoveryRequest(industry=industry, city=city, url=url))
 
         elif intent == "campaign_launch_kit":
@@ -9745,14 +9761,14 @@ async def command_center(request: CommandRequest):
 
         elif intent == "opportunity_engine":
             if not url and not industry:
-                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry"}
+                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry", "params_used": _pu}
             result = await opportunity_engine(OpportunityEngineRequest(
                 business_key=url or industry, industry=industry, city=city, budget=int(budget),
             ))
 
         elif intent == "kpi_engine":
             if not industry:
-                return {"success": False, "intent": intent, "error": "Missing industry"}
+                return {"success": False, "intent": intent, "error": "Missing industry", "params_used": _pu}
             result = await kpi_engine(KPIEngineRequest(url=url, industry=industry, city=city, budget=budget, goal=goal))
 
         elif intent == "outreach_ai":
@@ -9760,20 +9776,72 @@ async def command_center(request: CommandRequest):
 
         elif intent == "website_intelligence":
             if not url:
-                return {"success": False, "intent": intent, "error": "Missing url to audit"}
+                return {"success": False, "intent": intent, "error": "Missing url to audit", "params_used": _pu}
             result = await website_intelligence(WebsiteIntelligenceRequest(url=url, industry=industry, city=city))
 
         elif intent == "offer_intelligence":
             if not url and not industry:
-                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry"}
+                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry", "params_used": _pu}
             result = await offer_intelligence(OfferIntelligenceRequest(business_key=url or industry, industry=industry, city=city))
 
         elif intent == "autonomous_marketing":
             if not goal:
-                return {"success": False, "intent": intent, "error": "Missing goal — describe what you need, e.g. 'doctor leads'"}
+                return {"success": False, "intent": intent, "error": "Missing goal — describe what you need, e.g. 'doctor leads'", "params_used": _pu}
             result = await autonomous_marketing(AutonomousMarketingRequest(
                 url=url, industry=industry, city=city, budget=budget, goal_text=goal,
             ))
+
+        elif intent == "full_campaign_launch":
+            if not url:
+                return {"success": False, "intent": intent, "error": "Missing business — which website should I launch a campaign for? e.g. 'launch a campaign for sohscape.com'", "params_used": _pu}
+            # Real spend is on the line here — never guess a budget, ask for it explicitly.
+            if not budget:
+                return {"success": False, "intent": intent, "error": "Missing budget — how much do you want to spend per month? e.g. 'budget 10000'", "params_used": _pu}
+
+            # Step 1: Marketing Brain — grounds the campaign in this business's real data.
+            db = SessionLocal()
+            try:
+                brain_result = await full_report(FullReportRequest(
+                    url=url, business_type=industry or "Business", budget=int(budget),
+                    goal=goal or "Leads", target_industry="", target_city=city,
+                ), db)
+            finally:
+                db.close()
+            if not brain_result.get("success"):
+                result = {"success": False, "error": "Marketing Brain could not analyze this business.", "brain_result": brain_result}
+            else:
+                # Step 2: Campaign Launch Kit — writes keywords/headlines/descriptions
+                # to campaign_memory, keyed identically to what step 3 will read back.
+                kit_result = await campaign_launch_kit(CampaignLaunchKitRequest(
+                    url=url, industry=industry, city=city, budget=int(budget), goal=goal or "Leads",
+                    sections=brain_result.get("sections", {}),
+                ))
+                if not kit_result.get("success"):
+                    result = {"success": False, "error": "Campaign Launch Kit generation failed.", "brain_result": brain_result, "kit_result": kit_result}
+                else:
+                    # Step 3: Push to Google Ads — PAUSED by default, same flow as the
+                    # existing "Push to Ads" button (same key derivation, so it reads
+                    # back exactly what step 2 just saved).
+                    _biz_dna = (brain_result.get("bi_data") or {}).get("business_dna", {}) or {}
+                    biz_label = _biz_dna.get("business_name") or url
+                    campaign_name = f"{biz_label} — {goal or 'Leads'} — Command Center"[:255]
+                    budget_daily = max(1.0, round(int(budget) / 30))
+                    gads_result = await gads_create_campaign(CreateCampaignRequest(
+                        campaign_name=campaign_name, budget_daily=float(budget_daily), campaign_type="SEARCH",
+                        url=url, industry=industry, city=city,
+                    ))
+                    result = {
+                        "success": bool(gads_result.get("success")),
+                        "brain_result": brain_result, "kit_result": kit_result, "gads_result": gads_result,
+                    }
+                    extra_fields = {
+                        "campaign_id":     gads_result.get("campaign_id"),
+                        "ad_group_id":     gads_result.get("ad_group_id"),
+                        "keywords_added":  gads_result.get("keywords_added"),
+                        "ad_created":      gads_result.get("ad_created"),
+                        "google_ads_link": gads_result.get("google_ads_dashboard"),
+                        "trust_verdict":   brain_result.get("trust_verdict"),
+                    }
 
         else:
             return {
@@ -9787,6 +9855,7 @@ async def command_center(request: CommandRequest):
                     "Find better audience for [url]", "Predict results for [industry] campaign",
                     "Write outreach for [industry] in [city]", "Audit landing page for [url]",
                     "Design offer for [url]", "Budget [X], need [goal]",
+                    "Launch a campaign for [url], budget [X]",
                 ],
             }
     except Exception as _e:
@@ -9800,6 +9869,7 @@ async def command_center(request: CommandRequest):
         "reasoning": classification.get("reasoning", ""),
         "params_used": {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal},
         "result":    result,
+        **extra_fields,
     }
 
 
