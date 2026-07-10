@@ -1145,6 +1145,38 @@ def _clean_banned_words_deep(obj):
     return obj
 
 
+_GPT_REFUSAL_PATTERNS = (
+    "i'm sorry", "i am sorry", "i cannot assist", "i can't assist", "i cannot help",
+    "i can't help", "i'm not able to", "i am not able to", "i cannot fulfill",
+    "i can't fulfill", "i cannot comply", "i can't comply", "sorry, but i can't",
+    "sorry, but i cannot",
+)
+
+
+def _looks_like_gpt_refusal(text: str) -> bool:
+    """
+    Deterministic check: GPT occasionally declines a request outright
+    ("I'm sorry, I can't assist with that request.") instead of returning
+    the actual content — and a caller that only checks the wrapping
+    endpoint's own `success` flag (which is True as long as the API call
+    itself succeeded) would silently treat that refusal string as if it
+    were real content. Confirmed live: campaign_launch_kit once returned
+    this exact refusal as both meta_kit and google_kit, and downstream
+    keyword/headline extraction found nothing — a real PAUSED Google Ads
+    campaign got created with 0 keywords and no ad as a result. Two checks:
+    an explicit refusal phrase at the very start, or a suspiciously short
+    response with none of the expected "=== SECTION ===" structure at all.
+    """
+    if not text:
+        return True
+    t = text.strip().lower()
+    if any(t.startswith(p) for p in _GPT_REFUSAL_PATTERNS):
+        return True
+    if len(text.strip()) < 300 and "===" not in text:
+        return True
+    return False
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # TRUST & ACCURACY LAYER — shared by /full-report (Marketing Brain) and
 # /creative-studio. Born from the sohscape.com wellness-mismatch bug: a
@@ -2528,6 +2560,23 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         max_tokens=5500,
     )
     full_text = _clean_banned_words(resp.choices[0].message.content.strip())
+
+    if _looks_like_gpt_refusal(full_text):
+        # Refusals are often non-deterministic — the identical prompt
+        # frequently succeeds on a second attempt, so retry once before
+        # giving up rather than silently proceeding with a refusal string
+        # as if it were real kit content.
+        logger.warning(f"[CAMPAIGN KIT] GPT response looked like a refusal, retrying once: {full_text[:150]!r}")
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=5500,
+        )
+        full_text = _clean_banned_words(resp.choices[0].message.content.strip())
+        if _looks_like_gpt_refusal(full_text):
+            logger.error(f"[CAMPAIGN KIT] GPT declined again after retry: {full_text[:150]!r}")
+            return {"success": False, "error": "GPT declined to generate content for this request. Try again, or rephrase the goal/budget."}
 
     def extract_kit(text, start_marker, end_marker=None):
         # Exact literal match first — the fast, deterministic path when GPT
