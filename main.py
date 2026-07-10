@@ -9813,6 +9813,47 @@ def _command_research_identity_verified(handle: str, snippet: str) -> bool:
     return all(t in snippet_l for t in tokens)
 
 
+async def _command_verify_research_aboutness(handle: str, snippet: str) -> str | None:
+    """
+    A second, stronger gate on top of _command_research_identity_verified.
+    The name merely APPEARING in a snippet (the deterministic check above)
+    is not proof the snippet actually DESCRIBES what that business does —
+    confirmed live: researching "12notez" (a real music/podcast production
+    studio) surfaced a snippet where the name was only mentioned in passing
+    inside a generic "how to grow on social media" article, which passed
+    the token-presence check, and the generation step then treated 12notez
+    AS a social-media-management business as a result. This mirrors the
+    Social Intelligence Engine's own verification discipline (a GPT read of
+    "is this really about the business, or just a name that appears in
+    unrelated context") backed by a strict instruction to say UNKNOWN
+    rather than guess. Returns a one-sentence description of what the
+    business actually does, or None if the research doesn't confidently and
+    specifically describe it.
+    """
+    try:
+        prompt = (
+            f'A research snippet below may or may not actually describe what the business/account "{handle}" does.\n\n'
+            f"RESEARCH:\n{snippet[:2000]}\n\n"
+            f'In ONE sentence, state specifically what "{handle}" actually does (industry/product/service) — '
+            "ONLY if the research text clearly and specifically describes it. If the name only appears in passing "
+            "(e.g. listed among other unrelated examples, or the surrounding text is really about something else — "
+            "general advice, a different topic, a different business) and does NOT tell you what THIS business "
+            "specifically does, respond with EXACTLY the single word: UNKNOWN\n\n"
+            "Respond with ONLY the one sentence, or ONLY the word UNKNOWN — nothing else."
+        )
+        resp = await asyncio.to_thread(
+            client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+            max_tokens=100, temperature=0,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+        if not answer or answer.strip().upper().startswith("UNKNOWN"):
+            return None
+        return answer
+    except Exception as _e:
+        logger.warning(f"[COMMAND] research-aboutness verification call failed: {_e}")
+        return None
+
+
 async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> dict:
     """Pull real business context for the lightweight content-generation
     intents (hashtags/captions/scripts), trying progressively lighter
@@ -9850,19 +9891,28 @@ async def _command_memory_context(url: str, industry: str, city: str, text_cmd: 
         handle = m.group(1) if m else identifier.lstrip("@")
         # Bake any already-known city into the search itself — disambiguates
         # the wrong business up front rather than relying solely on the
-        # post-hoc identity check below to catch it.
-        query = f"{handle} instagram business what is" + (f" {city}" if city else "")
+        # post-hoc identity check below to catch it. Deliberately not
+        # Instagram-specific (a real business is often better described by
+        # general web results than by forcing "instagram" into the query).
+        query = f"{handle} company business what do they do" + (f" {city}" if city else "")
         research = await _tavily_research(query)
         if research["used"]:
             if _command_research_identity_verified(handle, research["raw"]):
-                return {
-                    "context": f"Business identifier: {handle}\nPublic research found:\n{research['raw'][:1500]}",
-                    "grounded_in_business_data": False, "research_used": True, "identifier": handle,
-                }
-            logger.info(
-                f"[COMMAND HASHTAG] discarded research — identity mismatch: input handle {handle!r} not "
-                f"confirmed in the returned snippet (first 150 chars): {research['raw'][:150]!r}"
-            )
+                description = await _command_verify_research_aboutness(handle, research["raw"])
+                if description:
+                    return {
+                        "context": f"Business identifier: {handle}\nWhat this business actually does (verified from public research): {description}",
+                        "grounded_in_business_data": False, "research_used": True, "identifier": handle,
+                    }
+                logger.info(
+                    f"[COMMAND HASHTAG] discarded research — {handle!r} appeared in the snippet but the research "
+                    f"didn't specifically describe what the business does (first 150 chars): {research['raw'][:150]!r}"
+                )
+            else:
+                logger.info(
+                    f"[COMMAND HASHTAG] discarded research — identity mismatch: input handle {handle!r} not "
+                    f"confirmed in the returned snippet (first 150 chars): {research['raw'][:150]!r}"
+                )
 
     return {
         "context": f"Business URL/name: {url or industry or 'not specified'}\nRequest context: {text_cmd}",
@@ -10274,12 +10324,22 @@ async def command_center(request: CommandRequest):
             # and "eco-friendly spaces". Only guard against this when there's
             # truly no signal at all — when real public research WAS found,
             # GPT should use it, not stay artificially generic.
+            # Confirmed live: even this guard's own wording can backfire — an
+            # earlier version said "GENERIC business-growth/marketing
+            # language", and GPT wrote copy about "growing your social media
+            # strategy" as if the business itself WERE a marketing/social-
+            # media-management agency (12notez, a music/podcast studio, got
+            # hashtags like #SocialMediaManagement). "Generic" must mean
+            # copy this business could post about ITSELF, never copy that
+            # implies the business provides marketing/social-media services.
             _no_signal_guard = (
                 "\nIMPORTANT — NO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent a specific business "
-                "category (wellness, fitness, food, fashion, etc.) that isn't explicitly stated in the context. "
-                "Keep hashtags/captions in GENERIC business-growth/marketing language instead of guessing an "
-                "industry. Use the business name from the context if present, but never fabricate what the "
-                "business actually does.\n"
+                "category (wellness, fitness, food, fashion, marketing agency, social media management, etc.) "
+                "that isn't explicitly stated in the context. Write hashtags/captions as generic, industry-agnostic "
+                "advice THIS business could post to grow ITS OWN audience or customers (e.g. 'grow your following', "
+                "'reach new customers', 'discover more') — use the business name from the context if present, but "
+                "NEVER write copy that implies the business itself provides marketing, social media management, or "
+                "consulting services, since that would be guessing an industry that was never confirmed.\n"
             ) if not _grounded and not _researched else ""
             # Confirmed live: without this, only the "niche" bucket picked up
             # the researched theme (e.g. "events") while "broad" stayed
@@ -10320,10 +10380,12 @@ async def command_center(request: CommandRequest):
             _ctx, _grounded, _researched = _ctxr["context"], _ctxr["grounded_in_business_data"], _ctxr["research_used"]
             _no_signal_guard = (
                 "\nIMPORTANT — NO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent a specific business "
-                "category (wellness, fitness, food, fashion, etc.) that isn't explicitly stated in the context. "
-                "Write a GENERIC 'grow your business' style script instead of guessing an industry — focus on "
-                "generic outcomes like leads/customers/results, not an invented niche. Use the business name from "
-                "the context if present, but never fabricate what the business actually does.\n"
+                "category (wellness, fitness, food, fashion, marketing agency, social media management, etc.) "
+                "that isn't explicitly stated in the context. Write a GENERIC 'grow your business' style script "
+                "instead of guessing an industry — focus on generic outcomes like leads/customers/results for THIS "
+                "business, not an invented niche. Use the business name from the context if present, but NEVER "
+                "write a script that implies the business itself provides marketing, social media management, or "
+                "consulting services, since that would be guessing an industry that was never confirmed.\n"
             ) if not _grounded and not _researched else ""
             _research_note_for_prompt = (
                 "\nNOTE: The context above includes REAL public research findings about this business — ground the "
