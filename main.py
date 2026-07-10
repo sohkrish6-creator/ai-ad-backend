@@ -9934,9 +9934,23 @@ async def command_center(request: CommandRequest):
 
         elif intent == "hashtag_generation":
             _ctx, _grounded = await _command_memory_context(url, industry, city, text_cmd)
+            # Confirmed live: with zero real signal, GPT will still invent a
+            # specific (and often unrelated) business vertical — e.g. a
+            # digital marketing agency's script came back about "wellness"
+            # and "eco-friendly spaces". Grounded=False alone isn't enough;
+            # the content itself must stay industry-agnostic rather than
+            # guessing a category.
+            _no_signal_guard = (
+                "\nIMPORTANT — NO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent a specific business "
+                "category (wellness, fitness, food, fashion, etc.) that isn't explicitly stated in the context. "
+                "Keep hashtags/captions in GENERIC business-growth/marketing language instead of guessing an "
+                "industry. Use the business name from the context if present, but never fabricate what the "
+                "business actually does.\n"
+            ) if not _grounded else ""
             prompt = (
                 "Generate social media hashtags and captions for this business.\n\n"
-                f"CONTEXT:\n{_ctx}\n\n"
+                f"CONTEXT:\n{_ctx}\n"
+                f"{_no_signal_guard}\n"
                 'Return ONLY JSON: {"hashtags": {"broad": ["...","...","...","...","..."], '
                 '"niche": ["...","...","...","...","..."], "local": ["...","...","...","...","..."]}, '
                 '"captions": ["...","...","..."]}\n'
@@ -9957,9 +9971,17 @@ async def command_center(request: CommandRequest):
 
         elif intent == "ad_script_writing":
             _ctx, _grounded = await _command_memory_context(url, industry, city, text_cmd)
+            _no_signal_guard = (
+                "\nIMPORTANT — NO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent a specific business "
+                "category (wellness, fitness, food, fashion, etc.) that isn't explicitly stated in the context. "
+                "Write a GENERIC 'grow your business' style script instead of guessing an industry — focus on "
+                "generic outcomes like leads/customers/results, not an invented niche. Use the business name from "
+                "the context if present, but never fabricate what the business actually does.\n"
+            ) if not _grounded else ""
             prompt = (
                 "Write a short-form vertical video ad script (Reel/Short/TikTok style) for this business.\n\n"
-                f"CONTEXT:\n{_ctx}\n\n"
+                f"CONTEXT:\n{_ctx}\n"
+                f"{_no_signal_guard}\n"
                 'Return ONLY JSON: {"hook": "first 2-3 seconds — must stop the scroll, specific not generic", '
                 '"body": ["beat 1", "beat 2", "beat 3"], "cta": "final on-screen call to action line", '
                 '"format_suggestion": "e.g. 15-30s Reel, talking-head or product demo, with a one-line visual note"}'
