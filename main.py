@@ -9680,38 +9680,88 @@ _COMMAND_INTENTS = (
     "full_report", "prospect_discovery", "campaign_launch_kit", "ai_optimizer",
     "opportunity_engine", "kpi_engine", "outreach_ai", "website_intelligence",
     "offer_intelligence", "autonomous_marketing", "full_campaign_launch",
-    "trend_research", "hashtag_generation", "ad_script_writing", "market_query", "unknown",
+    "trend_research", "hashtag_generation", "ad_script_writing", "market_query",
+    "creative_generation", "competitor_ad_finder", "weekly_report", "meta_campaign_launch",
+    "unknown",
 )
 
-_IG_HANDLE_RE = re.compile(r'instagram\.com/([A-Za-z0-9_.]+)', re.I)
-
-# Category/filler words in a handle (e.g. "skyweds_events") that are too
-# generic to prove identity on their own — "events" alone appearing in a
-# research snippet doesn't mean the snippet is about THIS events business.
-_GENERIC_HANDLE_WORDS = {
-    "events", "event", "official", "studio", "studios", "agency", "agencies",
-    "group", "company", "india", "team", "media", "digital", "online",
-    "shop", "store", "brand", "brands", "collective", "creative", "creatives",
+# Intents that run multiple real backend phases and are slow enough to
+# warrant a live step-by-step panel instead of one long blocking request —
+# see _COMMAND_STEP_TEMPLATES / _run_multi_step_command / GET
+# /command/status/{task_id}. Every other intent still responds directly and
+# synchronously, unchanged.
+_COMMAND_STEP_TEMPLATES = {
+    "full_report": [
+        {"key": "analyze", "label": "🧠 Analyzing Business, Market & Audience"},
+        {"key": "done",    "label": "✅ Report Ready"},
+    ],
+    "autonomous_marketing": [
+        {"key": "decide", "label": "🧠 Deciding Campaign Plan"},
+        {"key": "done",   "label": "✅ Plan Ready"},
+    ],
+    "full_campaign_launch": [
+        {"key": "analyze", "label": "🧠 Analyzing Business, Market & Audience"},
+        {"key": "kit",     "label": "✍️ Writing Ad Copy & Keywords"},
+        {"key": "push",    "label": "📊 Building Google Ads Campaign"},
+        {"key": "done",    "label": "✅ Campaign Ready"},
+    ],
+    "meta_campaign_launch": [
+        {"key": "analyze", "label": "🧠 Analyzing Business, Market & Audience"},
+        {"key": "kit",     "label": "✍️ Writing Ad Copy & Keywords"},
+        {"key": "push",    "label": "📊 Building Meta Ads Campaign"},
+        {"key": "done",    "label": "✅ Campaign Ready"},
+    ],
 }
+_MULTI_STEP_INTENTS = set(_COMMAND_STEP_TEMPLATES.keys())
+
+# In-memory task store for multi-step commands — fine for a single-process
+# app (consistent with other in-memory state already used in this file).
+_COMMAND_TASKS: dict = {}
+
+
+def _task_set_step(task_id: str, key: str, status: str, detail=None) -> None:
+    task = _COMMAND_TASKS.get(task_id)
+    if not task:
+        return
+    for s in task["steps"]:
+        if s["key"] == key:
+            s["status"] = status
+            if detail is not None:
+                s["detail"] = detail
+            break
+
+_IG_HANDLE_RE = re.compile(r'instagram\.com/([A-Za-z0-9_.]+)', re.I)
 
 
 def _command_research_identity_verified(handle: str, snippet: str) -> bool:
     """
-    Deterministic identity guard for the Tavily research step below — reuses
-    the exact discipline already proven in the Social Intelligence Engine
-    (_sie_name_appears_in_snippet: does the business's own name actually
-    appear in the research snippet, rather than trusting a topically-
-    plausible result). Confirmed live: researching Instagram handle
-    "skyweds_events" (a real Jaipur wedding planner) instead confidently
-    matched an unrelated Oklahoma City venue — worse than a generic
-    fallback, because it was specifically WRONG. That snippet legitimately
-    mentioned "events" (a generic category word baked into the handle
-    itself), which is why generic words are stripped out here first — only
-    the distinctive brand token(s) count as proof of identity.
+    Deterministic identity guard for the Tavily research step below —
+    applies the same discipline already proven in the Social Intelligence
+    Engine (_sie_name_appears_in_snippet: does the business's own name
+    actually appear in the research snippet, rather than trusting a
+    topically-plausible result), generalized across ANY industry.
+
+    Requires ALL distinctive tokens (>=4 chars) of the handle to appear in
+    the snippet — not just one. A single shared word is not enough proof of
+    identity, because handles routinely bundle a category descriptor with
+    the brand name (e.g. "skyweds_events", "smilecare_dental",
+    "zenith_realty") — a wrong business in the SAME category will
+    legitimately share that one word ("events"/"dental"/"realty") without
+    being the same business at all. Confirmed live: researching
+    "skyweds_events" (a real Jaipur wedding planner) once confidently
+    matched an unrelated Oklahoma City venue whose snippet happened to
+    mention "events" generically. Requiring the full token combination
+    generalizes correctly without needing a hand-maintained, industry-by-
+    industry list of "generic" category words — which would never cover
+    every vertical (salons, clinics, restaurants, real estate, jewellery...).
     """
-    tokens = [w for w in re.findall(r"[a-zA-Z]+", handle) if len(w) >= 4 and w.lower() not in _GENERIC_HANDLE_WORDS]
-    distinctive = " ".join(tokens) if tokens else handle
-    return _sie_name_appears_in_snippet(distinctive, snippet)
+    if not handle or not snippet:
+        return False
+    snippet_l = snippet.lower()
+    tokens = [w.lower() for w in re.findall(r"[a-zA-Z]+", handle) if len(w) >= 4]
+    if not tokens:
+        tokens = [handle.strip().lower()]
+    return all(t in snippet_l for t in tokens)
 
 
 async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> dict:
@@ -9815,6 +9865,16 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "honestly rather than a guess, e.g. 'what's happening in the SaaS market right now', 'should I run ads on "
         "LinkedIn for B2B', 'is Instagram still worth it for restaurants' — this is also the catch-all for any "
         "genuinely marketing-related request that doesn't cleanly fit one of the other actions above\n"
+        "- creative_generation: generate ad creative concepts/images/visual direction for a business, e.g. "
+        "'generate an ad image for [url]', 'design a creative for my business'\n"
+        "- competitor_ad_finder: find what ads a competitor is running and how to beat them, e.g. 'what ads is "
+        "[competitor] running', 'find my competitor's ads'\n"
+        "- weekly_report: summarize recent activity/performance across this tool for the last week, e.g. 'give me "
+        "this week's summary', 'what happened this week for [url]'\n"
+        "- meta_campaign_launch: same as full_campaign_launch but for Meta/Facebook/Instagram Ads instead of "
+        "Google — pick this when the command specifically says Meta/Facebook/Instagram ads, e.g. 'launch a Meta "
+        "campaign for [url] budget [X]', 'run this on Instagram ads'. Needs both a url and a budget, same as "
+        "full_campaign_launch.\n"
         "- unknown: ONLY for requests that are NOT about marketing/advertising/business growth at all (e.g. weather, "
         "sports scores, general trivia, coding help unrelated to this platform). If a request is marketing-related "
         "but doesn't fit neatly into a specific action, choose market_query instead of unknown — always prefer "
@@ -9840,6 +9900,163 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
     if parsed.get("intent") not in _COMMAND_INTENTS:
         parsed["intent"] = "unknown"
     return parsed
+
+
+async def _run_multi_step_command(task_id: str, intent: str, url: str, industry: str, city: str, budget: float, goal: str) -> None:
+    """
+    Background runner for the 4 multi-step intents — updates _COMMAND_TASKS
+    step-by-step as each REAL backend phase actually completes (never a
+    simulated/fake progress bar), so GET /command/status/{task_id} always
+    reflects genuine state. Final shape matches exactly what the old
+    synchronous /command response used to return (result + extra_fields),
+    so the frontend renders the completed task the same way it already
+    renders a normal synchronous response.
+    """
+    task = _COMMAND_TASKS[task_id]
+    try:
+        if intent == "full_report":
+            _task_set_step(task_id, "analyze", "running")
+            db = SessionLocal()
+            try:
+                brain_result = await full_report(FullReportRequest(
+                    url=url, business_type=industry or "Business", budget=int(budget) or 10000,
+                    goal=goal, target_industry=industry, target_city=city,
+                ), db)
+            finally:
+                db.close()
+            _ok = bool(brain_result.get("success"))
+            _task_set_step(task_id, "analyze", "done" if _ok else "error", detail={
+                "trust_verdict": brain_result.get("trust_verdict"), "based_on": brain_result.get("based_on"),
+                "business_understanding": ((brain_result.get("sections") or {}).get("business_understanding") or "")[:400],
+            })
+            _task_set_step(task_id, "done", "done" if _ok else "error")
+            task["result"] = brain_result
+            task["extra_fields"] = {}
+
+        elif intent == "autonomous_marketing":
+            _task_set_step(task_id, "decide", "running")
+            plan_result = await autonomous_marketing(AutonomousMarketingRequest(
+                url=url, industry=industry, city=city, budget=budget, goal_text=goal,
+            ))
+            _ok = bool(plan_result.get("success"))
+            _task_set_step(task_id, "decide", "done" if _ok else "error", detail=plan_result)
+            _task_set_step(task_id, "done", "done" if _ok else "error")
+            task["result"] = plan_result
+            task["extra_fields"] = {}
+
+        elif intent in ("full_campaign_launch", "meta_campaign_launch"):
+            _task_set_step(task_id, "analyze", "running")
+            db = SessionLocal()
+            try:
+                brain_result = await full_report(FullReportRequest(
+                    url=url, business_type=industry or "Business", budget=int(budget),
+                    goal=goal or "Leads", target_industry="", target_city=city,
+                ), db)
+            finally:
+                db.close()
+
+            if not brain_result.get("success"):
+                _task_set_step(task_id, "analyze", "error", detail={"error": "Marketing Brain could not analyze this business."})
+                _task_set_step(task_id, "kit", "error")
+                _task_set_step(task_id, "push", "error")
+                _task_set_step(task_id, "done", "error")
+                task["result"] = {"success": False, "error": "Marketing Brain could not analyze this business.", "brain_result": brain_result}
+                task["extra_fields"] = {}
+                task["status"] = "done"
+                return
+
+            _task_set_step(task_id, "analyze", "done", detail={
+                "trust_verdict": brain_result.get("trust_verdict"), "based_on": brain_result.get("based_on"),
+                "business_understanding": ((brain_result.get("sections") or {}).get("business_understanding") or "")[:400],
+            })
+
+            # Step 2: Campaign Launch Kit — writes keywords/headlines/descriptions
+            # to campaign_memory, keyed identically to what step 3 reads back.
+            _task_set_step(task_id, "kit", "running")
+            kit_result = await campaign_launch_kit(CampaignLaunchKitRequest(
+                url=url, industry=industry, city=city, budget=int(budget), goal=goal or "Leads",
+                sections=brain_result.get("sections", {}),
+            ))
+            if not kit_result.get("success"):
+                _task_set_step(task_id, "kit", "error", detail={"error": "Campaign Launch Kit generation failed."})
+                _task_set_step(task_id, "push", "error")
+                _task_set_step(task_id, "done", "error")
+                task["result"] = {"success": False, "error": "Campaign Launch Kit generation failed.", "brain_result": brain_result, "kit_result": kit_result}
+                task["extra_fields"] = {}
+                task["status"] = "done"
+                return
+
+            _task_set_step(task_id, "kit", "done", detail={
+                "meta_kit_preview": (kit_result.get("meta_kit") or "")[:300],
+                "google_kit_preview": (kit_result.get("google_kit") or "")[:300],
+            })
+
+            # Step 3: Push to Google/Meta Ads — PAUSED by default, same flow as
+            # the existing "Push to Ads" button (same key derivation, so it
+            # reads back exactly what step 2 just saved).
+            _task_set_step(task_id, "push", "running")
+            _biz_dna = (brain_result.get("bi_data") or {}).get("business_dna", {}) or {}
+            biz_label = _biz_dna.get("business_name") or url
+            campaign_name = f"{biz_label} — {goal or 'Leads'} — Command Center"[:255]
+            # Real budget allocation: matches campaign_launch_kit's own written
+            # split (40% Google / 50% Meta / 10% remarketing) instead of
+            # treating the whole monthly budget as if 100% goes to one
+            # platform — keeps the actually-created campaign's spend
+            # consistent with what the generated kit tells the user.
+            if intent == "full_campaign_launch":
+                google_daily_budget = max(1.0, round((int(budget) * 0.40) / 30, 2))
+                push_result = await gads_create_campaign(CreateCampaignRequest(
+                    campaign_name=campaign_name, budget_daily=float(google_daily_budget), campaign_type="SEARCH",
+                    url=url, industry=industry, city=city,
+                ))
+                push_key = "gads_result"
+                extra = {
+                    "campaign_id":     push_result.get("campaign_id"),
+                    "ad_group_id":     push_result.get("ad_group_id"),
+                    "keywords_added":  push_result.get("keywords_added"),
+                    "ad_created":      push_result.get("ad_created"),
+                    "google_ads_link": push_result.get("google_ads_dashboard"),
+                    "trust_verdict":   brain_result.get("trust_verdict"),
+                }
+            else:
+                meta_daily_budget = max(1.0, round((int(budget) * 0.50) / 30, 2))
+                push_result = await meta_ads_create_campaign(CreateMetaCampaignRequest(
+                    campaign_name=campaign_name, daily_budget=float(meta_daily_budget),
+                    url=url, industry=industry, city=city,
+                ))
+                push_key = "meta_result"
+                extra = {
+                    "campaign_id":   push_result.get("campaign_id"),
+                    "adset_id":      push_result.get("adset_id"),
+                    "action_needed": push_result.get("action_needed"),
+                    "meta_ads_link": push_result.get("meta_ads_manager_link"),
+                    "trust_verdict": brain_result.get("trust_verdict"),
+                }
+            _ok = bool(push_result.get("success"))
+            _task_set_step(task_id, "push", "done" if _ok else "error", detail=push_result)
+            _task_set_step(task_id, "done", "done" if _ok else "error")
+            task["result"] = {"success": _ok, "brain_result": brain_result, "kit_result": kit_result, push_key: push_result}
+            task["extra_fields"] = extra
+
+        task["status"] = "done"
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[COMMAND TASK {task_id}] {intent!r} failed: {_e}\n{tb}")
+        for s in task["steps"]:
+            if s["status"] in ("pending", "running"):
+                s["status"] = "error"
+        task["status"] = "error"
+        task["result"] = {"success": False, "error": str(_e)}
+        task["extra_fields"] = {}
+
+
+@app.get("/command/status/{task_id}")
+async def command_status(task_id: str):
+    task = _COMMAND_TASKS.get(task_id)
+    if not task:
+        return {"success": False, "error": "Task not found — it may have expired or the task_id is invalid."}
+    return {"success": True, **task}
+
 
 @app.post("/command")
 async def command_center(request: CommandRequest):
@@ -9868,19 +10085,35 @@ async def command_center(request: CommandRequest):
     # same box (e.g. just "10000") instead of losing context on every retry.
     _pu = {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal}
 
+    if intent in _MULTI_STEP_INTENTS:
+        # Real spend is on the line for the two campaign-launch intents —
+        # never guess a budget, ask for it explicitly. Same param checks as
+        # before, just run before spinning up the background task instead of
+        # inside it.
+        if intent in ("full_campaign_launch", "meta_campaign_launch") and not url:
+            _which = "Google" if intent == "full_campaign_launch" else "Meta"
+            return {"success": False, "intent": intent, "error": f"Missing business — which website should I launch a {_which} campaign for? e.g. 'launch a campaign for sohscape.com'", "params_used": _pu}
+        if intent in ("full_campaign_launch", "meta_campaign_launch") and not budget:
+            return {"success": False, "intent": intent, "error": "Missing budget — how much do you want to spend per month? e.g. 'budget 10000'", "params_used": _pu}
+        if intent == "autonomous_marketing" and not goal:
+            return {"success": False, "intent": intent, "error": "Missing goal — describe what you need, e.g. 'doctor leads'", "params_used": _pu}
+
+        task_id = str(uuid.uuid4())
+        _COMMAND_TASKS[task_id] = {
+            "status": "running", "intent": intent, "reasoning": classification.get("reasoning", ""),
+            "params_used": _pu,
+            "steps": [{"key": s["key"], "label": s["label"], "status": "pending", "detail": None} for s in _COMMAND_STEP_TEMPLATES[intent]],
+            "result": None, "extra_fields": {},
+        }
+        asyncio.create_task(_run_multi_step_command(task_id, intent, url, industry, city, budget, goal))
+        return {
+            "success": True, "intent": intent, "reasoning": classification.get("reasoning", ""),
+            "params_used": _pu, "task_id": task_id, "multi_step": True,
+        }
+
     extra_fields = {}
     try:
-        if intent == "full_report":
-            db = SessionLocal()
-            try:
-                result = await full_report(FullReportRequest(
-                    url=url, business_type=industry or "Business", budget=int(budget) or 10000,
-                    goal=goal, target_industry=industry, target_city=city,
-                ), db)
-            finally:
-                db.close()
-
-        elif intent == "prospect_discovery":
+        if intent == "prospect_discovery":
             if not industry:
                 return {"success": False, "intent": intent, "error": "Missing industry — try 'find [industry] in [city]'", "params_used": _pu}
             result = await prospect_discovery(ProspectDiscoveryRequest(industry=industry, city=city, url=url))
@@ -9918,64 +10151,45 @@ async def command_center(request: CommandRequest):
                 return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry", "params_used": _pu}
             result = await offer_intelligence(OfferIntelligenceRequest(business_key=url or industry, industry=industry, city=city))
 
-        elif intent == "autonomous_marketing":
-            if not goal:
-                return {"success": False, "intent": intent, "error": "Missing goal — describe what you need, e.g. 'doctor leads'", "params_used": _pu}
-            result = await autonomous_marketing(AutonomousMarketingRequest(
-                url=url, industry=industry, city=city, budget=budget, goal_text=goal,
+        elif intent == "creative_generation":
+            if not url and not industry:
+                return {"success": False, "intent": intent, "error": "Missing business — provide a url or industry", "params_used": _pu}
+            result = await _run_creative_studio(CreativeStudioRequest(
+                mode="business", url=url, industry=industry, city=city, campaign_objective=goal or "Leads",
             ))
 
-        elif intent == "full_campaign_launch":
-            if not url:
-                return {"success": False, "intent": intent, "error": "Missing business — which website should I launch a campaign for? e.g. 'launch a campaign for sohscape.com'", "params_used": _pu}
-            # Real spend is on the line here — never guess a budget, ask for it explicitly.
-            if not budget:
-                return {"success": False, "intent": intent, "error": "Missing budget — how much do you want to spend per month? e.g. 'budget 10000'", "params_used": _pu}
-
-            # Step 1: Marketing Brain — grounds the campaign in this business's real data.
+        elif intent == "competitor_ad_finder":
+            if not url and not industry:
+                return {"success": False, "intent": intent, "error": "Missing competitor — provide a competitor's url, name, or industry", "params_used": _pu}
             db = SessionLocal()
             try:
-                brain_result = await full_report(FullReportRequest(
-                    url=url, business_type=industry or "Business", budget=int(budget),
-                    goal=goal or "Leads", target_industry="", target_city=city,
+                result = await ad_intelligence(AdIntelRequest(
+                    business_name=url or industry, business_type=industry or "Business", website=url, country="IN",
                 ), db)
             finally:
                 db.close()
-            if not brain_result.get("success"):
-                result = {"success": False, "error": "Marketing Brain could not analyze this business.", "brain_result": brain_result}
-            else:
-                # Step 2: Campaign Launch Kit — writes keywords/headlines/descriptions
-                # to campaign_memory, keyed identically to what step 3 will read back.
-                kit_result = await campaign_launch_kit(CampaignLaunchKitRequest(
-                    url=url, industry=industry, city=city, budget=int(budget), goal=goal or "Leads",
-                    sections=brain_result.get("sections", {}),
-                ))
-                if not kit_result.get("success"):
-                    result = {"success": False, "error": "Campaign Launch Kit generation failed.", "brain_result": brain_result, "kit_result": kit_result}
-                else:
-                    # Step 3: Push to Google Ads — PAUSED by default, same flow as the
-                    # existing "Push to Ads" button (same key derivation, so it reads
-                    # back exactly what step 2 just saved).
-                    _biz_dna = (brain_result.get("bi_data") or {}).get("business_dna", {}) or {}
-                    biz_label = _biz_dna.get("business_name") or url
-                    campaign_name = f"{biz_label} — {goal or 'Leads'} — Command Center"[:255]
-                    budget_daily = max(1.0, round(int(budget) / 30))
-                    gads_result = await gads_create_campaign(CreateCampaignRequest(
-                        campaign_name=campaign_name, budget_daily=float(budget_daily), campaign_type="SEARCH",
-                        url=url, industry=industry, city=city,
+
+        elif intent == "weekly_report":
+            _activity_result = await activity_list(limit=100, type="", business_key=url or "")
+            _all_activity = _activity_result.get("activity", []) if isinstance(_activity_result, dict) else []
+            _cutoff = datetime.utcnow() - timedelta(days=7)
+
+            def _within_week(a):
+                try:
+                    return datetime.fromisoformat((a.get("created_at") or "").replace("Z", "")) >= _cutoff
+                except Exception:
+                    return True  # unparseable timestamp — don't silently drop it, keep it visible
+
+            _recent = [a for a in _all_activity if _within_week(a)]
+            _perf = None
+            if url or industry:
+                try:
+                    _perf = await performance_intelligence(PerformanceIntelligenceRequest(
+                        url=url, industry=industry, city=city, date_range="7d",
                     ))
-                    result = {
-                        "success": bool(gads_result.get("success")),
-                        "brain_result": brain_result, "kit_result": kit_result, "gads_result": gads_result,
-                    }
-                    extra_fields = {
-                        "campaign_id":     gads_result.get("campaign_id"),
-                        "ad_group_id":     gads_result.get("ad_group_id"),
-                        "keywords_added":  gads_result.get("keywords_added"),
-                        "ad_created":      gads_result.get("ad_created"),
-                        "google_ads_link": gads_result.get("google_ads_dashboard"),
-                        "trust_verdict":   brain_result.get("trust_verdict"),
-                    }
+                except Exception as _pe:
+                    logger.warning(f"[COMMAND] weekly_report performance lookup failed: {_pe}")
+            result = {"success": True, "activity_count": len(_recent), "recent_activity": _recent[:20], "performance": _perf}
 
         elif intent == "trend_research":
             query = f"latest {industry or 'digital marketing'} advertising trends {city or 'India'} 2026 social media campaigns"
@@ -10123,7 +10337,9 @@ async def command_center(request: CommandRequest):
                     "Design offer for [url]", "Budget [X], need [goal]",
                     "Launch a campaign for [url], budget [X]",
                     "What's trending in [industry] marketing", "Hashtags/captions for [url]",
-                    "Write a reel/video ad script for [url]", "Any other marketing question",
+                    "Write a reel/video ad script for [url]", "Generate an ad creative for [url]",
+                    "What ads is [competitor] running", "This week's summary for [url]",
+                    "Launch a Meta campaign for [url], budget [X]", "Any other marketing question",
                 ],
             }
     except Exception as _e:
