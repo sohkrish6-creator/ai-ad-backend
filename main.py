@@ -9679,8 +9679,39 @@ class CommandRequest(BaseModel):
 _COMMAND_INTENTS = (
     "full_report", "prospect_discovery", "campaign_launch_kit", "ai_optimizer",
     "opportunity_engine", "kpi_engine", "outreach_ai", "website_intelligence",
-    "offer_intelligence", "autonomous_marketing", "full_campaign_launch", "unknown",
+    "offer_intelligence", "autonomous_marketing", "full_campaign_launch",
+    "trend_research", "hashtag_generation", "ad_script_writing", "market_query", "unknown",
 )
+
+async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> tuple:
+    """Pull real business context from memory for the lightweight content-
+    generation intents (hashtags/captions/scripts). Returns (context_str,
+    grounded: bool) — grounded=False means there's no real business_dna/
+    positioning on file, so callers must honestly flag the output as
+    generic rather than presenting it as tailored to this specific business."""
+    if url or industry:
+        mem, _ = get_memory_with_city_fallback(url or industry, industry, city)
+        bm = (mem or {}).get("business", {}) or {}
+        if _has_real_business_dna(bm):
+            parts = [f"Business: {bm.get('business_name') or url or industry}"]
+            if bm.get("industry"):    parts.append(f"Industry: {bm['industry']}")
+            if bm.get("positioning"): parts.append(f"Positioning: {bm['positioning']}")
+            if bm.get("uvp"):         parts.append(f"UVP: {bm['uvp']}")
+            am = (mem or {}).get("audience", {}) or {}
+            if am.get("segments"):    parts.append(f"Audience segments: {json.dumps(am['segments'], ensure_ascii=False)[:400]}")
+            return "\n".join(parts), True
+    return f"Business URL/name: {url or industry or 'not specified'}\nRequest context: {text_cmd}", False
+
+
+async def _tavily_research(query: str) -> dict:
+    """Real web research only — never a substitute for invented trends. When
+    used=False, callers MUST say research wasn't available rather than let
+    GPT fabricate trends/facts from nothing."""
+    if not TAVILY_API_KEY:
+        return {"used": False, "query": query, "raw": ""}
+    raw = await fetch_tavily(query)
+    return {"used": bool(raw.strip()), "query": query, "raw": raw}
+
 
 async def _classify_command(text_cmd: str, url: str, industry: str, city: str, budget: float) -> dict:
     prompt = (
@@ -9707,7 +9738,19 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "live, not just planned. Trigger phrases: 'ad chalana hai', 'launch a campaign', 'launch an ad', 'run "
         "everything for this client', 'get this live', 'start advertising', 'put this on Google Ads'. Needs both a "
         "url and a budget to actually run — extract whatever is present, leave the rest blank if missing.\n"
-        "- unknown: none of the above fit\n\n"
+        "- trend_research: what's trending in an industry/niche right now, what ad formats/angles are working, e.g. "
+        "'what's trending in hospitality marketing', 'what ads are working now for gyms'\n"
+        "- hashtag_generation: generate hashtags and/or captions for social posts, e.g. 'hashtags do', 'captions likho'\n"
+        "- ad_script_writing: write a short-form video ad/reel/short script (hook/body/CTA), e.g. 'reel script banao', "
+        "'video ad script chahiye'\n"
+        "- market_query: any other real-world marketing/market question that needs current information to answer "
+        "honestly rather than a guess, e.g. 'what's happening in the SaaS market right now', 'should I run ads on "
+        "LinkedIn for B2B', 'is Instagram still worth it for restaurants' — this is also the catch-all for any "
+        "genuinely marketing-related request that doesn't cleanly fit one of the other actions above\n"
+        "- unknown: ONLY for requests that are NOT about marketing/advertising/business growth at all (e.g. weather, "
+        "sports scores, general trivia, coding help unrelated to this platform). If a request is marketing-related "
+        "but doesn't fit neatly into a specific action, choose market_query instead of unknown — always prefer "
+        "attempting the closest real capability over refusing.\n\n"
         'Return ONLY JSON: {"intent": "one of the actions above", '
         '"extracted": {"url":"", "industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line"}\n'
         "For \"url\": pull out any website/domain mentioned in the command text itself (e.g. 'sohscape.com', "
@@ -9864,6 +9907,95 @@ async def command_center(request: CommandRequest):
                         "trust_verdict":   brain_result.get("trust_verdict"),
                     }
 
+        elif intent == "trend_research":
+            query = f"latest {industry or 'digital marketing'} advertising trends {city or 'India'} 2026 social media campaigns"
+            research = await _tavily_research(query)
+            if not research["used"]:
+                result = {"success": False, "error": "Live research wasn't available right now (no search results came back) — I can't responsibly report trends without real data. Try again in a bit."}
+            else:
+                prompt = (
+                    "You are a marketing trend analyst. Using ONLY the real search results below — never invent an "
+                    f"example that isn't supported by them — summarize current trends for {industry or 'this industry'} "
+                    f"businesses in {city or 'India'}.\n\n"
+                    f"REAL SEARCH RESULTS:\n{research['raw'][:3500]}\n\n"
+                    f"BUSINESS ASKING: {url or industry or 'not specified'}\n\n"
+                    'Return ONLY JSON: {"trending_themes": ["...","...","..."], "trending_formats": '
+                    '["...","...","..."], "example_angles": ["...","...","..."], '
+                    '"how_to_adapt": "one paragraph — how THIS business could adapt these trends"}\n'
+                    "Every theme/format/angle must be traceable to the search results above."
+                )
+                resp = await asyncio.to_thread(
+                    client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"}, max_tokens=900, temperature=0.3,
+                )
+                parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+                parsed["based_on"] = f"Based on real-time web search results for \"{research['query']}\" — not invented."
+                result = {"success": True, **parsed}
+
+        elif intent == "hashtag_generation":
+            _ctx, _grounded = await _command_memory_context(url, industry, city, text_cmd)
+            prompt = (
+                "Generate social media hashtags and captions for this business.\n\n"
+                f"CONTEXT:\n{_ctx}\n\n"
+                'Return ONLY JSON: {"hashtags": {"broad": ["...","...","...","...","..."], '
+                '"niche": ["...","...","...","...","..."], "local": ["...","...","...","...","..."]}, '
+                '"captions": ["...","...","..."]}\n'
+                "5-8 hashtags per bucket (broad = large general reach, niche = specific to the exact "
+                "product/service, local = city/region-specific — omit local hashtags entirely if no city/location "
+                "context is available, do not invent a city). 2-3 caption variations, each 1-3 sentences ending "
+                "with a clear call to action."
+            )
+            resp = await asyncio.to_thread(
+                client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, max_tokens=700, temperature=0.5,
+            )
+            parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+            parsed["grounded_in_business_data"] = _grounded
+            if not _grounded:
+                parsed["note"] = "Generated from generic business/industry context — no deeper analysis on file. Run Marketing Brain first for hashtags tailored to your real positioning."
+            result = {"success": True, **parsed}
+
+        elif intent == "ad_script_writing":
+            _ctx, _grounded = await _command_memory_context(url, industry, city, text_cmd)
+            prompt = (
+                "Write a short-form vertical video ad script (Reel/Short/TikTok style) for this business.\n\n"
+                f"CONTEXT:\n{_ctx}\n\n"
+                'Return ONLY JSON: {"hook": "first 2-3 seconds — must stop the scroll, specific not generic", '
+                '"body": ["beat 1", "beat 2", "beat 3"], "cta": "final on-screen call to action line", '
+                '"format_suggestion": "e.g. 15-30s Reel, talking-head or product demo, with a one-line visual note"}'
+            )
+            resp = await asyncio.to_thread(
+                client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, max_tokens=600, temperature=0.5,
+            )
+            parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+            parsed["grounded_in_business_data"] = _grounded
+            if not _grounded:
+                parsed["note"] = "Generated from generic business/industry context — no deeper analysis on file. Run Marketing Brain first for a script tailored to your real positioning."
+            result = {"success": True, **parsed}
+
+        elif intent == "market_query":
+            query = f"{text_cmd} {industry} {city} 2026".strip()
+            research = await _tavily_research(query)
+            if not research["used"]:
+                result = {"success": False, "error": "Live research wasn't available right now (no search results came back) — I can't responsibly answer without real data. Try again in a bit."}
+            else:
+                prompt = (
+                    "Answer this marketing/business question using ONLY the real search results below — never "
+                    "invent a fact or statistic that isn't supported by them. If the results don't fully answer the "
+                    "question, say so honestly rather than filling the gap with a guess.\n\n"
+                    f'QUESTION: "{text_cmd}"\n\n'
+                    f"REAL SEARCH RESULTS:\n{research['raw'][:3500]}\n\n"
+                    'Return ONLY JSON: {"answer": "direct answer, 3-5 sentences", "key_findings": ["...","...","..."]}'
+                )
+                resp = await asyncio.to_thread(
+                    client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"}, max_tokens=700, temperature=0.3,
+                )
+                parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+                parsed["based_on"] = f"Based on real-time web search results for \"{research['query']}\"."
+                result = {"success": True, **parsed}
+
         else:
             return {
                 "success": False,
@@ -9877,6 +10009,8 @@ async def command_center(request: CommandRequest):
                     "Write outreach for [industry] in [city]", "Audit landing page for [url]",
                     "Design offer for [url]", "Budget [X], need [goal]",
                     "Launch a campaign for [url], budget [X]",
+                    "What's trending in [industry] marketing", "Hashtags/captions for [url]",
+                    "Write a reel/video ad script for [url]", "Any other marketing question",
                 ],
             }
     except Exception as _e:
