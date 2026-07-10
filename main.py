@@ -9683,12 +9683,25 @@ _COMMAND_INTENTS = (
     "trend_research", "hashtag_generation", "ad_script_writing", "market_query", "unknown",
 )
 
-async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> tuple:
-    """Pull real business context from memory for the lightweight content-
-    generation intents (hashtags/captions/scripts). Returns (context_str,
-    grounded: bool) — grounded=False means there's no real business_dna/
-    positioning on file, so callers must honestly flag the output as
-    generic rather than presenting it as tailored to this specific business."""
+_IG_HANDLE_RE = re.compile(r'instagram\.com/([A-Za-z0-9_.]+)', re.I)
+
+
+async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> dict:
+    """Pull real business context for the lightweight content-generation
+    intents (hashtags/captions/scripts), trying progressively lighter
+    sources so the output is never MORE generic than the real signal
+    available warrants:
+      1. Stored Marketing Brain memory (business_dna/positioning/uvp) — the
+         strongest signal.
+      2. A live Tavily search on the given identifier (Instagram handle,
+         business name, or URL) to find out what the business actually
+         does. Confirmed live: without this tier, "hashtags for
+         skyweds_events" (a wedding events business) produced fully generic
+         "#BusinessGrowth"-style hashtags with zero wedding/event
+         relevance, because nothing ever looked the name up.
+      3. Fully generic — genuinely nothing to ground on.
+    Returns {"context": str, "grounded_in_business_data": bool,
+    "research_used": bool, "identifier": str|None}."""
     if url or industry:
         mem, _ = get_memory_with_city_fallback(url or industry, industry, city)
         bm = (mem or {}).get("business", {}) or {}
@@ -9699,8 +9712,26 @@ async def _command_memory_context(url: str, industry: str, city: str, text_cmd: 
             if bm.get("uvp"):         parts.append(f"UVP: {bm['uvp']}")
             am = (mem or {}).get("audience", {}) or {}
             if am.get("segments"):    parts.append(f"Audience segments: {json.dumps(am['segments'], ensure_ascii=False)[:400]}")
-            return "\n".join(parts), True
-    return f"Business URL/name: {url or industry or 'not specified'}\nRequest context: {text_cmd}", False
+            return {
+                "context": "\n".join(parts), "grounded_in_business_data": True,
+                "research_used": False, "identifier": bm.get("business_name") or url or industry,
+            }
+
+    identifier = (url or industry or "").strip()
+    if identifier and TAVILY_API_KEY:
+        m = _IG_HANDLE_RE.search(identifier)
+        handle = m.group(1) if m else identifier.lstrip("@")
+        research = await _tavily_research(f"{handle} instagram business what is")
+        if research["used"]:
+            return {
+                "context": f"Business identifier: {handle}\nPublic research found:\n{research['raw'][:1500]}",
+                "grounded_in_business_data": False, "research_used": True, "identifier": handle,
+            }
+
+    return {
+        "context": f"Business URL/name: {url or industry or 'not specified'}\nRequest context: {text_cmd}",
+        "grounded_in_business_data": False, "research_used": False, "identifier": url or industry or None,
+    }
 
 
 async def _tavily_research(query: str) -> dict:
@@ -9753,10 +9784,12 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "attempting the closest real capability over refusing.\n\n"
         'Return ONLY JSON: {"intent": "one of the actions above", '
         '"extracted": {"url":"", "industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line"}\n'
-        "For \"url\": pull out any website/domain mentioned in the command text itself (e.g. 'sohscape.com', "
-        "'https://...', 'www.foo.in') — this is the ONLY way the system learns the url when the command comes from "
-        "a single free-text box with no separate url field. Only fill \"extracted\" fields you can confidently pull "
-        "from the command text itself — leave blank/0 if not mentioned."
+        "For \"url\": pull out any website/domain, Instagram handle (with or without @, or as instagram.com/name), "
+        "or bare business name/username mentioned in the command text itself (e.g. 'sohscape.com', 'https://...', "
+        "'www.foo.in', '@skyweds_events', 'instagram.com/skyweds_events', or a bare handle-like name such as "
+        "'skyweds_events') — this is the ONLY way the system learns what business to look up or research when the "
+        "command comes from a single free-text box with no separate url field. Only fill \"extracted\" fields you "
+        "can confidently pull from the command text itself — leave blank/0 if not mentioned."
     )
     resp = await asyncio.to_thread(
         client.chat.completions.create,
@@ -9933,24 +9966,34 @@ async def command_center(request: CommandRequest):
                 result = {"success": True, **parsed}
 
         elif intent == "hashtag_generation":
-            _ctx, _grounded = await _command_memory_context(url, industry, city, text_cmd)
+            _ctxr = await _command_memory_context(url, industry, city, text_cmd)
+            _ctx, _grounded, _researched = _ctxr["context"], _ctxr["grounded_in_business_data"], _ctxr["research_used"]
             # Confirmed live: with zero real signal, GPT will still invent a
             # specific (and often unrelated) business vertical — e.g. a
             # digital marketing agency's script came back about "wellness"
-            # and "eco-friendly spaces". Grounded=False alone isn't enough;
-            # the content itself must stay industry-agnostic rather than
-            # guessing a category.
+            # and "eco-friendly spaces". Only guard against this when there's
+            # truly no signal at all — when real public research WAS found,
+            # GPT should use it, not stay artificially generic.
             _no_signal_guard = (
                 "\nIMPORTANT — NO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent a specific business "
                 "category (wellness, fitness, food, fashion, etc.) that isn't explicitly stated in the context. "
                 "Keep hashtags/captions in GENERIC business-growth/marketing language instead of guessing an "
                 "industry. Use the business name from the context if present, but never fabricate what the "
                 "business actually does.\n"
-            ) if not _grounded else ""
+            ) if not _grounded and not _researched else ""
+            # Confirmed live: without this, only the "niche" bucket picked up
+            # the researched theme (e.g. "events") while "broad" stayed
+            # completely generic ("#BusinessGrowth") — every bucket must
+            # reflect what the research actually found.
+            _research_note_for_prompt = (
+                "\nNOTE: The context above includes REAL public research findings about this business — ground ALL "
+                "hashtag categories (broad, niche, AND local) and the captions in what this business actually does, "
+                "not just the niche category.\n"
+            ) if _researched else ""
             prompt = (
                 "Generate social media hashtags and captions for this business.\n\n"
                 f"CONTEXT:\n{_ctx}\n"
-                f"{_no_signal_guard}\n"
+                f"{_no_signal_guard}{_research_note_for_prompt}\n"
                 'Return ONLY JSON: {"hashtags": {"broad": ["...","...","...","...","..."], '
                 '"niche": ["...","...","...","...","..."], "local": ["...","...","...","...","..."]}, '
                 '"captions": ["...","...","..."]}\n'
@@ -9965,23 +10008,31 @@ async def command_center(request: CommandRequest):
             )
             parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
             parsed["grounded_in_business_data"] = _grounded
-            if not _grounded:
+            parsed["research_used"] = _researched
+            if _researched:
+                parsed["note"] = f"Generated from public research on {_ctxr['identifier']} — for deeper analysis, run Marketing Brain."
+            elif not _grounded:
                 parsed["note"] = "Generated from generic business/industry context — no deeper analysis on file. Run Marketing Brain first for hashtags tailored to your real positioning."
             result = {"success": True, **parsed}
 
         elif intent == "ad_script_writing":
-            _ctx, _grounded = await _command_memory_context(url, industry, city, text_cmd)
+            _ctxr = await _command_memory_context(url, industry, city, text_cmd)
+            _ctx, _grounded, _researched = _ctxr["context"], _ctxr["grounded_in_business_data"], _ctxr["research_used"]
             _no_signal_guard = (
                 "\nIMPORTANT — NO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent a specific business "
                 "category (wellness, fitness, food, fashion, etc.) that isn't explicitly stated in the context. "
                 "Write a GENERIC 'grow your business' style script instead of guessing an industry — focus on "
                 "generic outcomes like leads/customers/results, not an invented niche. Use the business name from "
                 "the context if present, but never fabricate what the business actually does.\n"
-            ) if not _grounded else ""
+            ) if not _grounded and not _researched else ""
+            _research_note_for_prompt = (
+                "\nNOTE: The context above includes REAL public research findings about this business — ground the "
+                "hook/body/CTA in what this business actually does, per that research.\n"
+            ) if _researched else ""
             prompt = (
                 "Write a short-form vertical video ad script (Reel/Short/TikTok style) for this business.\n\n"
                 f"CONTEXT:\n{_ctx}\n"
-                f"{_no_signal_guard}\n"
+                f"{_no_signal_guard}{_research_note_for_prompt}\n"
                 'Return ONLY JSON: {"hook": "first 2-3 seconds — must stop the scroll, specific not generic", '
                 '"body": ["beat 1", "beat 2", "beat 3"], "cta": "final on-screen call to action line", '
                 '"format_suggestion": "e.g. 15-30s Reel, talking-head or product demo, with a one-line visual note"}'
@@ -9992,7 +10043,10 @@ async def command_center(request: CommandRequest):
             )
             parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
             parsed["grounded_in_business_data"] = _grounded
-            if not _grounded:
+            parsed["research_used"] = _researched
+            if _researched:
+                parsed["note"] = f"Generated from public research on {_ctxr['identifier']} — for deeper analysis, run Marketing Brain."
+            elif not _grounded:
                 parsed["note"] = "Generated from generic business/industry context — no deeper analysis on file. Run Marketing Brain first for a script tailored to your real positioning."
             result = {"success": True, **parsed}
 
