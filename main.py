@@ -9685,6 +9685,34 @@ _COMMAND_INTENTS = (
 
 _IG_HANDLE_RE = re.compile(r'instagram\.com/([A-Za-z0-9_.]+)', re.I)
 
+# Category/filler words in a handle (e.g. "skyweds_events") that are too
+# generic to prove identity on their own — "events" alone appearing in a
+# research snippet doesn't mean the snippet is about THIS events business.
+_GENERIC_HANDLE_WORDS = {
+    "events", "event", "official", "studio", "studios", "agency", "agencies",
+    "group", "company", "india", "team", "media", "digital", "online",
+    "shop", "store", "brand", "brands", "collective", "creative", "creatives",
+}
+
+
+def _command_research_identity_verified(handle: str, snippet: str) -> bool:
+    """
+    Deterministic identity guard for the Tavily research step below — reuses
+    the exact discipline already proven in the Social Intelligence Engine
+    (_sie_name_appears_in_snippet: does the business's own name actually
+    appear in the research snippet, rather than trusting a topically-
+    plausible result). Confirmed live: researching Instagram handle
+    "skyweds_events" (a real Jaipur wedding planner) instead confidently
+    matched an unrelated Oklahoma City venue — worse than a generic
+    fallback, because it was specifically WRONG. That snippet legitimately
+    mentioned "events" (a generic category word baked into the handle
+    itself), which is why generic words are stripped out here first — only
+    the distinctive brand token(s) count as proof of identity.
+    """
+    tokens = [w for w in re.findall(r"[a-zA-Z]+", handle) if len(w) >= 4 and w.lower() not in _GENERIC_HANDLE_WORDS]
+    distinctive = " ".join(tokens) if tokens else handle
+    return _sie_name_appears_in_snippet(distinctive, snippet)
+
 
 async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> dict:
     """Pull real business context for the lightweight content-generation
@@ -9721,12 +9749,21 @@ async def _command_memory_context(url: str, industry: str, city: str, text_cmd: 
     if identifier and TAVILY_API_KEY:
         m = _IG_HANDLE_RE.search(identifier)
         handle = m.group(1) if m else identifier.lstrip("@")
-        research = await _tavily_research(f"{handle} instagram business what is")
+        # Bake any already-known city into the search itself — disambiguates
+        # the wrong business up front rather than relying solely on the
+        # post-hoc identity check below to catch it.
+        query = f"{handle} instagram business what is" + (f" {city}" if city else "")
+        research = await _tavily_research(query)
         if research["used"]:
-            return {
-                "context": f"Business identifier: {handle}\nPublic research found:\n{research['raw'][:1500]}",
-                "grounded_in_business_data": False, "research_used": True, "identifier": handle,
-            }
+            if _command_research_identity_verified(handle, research["raw"]):
+                return {
+                    "context": f"Business identifier: {handle}\nPublic research found:\n{research['raw'][:1500]}",
+                    "grounded_in_business_data": False, "research_used": True, "identifier": handle,
+                }
+            logger.info(
+                f"[COMMAND HASHTAG] discarded research — identity mismatch: input handle {handle!r} not "
+                f"confirmed in the returned snippet (first 150 chars): {research['raw'][:150]!r}"
+            )
 
     return {
         "context": f"Business URL/name: {url or industry or 'not specified'}\nRequest context: {text_cmd}",
