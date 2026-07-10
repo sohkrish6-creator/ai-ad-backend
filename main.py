@@ -9854,13 +9854,109 @@ async def _command_verify_research_aboutness(handle: str, snippet: str) -> str |
         return None
 
 
+_FUZZY_LOOKUP_TABLES = ("business_memory", "social_intel_memory", "creative_studio_memory")
+
+
+def _command_fuzzy_memory_lookup(name: str) -> tuple:
+    """
+    Broader fallback used only by the Command Center's lightweight content-
+    generation intents (hashtags/scripts) — finds existing memory for a bare
+    business name mentioned in natural language (e.g. "sohscape ke liye reel
+    script do"), not just a URL or @handle.
+
+    get_memory_with_city_fallback's own LIKE-prefix fallback only activates
+    when an industry is ALSO given (these commands usually give none) and
+    only scans business_memory — so a business whose real intelligence
+    lives in Social Intelligence Engine or Creative Studio memory instead
+    of Marketing Brain's business_memory would never be found there either.
+    Confirmed live: "sohscape ke liye reel script do" and "skyweds ke liye
+    ... script chahiye" both fell through to the fully generic fallback
+    despite real stored memory existing for both — Sohscape in
+    business_memory (business_key "sohscape.com"), Skyweds in
+    social_intel_memory — one prefix/substring match away from a bare name.
+    Returns (memory_dict, matched_key) from get_memory(), or ({}, "") if
+    nothing matched in any of the three tables.
+    """
+    token = (name or "").strip().lower()
+    if not token or len(token) < 3:
+        return {}, ""
+    for table in _FUZZY_LOOKUP_TABLES:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(f"SELECT business_key FROM {table} WHERE LOWER(business_key) LIKE :p ORDER BY updated_at DESC LIMIT 1"),
+                    {"p": f"%{token}%"},
+                ).first()
+            if row:
+                found_key = row[0]
+                mem = get_memory(found_key)
+                if mem:
+                    logger.info(f"[COMMAND MEMORY] fuzzy match: {name!r} -> {found_key!r} (via {table})")
+                    return mem, found_key
+        except Exception as _e:
+            logger.warning(f"[COMMAND MEMORY] fuzzy lookup against {table} failed: {_e}")
+    return {}, ""
+
+
+def _memory_to_command_context(mem: dict) -> str | None:
+    """
+    Normalizes stored memory from ANY of the 3 sources the Command Center's
+    content-generation intents should check — Marketing Brain's
+    business_memory, Social Intelligence Engine's social_intel_memory,
+    Creative Studio's creative_studio_memory — into one context string for
+    the generation prompt. Each module stores its findings under a
+    different schema, so this tries them in order of richness and stops at
+    the first one with real content. Returns None if nothing usable was
+    found in any of them.
+    """
+    parts = []
+    bm = (mem or {}).get("business", {}) or {}
+    if _has_real_business_dna(bm):
+        if bm.get("business_name"): parts.append(f"Business: {bm['business_name']}")
+        if bm.get("industry"):      parts.append(f"Industry: {bm['industry']}")
+        if bm.get("positioning"):   parts.append(f"Positioning: {bm['positioning']}")
+        if bm.get("uvp"):           parts.append(f"UVP: {bm['uvp']}")
+
+    if not parts:
+        sie = (mem or {}).get("social_intel", {}) or {}
+        sie_data = sie.get("data", {}) or {}
+        if isinstance(sie_data, str):
+            try: sie_data = json.loads(sie_data)
+            except Exception: sie_data = {}
+        bs = sie_data.get("business_summary", {}) or {}
+        if bs.get("positioning") or bs.get("industry"):
+            if bs.get("business_name"): parts.append(f"Business: {bs['business_name']}")
+            if bs.get("industry"):      parts.append(f"Industry: {bs['industry']}")
+            if bs.get("positioning"):   parts.append(f"Positioning: {bs['positioning']}")
+
+    if not parts:
+        cs = (mem or {}).get("creative_studio", {}) or {}
+        cs_data = cs.get("data", {}) or {}
+        if isinstance(cs_data, str):
+            try: cs_data = json.loads(cs_data)
+            except Exception: cs_data = {}
+        intel_applied = (cs_data.get("intelligence_applied") or "").strip()
+        if intel_applied and not _detect_consistency_contradiction(True, intel_applied):
+            parts.append(f"Prior creative intelligence: {intel_applied}")
+
+    if not parts:
+        return None
+
+    am = (mem or {}).get("audience", {}) or {}
+    if am.get("segments"):
+        parts.append(f"Audience segments: {json.dumps(am['segments'], ensure_ascii=False)[:400]}")
+    return "\n".join(parts)
+
+
 async def _command_memory_context(url: str, industry: str, city: str, text_cmd: str) -> dict:
     """Pull real business context for the lightweight content-generation
     intents (hashtags/captions/scripts), trying progressively lighter
     sources so the output is never MORE generic than the real signal
     available warrants:
-      1. Stored Marketing Brain memory (business_dna/positioning/uvp) — the
-         strongest signal.
+      1. Stored memory — Marketing Brain, Social Intelligence Engine, or
+         Creative Studio (checked via the exact/legacy key first, then a
+         broader fuzzy lookup across all three — see
+         _command_fuzzy_memory_lookup) — the strongest signal.
       2. A live Tavily search on the given identifier (Instagram handle,
          business name, or URL) to find out what the business actually
          does. Confirmed live: without this tier, "hashtags for
@@ -9871,18 +9967,17 @@ async def _command_memory_context(url: str, industry: str, city: str, text_cmd: 
     Returns {"context": str, "grounded_in_business_data": bool,
     "research_used": bool, "identifier": str|None}."""
     if url or industry:
-        mem, _ = get_memory_with_city_fallback(url or industry, industry, city)
-        bm = (mem or {}).get("business", {}) or {}
-        if _has_real_business_dna(bm):
-            parts = [f"Business: {bm.get('business_name') or url or industry}"]
-            if bm.get("industry"):    parts.append(f"Industry: {bm['industry']}")
-            if bm.get("positioning"): parts.append(f"Positioning: {bm['positioning']}")
-            if bm.get("uvp"):         parts.append(f"UVP: {bm['uvp']}")
-            am = (mem or {}).get("audience", {}) or {}
-            if am.get("segments"):    parts.append(f"Audience segments: {json.dumps(am['segments'], ensure_ascii=False)[:400]}")
+        lookup_name = url or industry
+        mem, _ = get_memory_with_city_fallback(lookup_name, industry, city)
+        context_str = _memory_to_command_context(mem)
+        if not context_str:
+            fuzzy_mem, _ = _command_fuzzy_memory_lookup(lookup_name)
+            if fuzzy_mem:
+                context_str = _memory_to_command_context(fuzzy_mem)
+        if context_str:
             return {
-                "context": "\n".join(parts), "grounded_in_business_data": True,
-                "research_used": False, "identifier": bm.get("business_name") or url or industry,
+                "context": context_str, "grounded_in_business_data": True,
+                "research_used": False, "identifier": lookup_name,
             }
 
     identifier = (url or industry or "").strip()
