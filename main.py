@@ -2530,14 +2530,35 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     full_text = _clean_banned_words(resp.choices[0].message.content.strip())
 
     def extract_kit(text, start_marker, end_marker=None):
-        start = text.find(start_marker)
+        # Exact literal match first — the fast, deterministic path when GPT
+        # follows the "=== X ===" instruction exactly (the common case).
+        def _find(marker, from_idx=0):
+            idx = text.find(marker, from_idx)
+            if idx != -1:
+                return idx, idx + len(marker)
+            # Fallback: GPT occasionally drifts off the exact "=== X ==="
+            # format (e.g. "### X" or "**X**"). Without this, the whole kit
+            # silently collapses into one mislabeled section — meta_kit ends
+            # up holding the entire raw text, google_kit ends up empty/wrong,
+            # and _extract_campaign_kit_assets finds zero keywords/headlines
+            # to push to Google Ads (confirmed live: a real PAUSED campaign
+            # got created with 0 keywords and no ad because of exactly this).
+            # Match the marker's core text loosely regardless of the
+            # surrounding decoration — same tolerance Marketing Brain's own
+            # section splitter (_header_pattern) already uses.
+            core = re.escape(marker.strip("= \n"))
+            m = re.search(r'^[#=\*\s\-]*' + core + r'[#=\*\s\-]*$', text[from_idx:], re.I | re.M)
+            if m:
+                return from_idx + m.start(), from_idx + m.end()
+            return -1, -1
+
+        start, start_end = _find(start_marker)
         if start == -1:
             return text
-        start += len(start_marker)
         if end_marker:
-            end = text.find(end_marker, start)
-            return text[start:end].strip() if end != -1 else text[start:].strip()
-        return text[start:].strip()
+            end, _ = _find(end_marker, start_end)
+            return text[start_end:end].strip() if end != -1 else text[start_end:].strip()
+        return text[start_end:].strip()
 
     meta_kit        = extract_kit(full_text, "=== META ADS LAUNCH KIT ===",   "=== GOOGLE ADS LAUNCH KIT ===")
     google_kit      = extract_kit(full_text, "=== GOOGLE ADS LAUNCH KIT ===", "=== REMARKETING KIT ===")
