@@ -13904,6 +13904,34 @@ def _mi_build_decade_queries(company_input: str, founding_year: int | None) -> d
     return base
 
 
+async def _mi_fetch_wikipedia(company_name: str) -> str:
+    """Fetch Wikipedia article extract for company_name via the public REST API.
+    Returns plain-text extract (up to 5000 chars), empty string on failure."""
+    try:
+        title = company_name.replace(" ", "_")
+        url = f"https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "prop": "extracts",
+            "titles": title,
+            "exintro": False,  # full article, not just intro
+            "explaintext": True,
+            "format": "json",
+            "redirects": 1,
+        }
+        async with httpx.AsyncClient(timeout=12) as c:
+            resp = await c.get(url, params=params)
+            data = resp.json()
+            pages = data.get("query", {}).get("pages", {})
+            for page in pages.values():
+                extract = page.get("extract", "")
+                if extract and not page.get("missing"):
+                    return extract[:5000]
+        return ""
+    except Exception:
+        return ""
+
+
 async def _mi_research_company(company_input: str) -> dict:
     """
     Two-phase deep research:
@@ -14000,16 +14028,16 @@ async def _mi_research_company(company_input: str) -> dict:
     )
 
     keys_p2 = list(phase2_qs.keys())
-    # For decade_full_history, target Wikipedia for comprehensive timeline data
-    wiki_domains = ["en.wikipedia.org", "britannica.com"]
-    tasks_p2 = [
-        fetch_tavily(phase2_qs[k], include_domains=wiki_domains if k == "decade_full_history" else None)
-        for k in keys_p2
-    ]
+    tasks_p2 = [fetch_tavily(phase2_qs[k]) for k in keys_p2]
+    # Also fetch Wikipedia article directly — much richer timeline data than snippets
+    tasks_p2.append(_mi_fetch_wikipedia(company_name))
+
     results_p2 = await asyncio.gather(*tasks_p2, return_exceptions=True)
     for i, k in enumerate(keys_p2):
         val = results_p2[i]
         research[k + "_raw"] = val if isinstance(val, str) else ""
+    wiki_val = results_p2[len(keys_p2)]
+    research["wikipedia_raw"] = wiki_val if isinstance(wiki_val, str) else ""
 
     return research
 
@@ -14041,10 +14069,11 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
     )
     user_msg = (
         f"Company: {company_name}\n\n"
-        f"=== OVERVIEW ===\n{cap('overview_raw', 900)}\n\n"
-        f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 900)}\n\n"
-        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 900)}\n\n"
-        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:7000]}\n\n"
+        f"=== WIKIPEDIA ARTICLE (primary source — extract year-anchored facts from here) ===\n{cap('wikipedia_raw', 4000)}\n\n"
+        f"=== OVERVIEW ===\n{cap('overview_raw', 700)}\n\n"
+        f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 700)}\n\n"
+        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 700)}\n\n"
+        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:4000]}\n\n"
         f"=== REVENUE / FINANCIAL HISTORY ===\n{cap('revenue_raw', 900)}\n{cap('revenue2_raw', 900)}\n\n"
         f"=== UNIQUE STORIES & ANECDOTES ===\n{cap('stories_raw', 900)}\n{cap('stories2_raw', 900)}\n\n"
         f"=== NEWS / RECENT ===\n{cap('news_raw', 700)}\n\n"
@@ -14085,7 +14114,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "3. For ICONIC CAMPAIGNS: any named mascot/campaign/tagline with a known launch year "
         "gets its OWN dedicated entry. Name the campaign explicitly in the milestone field.\n"
         "4. Each entry MUST have a data_source indicating which block it came from "
-        "(e.g. 'full history research', 'decade 1960s research', 'iconic-ads research').\n"
+        "(e.g. 'Wikipedia', 'decade 1960s research', 'iconic-ads research', 'timeline research').\n"
         "5. Sort chronologically, oldest first.\n"
         "6. Honesty: if the research only yields 2 evidenced facts, return 2 — never fabricate.\n\n"
         "RULES FOR REVENUE TIMELINE:\n"
