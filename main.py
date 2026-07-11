@@ -14158,7 +14158,6 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "2. Do NOT include generic corporate facts (e.g. 'was founded in X' is not a unique story).\n"
         "3. If nothing genuinely interesting is found, return unique_stories as []."
     )
-    _raw_ov = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14171,16 +14170,12 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
             temperature=0.2,
             max_tokens=5000,
         )
-        _raw_ov = resp.choices[0].message.content or ""
-        logger.info(f"[MI] overview raw (first 300c): {_raw_ov[:300]}")
-        parsed = json.loads(_raw_ov)
-        if not parsed:
-            logger.warning("[MI] overview/dna/timeline GPT returned empty JSON {}")
-            return {"_dbg_overview_empty": True, "_dbg_overview_raw": _raw_ov[:300]}
-        return parsed
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as _e:
+        if "insufficient_quota" in str(_e):
+            raise
         logger.error(f"[MI] overview/dna/timeline section failed: {type(_e).__name__}: {_e}")
-        return {"_dbg_overview_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_overview_raw": _raw_ov[:300]}
+        return {}
 
 
 async def _mi_sections_audience_channels_ads(company_name: str, research: dict) -> dict:
@@ -14234,16 +14229,12 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
             temperature=0.2,
             max_tokens=2000,
         )
-        _raw_aud = resp.choices[0].message.content or ""
-        logger.info(f"[MI] audience raw (first 300c): {_raw_aud[:300]}")
-        parsed = json.loads(_raw_aud)
-        if not parsed:
-            logger.warning("[MI] audience/channels/ads GPT returned empty JSON {}")
-            return {"_dbg_audience_empty": True, "_dbg_audience_raw": _raw_aud[:300]}
-        return parsed
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as _e:
+        if "insufficient_quota" in str(_e):
+            raise
         logger.error(f"[MI] audience/channels/ads section failed: {type(_e).__name__}: {_e}")
-        return {"_dbg_audience_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_audience_raw": _raw_aud[:300]}
+        return {}
 
 
 async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research: dict) -> dict:
@@ -14289,7 +14280,6 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         '"referral_program": "observed / not confirmed", '
         '"confidence": 60, "evidence": "...", "data_source": "..."}}'
     )
-    _raw_seo = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14302,16 +14292,12 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
             temperature=0.2,
             max_tokens=2000,
         )
-        _raw_seo = resp.choices[0].message.content or ""
-        logger.info(f"[MI] seo raw (first 300c): {_raw_seo[:300]}")
-        parsed = json.loads(_raw_seo)
-        if not parsed:
-            logger.warning("[MI] seo/creatives/offers/funnels GPT returned empty JSON {}")
-            return {"_dbg_seo_empty": True, "_dbg_seo_raw": _raw_seo[:300]}
-        return parsed
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as _e:
+        if "insufficient_quota" in str(_e):
+            raise
         logger.error(f"[MI] seo/creatives/offers/funnels section failed: {type(_e).__name__}: {_e}")
-        return {"_dbg_seo_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_seo_raw": _raw_seo[:300]}
+        return {}
 
 
 async def _mi_sections_competitors_swot_lessons(company_name: str, research: dict) -> dict:
@@ -14371,7 +14357,6 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         f"[MI] competitors/swot/lessons: competitor_data={comp_data_len}c "
         f"news={news_data_len}c controversy={controversy_len}c"
     )
-    _raw_comp = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14384,20 +14369,17 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
             temperature=0.3,
             max_tokens=2500,
         )
-        _raw_comp = resp.choices[0].message.content or ""
-        logger.info(f"[MI] competitors raw (first 300c): {_raw_comp[:300]}")
-        result = json.loads(_raw_comp)
-        if not result:
-            logger.warning("[MI] competitors/swot/lessons GPT returned empty JSON {}")
-            return {"_dbg_comp_empty": True, "_dbg_comp_raw": _raw_comp[:300]}
+        result = json.loads(resp.choices[0].message.content or "{}")
         n_comp = len(result.get("competitors") or [])
         n_swot_s = len((result.get("swot") or {}).get("strengths") or [])
         n_lessons = len(result.get("lessons") or [])
         logger.info(f"[MI] competitors/swot/lessons output: competitors={n_comp} swot_strengths={n_swot_s} lessons={n_lessons}")
         return result
     except Exception as _e:
+        if "insufficient_quota" in str(_e):
+            raise
         logger.error(f"[MI] competitors/swot/lessons section failed: {type(_e).__name__}: {_e}")
-        return {"_dbg_comp_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_comp_raw": _raw_comp[:300]}
+        return {}
 
 
 async def _mi_apply_to_business(
@@ -14540,8 +14522,11 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
 
     def _safe(result, label: str) -> dict:
         if isinstance(result, Exception):
+            err_str = str(result)
+            if "insufficient_quota" in err_str:
+                return {"_quota_exceeded": True}
             logger.error(f"[MI] Section '{label}' raised: {type(result).__name__}: {result}")
-            return {"_section_error": f"{label}: {type(result).__name__}: {str(result)[:200]}"}
+            return {}
         if not isinstance(result, dict):
             logger.warning(f"[MI] Section '{label}' returned non-dict: {type(result)}")
             return {}
@@ -14554,6 +14539,16 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     s_seo_creatives_offers   = _safe(section_results[2], "seo_creatives_offers_funnels")
     s_competitors_swot       = _safe(section_results[3], "competitors_swot_lessons")
     s_social                 = _safe(section_results[4], "social")
+
+    # Detect quota exhaustion — if any section hit it, return a clear error immediately
+    if any(d.get("_quota_exceeded") for d in [s_overview_dna_timeline, s_audience_channels_ads,
+                                               s_seo_creatives_offers, s_competitors_swot]):
+        logger.error("[MI] OpenAI quota exhausted — returning error to client")
+        return {
+            "success": False,
+            "company_name": company_name,
+            "error": "OpenAI quota exhausted. Please top up your account at platform.openai.com/account/billing to continue using Marketing Intelligence.",
+        }
 
     # ── Step 4: Assemble flat sections dict ─────────────────────────────────
     sections: dict = {}
@@ -14592,18 +14587,9 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     except Exception as _e:
         logger.warning(f"[MI] log_activity failed (non-fatal): {_e}")
 
-    # Collect section debug info — includes both old _section_error and new _dbg_* keys
-    dbg_keys = {"_section_error", "_dbg_overview_error", "_dbg_audience_error", "_dbg_seo_error", "_dbg_comp_error",
-                 "_dbg_overview_raw", "_dbg_audience_raw", "_dbg_seo_raw", "_dbg_comp_raw"}
-    section_debug = {
-        k: v for d in [s_overview_dna_timeline, s_audience_channels_ads,
-                        s_seo_creatives_offers, s_competitors_swot]
-        for k, v in d.items() if k in dbg_keys
-    }
     return {
         "success":       True,
         "company_name":  company_name,
         "company_input": company_input,
         "sections":      sections,
-        **({"_section_debug": section_debug} if section_debug else {}),
     }
