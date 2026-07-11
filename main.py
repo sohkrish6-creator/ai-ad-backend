@@ -967,18 +967,21 @@ async def fetch_firecrawl(url: str) -> str:
     except Exception:
         return ""
 
-async def fetch_tavily(query: str) -> str:
+async def fetch_tavily(query: str, include_domains: list | None = None) -> str:
     try:
+        payload: dict = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "advanced",
+            "max_results": 5,
+        }
+        if include_domains:
+            payload["include_domains"] = include_domains
         async with httpx.AsyncClient(timeout=10) as c:
             resp = await c.post(
                 "https://api.tavily.com/search",
                 headers={"Content-Type": "application/json"},
-                json={
-                    "api_key": TAVILY_API_KEY,
-                    "query": query,
-                    "search_depth": "advanced",
-                    "max_results": 5,
-                },
+                json=payload,
             )
             data = resp.json()
             snippets = [r.get("content", "") for r in data.get("results", []) if r.get("content")]
@@ -13997,10 +14000,13 @@ async def _mi_research_company(company_input: str) -> dict:
     )
 
     keys_p2 = list(phase2_qs.keys())
-    results_p2 = await asyncio.gather(
-        *[fetch_tavily(phase2_qs[k]) for k in keys_p2],
-        return_exceptions=True,
-    )
+    # For decade_full_history, target Wikipedia for comprehensive timeline data
+    wiki_domains = ["en.wikipedia.org", "britannica.com"]
+    tasks_p2 = [
+        fetch_tavily(phase2_qs[k], include_domains=wiki_domains if k == "decade_full_history" else None)
+        for k in keys_p2
+    ]
+    results_p2 = await asyncio.gather(*tasks_p2, return_exceptions=True)
     for i, k in enumerate(keys_p2):
         val = results_p2[i]
         research[k + "_raw"] = val if isinstance(val, str) else ""
