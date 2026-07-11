@@ -14020,7 +14020,9 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
     decade_blocks: list[str] = []
     for k in sorted(research.keys()):
         if k.startswith("decade_") and k.endswith("_raw"):
-            txt = (research.get(k) or "")[:1000]   # 1000 chars per block (was 700)
+            # full_history gets more space since it's the primary comprehensive source
+            cap_n = 2000 if "full_history" in k else 1200
+            txt = (research.get(k) or "")[:cap_n]
             if txt.strip():
                 era = k.replace("decade_", "").replace("_raw", "").replace("_", " ")
                 decade_blocks.append(f"--- {era} ---\n{txt}")
@@ -14036,7 +14038,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         f"=== OVERVIEW ===\n{cap('overview_raw', 900)}\n\n"
         f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 900)}\n\n"
         f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 900)}\n\n"
-        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:3000]}\n\n"
+        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:7000]}\n\n"
         f"=== REVENUE / FINANCIAL HISTORY ===\n{cap('revenue_raw', 900)}\n{cap('revenue2_raw', 900)}\n\n"
         f"=== UNIQUE STORIES & ANECDOTES ===\n{cap('stories_raw', 900)}\n{cap('stories2_raw', 900)}\n\n"
         f"=== NEWS / RECENT ===\n{cap('news_raw', 700)}\n\n"
@@ -14102,7 +14104,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
-            max_tokens=4000,
+            max_tokens=5000,
         )
         return json.loads(resp.choices[0].message.content)
     except Exception as _e:
