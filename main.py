@@ -13877,21 +13877,28 @@ def _mi_build_decade_queries(company_input: str, founding_year: int | None) -> d
     Returns dict of {key: query_string} — keys become decade_{year}_raw in research.
     """
     current_year = 2025
+    # Always include a comprehensive history query (Wikipedia-style summaries surface here)
+    base = {
+        "decade_full_history": (
+            f"{company_input} complete history timeline founded story major events milestones"
+        ),
+    }
     if not founding_year or not (1800 <= founding_year <= current_year):
-        return {
-            "decade_recent": f"{company_input} history milestones growth campaigns 2000s 2010s 2020s",
-        }
+        base["decade_recent"] = (
+            f"{company_input} company events story 2000s 2010s 2020s history"
+        )
+        return base
     start = (founding_year // 10) * 10
-    queries: dict = {}
     d = start
     while d <= current_year:
         d2 = d + 10
         label = f"{d}s {d2}s" if d2 <= current_year else f"{d}s"
-        queries[f"decade_{d}"] = (
-            f"{company_input} history milestones campaigns growth {label}"
+        # Focus on "events story" rather than "campaigns growth" — surfaces historical facts
+        base[f"decade_{d}"] = (
+            f"{company_input} {label} company events story history what happened"
         )
         d += 20  # pair decades so ≤5 queries for an 80-yr company
-    return queries
+    return base
 
 
 async def _mi_research_company(company_input: str) -> dict:
@@ -14009,14 +14016,14 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
     def cap(key: str, n: int = 1000) -> str:
         return (research.get(key) or "")[:n]
 
-    # Collect decade blocks — each decade key is "decade_{year}_raw"
+    # Collect decade blocks — each decade key is "decade_{year}_raw" or "decade_full_history_raw"
     decade_blocks: list[str] = []
     for k in sorted(research.keys()):
         if k.startswith("decade_") and k.endswith("_raw"):
-            txt = (research.get(k) or "")[:700]
+            txt = (research.get(k) or "")[:1000]   # 1000 chars per block (was 700)
             if txt.strip():
-                era = k.replace("decade_", "").replace("_raw", "")
-                decade_blocks.append(f"--- {era}s ---\n{txt}")
+                era = k.replace("decade_", "").replace("_raw", "").replace("_", " ")
+                decade_blocks.append(f"--- {era} ---\n{txt}")
     decade_combined = "\n\n".join(decade_blocks) if decade_blocks else "(no decade research)"
 
     system_msg = (
@@ -14062,14 +14069,17 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         '  ]\n'
         "}\n\n"
         "RULES FOR TIMELINE (read carefully):\n"
-        "1. Extract milestones from ALL research blocks above — decade-by-decade blocks are the primary source.\n"
-        "2. Return UP TO 15 real milestones. Do NOT cap at 5. Do NOT pad with invented ones.\n"
-        "3. For ICONIC CAMPAIGNS: if any named mascot/campaign/tagline with a known launch year is mentioned "
-        "(e.g. 'Amul Girl', 'Just Do It', a mascot, a long-running slogan) — include it as its OWN timeline "
-        "entry with that exact year. Name it explicitly in milestone. Do not merge it into 'brand consistency'.\n"
-        "4. Each entry MUST have a data_source that indicates WHICH research block it came from "
-        "(e.g. 'decade 1960s research', 'iconic-ads research', 'overview research').\n"
-        "5. Sort chronologically, oldest first.\n\n"
+        "1. Read EVERY research block carefully. ANY fact with a specific year is a valid milestone — "
+        "product launches, leadership events, campaign launches, awards, operational expansions, "
+        "government programs, partnerships, revenue milestones, controversies, pivots. Be inclusive.\n"
+        "2. Return ALL year-anchored facts found across ALL research blocks. Aim for 6–15 entries. "
+        "Do NOT limit to the most famous ones — extract everything you can verify from the text.\n"
+        "3. For ICONIC CAMPAIGNS: any named mascot/campaign/tagline with a known launch year "
+        "gets its OWN dedicated entry. Name the campaign explicitly in the milestone field.\n"
+        "4. Each entry MUST have a data_source indicating which block it came from "
+        "(e.g. 'full history research', 'decade 1960s research', 'iconic-ads research').\n"
+        "5. Sort chronologically, oldest first.\n"
+        "6. Honesty: if the research only yields 2 evidenced facts, return 2 — never fabricate.\n\n"
         "RULES FOR REVENUE TIMELINE:\n"
         "1. ONLY include years/periods where a specific revenue figure appears verbatim in the research.\n"
         "2. Do NOT interpolate, estimate, or fill gaps. If only FY2020 and FY2025 have real numbers, "
