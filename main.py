@@ -14527,4 +14527,11 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
         "company_name":  company_name,
         "company_input": company_input,
         "sections":      sections,
+        "_debug": {
+            "wikipedia_raw_len": len(research.get("wikipedia_raw") or ""),
+            "timeline_raw_len":  len(research.get("timeline_raw") or ""),
+            "iconic_ads_raw_len": len(research.get("iconic_ads_raw") or ""),
+            "decade_keys": [k for k in research if k.startswith("decade_") and k.endswith("_raw")],
+            "wikipedia_snippet": (research.get("wikipedia_raw") or "")[:200],
+        },
     }
