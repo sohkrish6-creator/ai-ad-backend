@@ -12241,16 +12241,16 @@ async def _sie_social_observed_step(business_name: str, platforms: dict, city: s
             "that platform as NOT_VERIFIED and do not use any of that snippet's numbers, even if they look "
             "real — a real number about the WRONG business is not this business's data.\n\n"
             f"{combined}\n\n"
-            "Return ONLY JSON with this exact structure:\n"
-            "{\n"
-            '  "instagram": {"approx_followers": "as mentioned in research, or null", "activity_level": "...", '
-            '"content_themes": ["...","..."], "notable_mentions": "...", "source_snippet": "...", '
-            '"data_label": "OBSERVED or NOT_VERIFIED", "note": "..."},\n'
-            '  "facebook": {"approx_followers": "...", "activity_level": "...", "content_themes": ["...","..."], '
-            '"notable_mentions": "...", "source_snippet": "...", "data_label": "...", "note": "..."},\n'
-            '  "linkedin": {"approx_followers": "...", "activity_level": "...", "content_themes": ["...","..."], '
-            '"notable_mentions": "...", "source_snippet": "...", "data_label": "...", "note": "..."}\n'
-            "}"
+            "Return ONLY valid JSON. "
+            "CRITICAL FORMATTING RULE: use null (not '...', not 'N/A', not 'not found') for any string field "
+            "where no real data was found, and [] for array fields with no data. NEVER output '...' as a value.\n"
+            "Schema (fill with real data; start from the NOT_VERIFIED defaults below and upgrade to OBSERVED only when the snippet confirms it):\n"
+            '{"instagram": {"approx_followers": null, "activity_level": null, "content_themes": [], '
+            '"notable_mentions": null, "source_snippet": null, "data_label": "NOT_VERIFIED", "note": ""}, '
+            '"facebook": {"approx_followers": null, "activity_level": null, "content_themes": [], '
+            '"notable_mentions": null, "source_snippet": null, "data_label": "NOT_VERIFIED", "note": ""}, '
+            '"linkedin": {"approx_followers": null, "activity_level": null, "content_themes": [], '
+            '"notable_mentions": null, "source_snippet": null, "data_label": "NOT_VERIFIED", "note": ""}}'
         )
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -12258,6 +12258,17 @@ async def _sie_social_observed_step(business_name: str, platforms: dict, city: s
             response_format={"type": "json_object"}, temperature=0.3, max_tokens=900,
         )
         parsed = json.loads(resp.choices[0].message.content)
+        # Scrub any literal "..." placeholder values the model may have echoed from the schema
+        def _scrub_placeholders(obj):
+            if isinstance(obj, dict):
+                return {k: _scrub_placeholders(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                cleaned = [_scrub_placeholders(i) for i in obj if i != "..."]
+                return cleaned
+            if obj == "...":
+                return None
+            return obj
+        parsed = _scrub_placeholders(parsed)
         for p in targets:
             entry = parsed.get(p) or {}
             entry.setdefault("platform", p)
@@ -13872,6 +13883,10 @@ async def _mi_research_company(company_input: str) -> dict:
         "competitors": f"{company_input} top competitors market share competitive landscape",
         "product":     f"{company_input} products services pricing offers website ecommerce",
         "news":        f"{company_input} news funding revenue growth expansion 2025",
+        # Dedicated targeted queries for sections that need deeper specific research
+        "timeline":    f"{company_input} history milestones marketing campaigns brand evolution key events year",
+        "controversy": f"{company_input} marketing mistakes criticism controversy failed campaigns backlash",
+        "comp2":       f"{company_input} competitors comparison alternatives brands India market rivals",
     }
     keys   = list(queries.keys())
     tasks  = [fetch_tavily(queries[k]) for k in keys]
@@ -13940,6 +13955,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
     user_msg = (
         f"Company: {company_name}\n\n"
         f"=== OVERVIEW RESEARCH ===\n{cap('overview_raw')}\n\n"
+        f"=== MARKETING HISTORY & MILESTONES ===\n{cap('timeline_raw')}\n\n"
         f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
         f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
         f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
@@ -13955,7 +13971,11 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         '"pricing_tier": "budget/mid/premium/luxury or \'not determined\'", '
         '"distribution_model": "...", "confidence": 70, "evidence": "...", "data_source": "..."}, '
         '"timeline": [{"year": "YYYY", "milestone": "...", "significance": "...", '
-        '"evidence": "from research snippet", "confidence": 80}]}'
+        '"evidence": "from research snippet", "confidence": 80}]}\n\n'
+        "IMPORTANT FOR TIMELINE: Extract ALL milestones found across the research above — founding, "
+        "major product launches, famous campaigns, leadership changes, acquisitions, pivots, awards, etc. "
+        "Return 4–10 entries if the research supports it. Do NOT artificially limit to 1 entry. "
+        "Sort chronologically oldest-first."
     )
     try:
         resp = await asyncio.to_thread(
@@ -14101,14 +14121,22 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
         + _MI_HONESTY_RULES + "\n\n"
         "ADDITIONAL RULES:\n"
-        "- Competitors: ONLY include those explicitly found in the research. If only 2 are found, return 2. Do NOT pad to 5.\n"
+        "- Competitors: Extract EVERY named competitor brand found anywhere across ALL research sections below. "
+        "Scan all four research blocks carefully — competitor names often appear in marketing or news sections, "
+        "not only in the dedicated competitor block. Include any brand mentioned as a rival, alternative, or "
+        "comparison. If 2 are found, return 2; if 5 are found, return 5. Do NOT pad, but do NOT miss any.\n"
+        "- Mistakes: Look specifically in the controversy/criticism research block. If ANY public criticism, "
+        "campaign backlash, controversy, or strategic misstep is mentioned, include it with evidence. "
+        "Only return an empty mistakes array if the controversy research is genuinely empty.\n"
         "- Lessons: ONLY include those supported by evidence. Quality over quantity."
     )
     user_msg = (
         f"Company: {company_name}\n\n"
-        f"=== COMPETITOR RESEARCH ===\n{cap('competitor_raw')}\n\n"
+        f"=== COMPETITOR RESEARCH (PRIMARY) ===\n{cap('competitor_raw')}\n\n"
+        f"=== COMPETITOR RESEARCH (SUPPLEMENTARY) ===\n{cap('comp2_raw')}\n\n"
         f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
         f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
+        f"=== CONTROVERSY / CRITICISM / MISTAKES ===\n{cap('controversy_raw')}\n\n"
         "Return JSON matching EXACTLY this schema:\n"
         '{"competitors": [{"name": "...", "positioning": "...", "estimated_strengths": ["..."], '
         '"observable_weakness": "...", "market_share_signal": "not found / rough estimate from research", '
