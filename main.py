@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
 from openai import OpenAI
 import httpx
@@ -38,10 +38,28 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://sohjustbe.com",
+        "https://www.sohjustbe.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def verify_api_key(request: Request, call_next):
+    """Reject requests that don't carry the correct X-API-Key header.
+    Skips OPTIONS (CORS preflight). No-ops when BACKEND_API_KEY is not set (local dev)."""
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    secret = os.getenv("BACKEND_API_KEY", "")
+    if secret:
+        incoming = request.headers.get("X-API-Key", "")
+        if not incoming or not hmac.compare_digest(incoming.encode(), secret.encode()):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")

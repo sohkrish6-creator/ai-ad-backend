@@ -12,5 +12,6 @@ jobs:
       - name: Trigger /optimizer/run-all
         run: |
           curl -X POST https://ai-ad-backend-zhpj.onrender.com/optimizer/run-all \
+            --header "X-API-Key: ${{ secrets.BACKEND_API_KEY }}" \
             --max-time 300 \
             --fail-with-body
