@@ -13905,28 +13905,27 @@ def _mi_build_decade_queries(company_input: str, founding_year: int | None) -> d
 
 
 async def _mi_fetch_wikipedia(company_name: str) -> str:
-    """Fetch Wikipedia article extract for company_name via the public REST API.
-    Returns plain-text extract (up to 5000 chars), empty string on failure."""
+    """Fetch full Wikipedia article text via the public REST API.
+    Returns plain-text extract (up to 9000 chars), empty string on failure."""
     try:
         title = company_name.replace(" ", "_")
-        url = f"https://en.wikipedia.org/w/api.php"
+        # Note: do NOT include exintro param — its mere presence limits to intro only
         params = {
             "action": "query",
             "prop": "extracts",
             "titles": title,
-            "exintro": False,  # full article, not just intro
             "explaintext": True,
             "format": "json",
             "redirects": 1,
         }
         async with httpx.AsyncClient(timeout=12) as c:
-            resp = await c.get(url, params=params)
+            resp = await c.get("https://en.wikipedia.org/w/api.php", params=params)
             data = resp.json()
             pages = data.get("query", {}).get("pages", {})
             for page in pages.values():
                 extract = page.get("extract", "")
                 if extract and not page.get("missing"):
-                    return extract[:5000]
+                    return extract[:9000]
         return ""
     except Exception:
         return ""
@@ -14069,7 +14068,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
     )
     user_msg = (
         f"Company: {company_name}\n\n"
-        f"=== WIKIPEDIA ARTICLE (primary source — extract year-anchored facts from here) ===\n{cap('wikipedia_raw', 4000)}\n\n"
+        f"=== WIKIPEDIA ARTICLE (primary source — extract year-anchored facts from here) ===\n{cap('wikipedia_raw', 7000)}\n\n"
         f"=== OVERVIEW ===\n{cap('overview_raw', 700)}\n\n"
         f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 700)}\n\n"
         f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 700)}\n\n"
