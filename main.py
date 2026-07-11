@@ -13835,3 +13835,499 @@ async def google_ads_dashboard(customer_id: str = ""):
     except Exception as _e:
         logger.error(f"[GADS] /google-ads/dashboard error: {_e}")
         return {"success": False, "error": str(_e)}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MARKETING INTELLIGENCE  — /marketing-intelligence
+# Deep competitive research on ANY company: overview, DNA, audience, channels,
+# ads, SEO, social, creatives, offers, funnels, competitors, SWOT, lessons +
+# optional "apply to my business" comparison section.
+# ════════════════════════════════════════════════════════════════════════════
+
+class MarketingIntelligenceRequest(BaseModel):
+    company_input: str           # name, URL, or @handle
+    compare_to_my_business: dict = {}   # optional {url, industry, city}
+
+
+_MI_HONESTY_RULES = """
+HONESTY RULES — MANDATORY, DO NOT VIOLATE:
+1. Revenue/financials: ONLY quote if explicitly found in the research below. If not found say "not publicly disclosed." NEVER estimate revenue.
+2. Founding date: Only if found in research. If estimating from context clues, label "circa YYYY (estimated)".
+3. Timeline: Include ONLY milestones supported by evidence in the research. Minimum 1, maximum the number actually found. Do NOT invent or pad.
+4. Follower counts, engagement rates: handled in Social section separately — do NOT guess them here.
+5. If research is sparse for any field, say so: "Limited public data available."
+""".strip()
+
+
+async def _mi_research_company(company_input: str) -> dict:
+    """
+    Parallel Tavily research (6 queries) + optional Firecrawl if a URL is
+    detected in company_input. Extracts a clean company_name via a tiny
+    GPT-mini call. Returns a flat research dict with 8 keys.
+    """
+    queries = {
+        "overview":    f"{company_input} company overview founded history CEO employees business model",
+        "marketing":   f"{company_input} marketing strategy brand campaigns advertising 2024 2025",
+        "social":      f"{company_input} Instagram Facebook LinkedIn YouTube followers social media",
+        "competitors": f"{company_input} top competitors market share competitive landscape",
+        "product":     f"{company_input} products services pricing offers website ecommerce",
+        "news":        f"{company_input} news funding revenue growth expansion 2025",
+    }
+    keys   = list(queries.keys())
+    tasks  = [fetch_tavily(queries[k]) for k in keys]
+
+    # Detect URL in input — fetch website content via Firecrawl if found
+    url_match = re.search(r'https?://[^\s]+|(?:www\.)[^\s]+', company_input, re.I)
+    detected_url = url_match.group(0) if url_match else None
+    if detected_url and not detected_url.startswith("http"):
+        detected_url = "https://" + detected_url
+    if detected_url:
+        tasks.append(fetch_firecrawl(detected_url))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    research = {}
+    for i, k in enumerate(keys):
+        val = results[i]
+        research[k + "_raw"] = val if isinstance(val, str) else ""
+
+    # Website content (last result if URL was found)
+    website_content = ""
+    if detected_url:
+        wc = results[len(keys)]
+        if isinstance(wc, str):
+            website_content = wc[:3000]
+    research["website_content"] = website_content
+
+    # Extract clean company_name via GPT mini
+    overview_snippet = research.get("overview_raw", "")[:600]
+    company_name = company_input  # fallback
+    if overview_snippet.strip():
+        try:
+            name_resp = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Extract the company's proper name from the snippet. Return ONLY the company name — no explanation, no punctuation."},
+                    {"role": "user",   "content": f"Input: {company_input}\nSnippet: {overview_snippet}"},
+                ],
+                max_tokens=30,
+                temperature=0.0,
+            )
+            extracted = (name_resp.choices[0].message.content or "").strip().strip('"').strip("'")
+            if extracted:
+                company_name = extracted
+        except Exception as _e:
+            logger.warning(f"[MI] company_name extraction failed: {_e}")
+
+    research["company_name"] = company_name
+    return research
+
+
+async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) -> dict:
+    """
+    GPT-4o call → {overview, business_dna, timeline}
+    Uses: overview_raw, news_raw, website_content, product_raw (capped at 1200 chars each).
+    """
+    def cap(key: str) -> str:
+        return (research.get(key) or "")[:1200]
+
+    system_msg = (
+        "You are a senior business analyst producing structured JSON intelligence reports. "
+        "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
+        + _MI_HONESTY_RULES
+    )
+    user_msg = (
+        f"Company: {company_name}\n\n"
+        f"=== OVERVIEW RESEARCH ===\n{cap('overview_raw')}\n\n"
+        f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
+        f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
+        f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
+        "Return JSON matching EXACTLY this schema:\n"
+        '{"overview": {"company_name": "...", "industry": "...", "founded": "YYYY or \'not found in research\'", '
+        '"headquarters": "...", "business_model": "...", "core_value_proposition": "one sentence", '
+        '"estimated_size": "startup/SMB/mid-market/enterprise", '
+        '"revenue": "if publicly disclosed in research else \'not publicly disclosed\'", '
+        '"key_products_services": ["..."], "confidence": 75, "evidence": "brief source quote", '
+        '"data_source": "Tavily research"}, '
+        '"business_dna": {"brand_positioning": "...", "target_customer_profile": "...", '
+        '"unique_differentiators": ["..."], "brand_voice_tone": "...", '
+        '"pricing_tier": "budget/mid/premium/luxury or \'not determined\'", '
+        '"distribution_model": "...", "confidence": 70, "evidence": "...", "data_source": "..."}, '
+        '"timeline": [{"year": "YYYY", "milestone": "...", "significance": "...", '
+        '"evidence": "from research snippet", "confidence": 80}]}'
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=2500,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.error(f"[MI] overview/dna/timeline section failed: {_e}")
+        return {}
+
+
+async def _mi_sections_audience_channels_ads(company_name: str, research: dict) -> dict:
+    """
+    GPT-4o call → {audience, channels, advertising}
+    Uses: marketing_raw, product_raw, website_content (capped at 1200 chars each).
+    """
+    def cap(key: str) -> str:
+        return (research.get(key) or "")[:1200]
+
+    system_msg = (
+        "You are a senior marketing strategist producing structured JSON intelligence reports. "
+        "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
+        + _MI_HONESTY_RULES
+    )
+    user_msg = (
+        f"Company: {company_name}\n\n"
+        f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
+        f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
+        f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
+        "Return JSON matching EXACTLY this schema:\n"
+        '{"audience": {"primary_demographic": "age/gender/income/location", '
+        '"psychographic_profile": "values, lifestyle, mindset", '
+        '"pain_points_addressed": ["..."], "buying_triggers": ["..."], '
+        '"geography_focus": "...", "data_label": "ESTIMATED from research", '
+        '"confidence": 65, "evidence": "...", "data_source": "..."}, '
+        '"channels": {"primary_channels": [{"name": "Google Ads", "usage": "observed / not confirmed", "role": "..."}], '
+        '"content_strategy": "...", "email_marketing": "observed / not confirmed", '
+        '"offline_presence": "...", "confidence": 65, "evidence": "...", "data_source": "..."}, '
+        '"advertising": {"platforms_observed": ["Meta", "Google"], "ad_formats": ["video", "carousel"], '
+        '"key_messages": ["..."], "cta_patterns": ["..."], '
+        '"estimated_spend": "rough estimate from research or \'not found in available data\'", '
+        '"confidence": 60, "evidence": "...", "data_source": "..."}}'
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=2000,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.error(f"[MI] audience/channels/ads section failed: {_e}")
+        return {}
+
+
+async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research: dict) -> dict:
+    """
+    GPT-4o call → {seo, creatives, offers, funnels}
+    Uses: website_content, product_raw, marketing_raw (capped at 1200 chars each).
+    """
+    def cap(key: str) -> str:
+        return (research.get(key) or "")[:1200]
+
+    seo_disclaimer = (
+        "Domain authority and backlink estimates are rough approximations based on observable signals "
+        "(website structure, content depth, inbound link mentions in search results). "
+        "These are NOT verified SEO tool metrics (Ahrefs/SEMrush/Moz)."
+    )
+
+    system_msg = (
+        "You are a senior digital marketing analyst producing structured JSON intelligence reports. "
+        "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
+        + _MI_HONESTY_RULES
+    )
+    user_msg = (
+        f"Company: {company_name}\n\n"
+        f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
+        f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
+        f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
+        "Return JSON matching EXACTLY this schema:\n"
+        '{"seo": {"website_health_signals": "observed page structure, load indicators, mobile signals", '
+        '"estimated_domain_strength": "low/medium/high (rough estimate, NOT a verified tool metric)", '
+        '"content_strategy": "...", "keyword_themes": ["..."], '
+        '"backlink_quality": "rough estimate based on mentions and partnerships found in research", '
+        '"local_seo": "...", '
+        f'"seo_disclaimer": "{seo_disclaimer}", '
+        '"confidence": 55, "evidence": "...", "data_source": "website content + Tavily research"}, '
+        '"creatives": {"visual_identity": "...", "ad_creative_patterns": ["..."], '
+        '"copywriting_style": "...", "hook_formulas": ["..."], '
+        '"confidence": 60, "evidence": "...", "data_source": "..."}, '
+        '"offers": {"hero_offer": "...", "pricing_signals": "...", "promotions_observed": ["..."], '
+        '"lead_magnets": ["..."], "upsell_signals": "...", '
+        '"confidence": 65, "evidence": "...", "data_source": "..."}, '
+        '"funnels": {"awareness_stage": "...", "consideration_stage": "...", '
+        '"conversion_stage": "...", "retention_signals": "...", '
+        '"referral_program": "observed / not confirmed", '
+        '"confidence": 60, "evidence": "...", "data_source": "..."}}'
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=2000,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.error(f"[MI] seo/creatives/offers/funnels section failed: {_e}")
+        return {}
+
+
+async def _mi_sections_competitors_swot_lessons(company_name: str, research: dict) -> dict:
+    """
+    GPT-4o call → {competitors, swot, lessons, mistakes, future_opportunities}
+    Uses: competitor_raw, marketing_raw, news_raw (capped at 1200 chars each).
+    Competitors returned as LIST for table rendering.
+    Only include competitors / lessons that are actually found in the research.
+    """
+    def cap(key: str) -> str:
+        return (research.get(key) or "")[:1200]
+
+    system_msg = (
+        "You are a senior competitive intelligence analyst producing structured JSON reports. "
+        "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
+        + _MI_HONESTY_RULES + "\n\n"
+        "ADDITIONAL RULES:\n"
+        "- Competitors: ONLY include those explicitly found in the research. If only 2 are found, return 2. Do NOT pad to 5.\n"
+        "- Lessons: ONLY include those supported by evidence. Quality over quantity."
+    )
+    user_msg = (
+        f"Company: {company_name}\n\n"
+        f"=== COMPETITOR RESEARCH ===\n{cap('competitor_raw')}\n\n"
+        f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
+        f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
+        "Return JSON matching EXACTLY this schema:\n"
+        '{"competitors": [{"name": "...", "positioning": "...", "estimated_strengths": ["..."], '
+        '"observable_weakness": "...", "market_share_signal": "not found / rough estimate from research", '
+        '"data_label": "OBSERVED from research"}], '
+        '"swot": {"strengths": ["..."], "weaknesses": ["..."], "opportunities": ["..."], "threats": ["..."]}, '
+        '"lessons": [{"lesson": "...", "evidence": "from research: ...", "applicability": "high/medium/low"}], '
+        '"mistakes": [{"mistake": "...", "evidence": "...", "lesson": "..."}], '
+        '"future_opportunities": [{"opportunity": "...", "rationale": "based on research signal: ...", "confidence": 70}]}'
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=2500,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.error(f"[MI] competitors/swot/lessons section failed: {_e}")
+        return {}
+
+
+async def _mi_apply_to_business(
+    company_name: str,
+    mi_sections: dict,
+    my_business_url: str,
+    my_industry: str,
+    my_city: str,
+) -> dict:
+    """
+    Optional comparison: takes the MI sections and applies them to the user's
+    own business. Pulls from Marketing Brain memory if available. Returns a
+    90-day execution plan with budget and expected results.
+    """
+    # Pull user's stored memory
+    business_key = re.sub(r'[^a-z0-9]', '_', (my_business_url or my_industry or "").lower().strip())
+    memory, _ = get_memory_with_city_fallback(business_key, my_industry, my_city)
+    memory_quality = "none"
+    memory_context = ""
+    if memory and isinstance(memory, dict):
+        strategy_chunk = str(memory.get("strategy", "") or "")[:1200]
+        competitor_chunk = str(memory.get("competitor", "") or "")[:1200]
+        audience_chunk = str(memory.get("audience", "") or "")[:1200]
+        combined_mem = "\n".join(filter(None, [strategy_chunk, competitor_chunk, audience_chunk]))
+        if combined_mem.strip():
+            memory_context = combined_mem
+            memory_quality = "good" if len(combined_mem) > 300 else "partial"
+
+    # Summarise key intelligence from mi_sections for the comparison prompt
+    lessons_list = mi_sections.get("lessons", [])
+    lessons_text = "\n".join(
+        f"- {item.get('lesson', '')} (applicability: {item.get('applicability', '')})"
+        for item in (lessons_list if isinstance(lessons_list, list) else [])
+    )[:1000]
+
+    competitors_list = mi_sections.get("competitors", [])
+    comp_text = "\n".join(
+        f"- {item.get('name', '')}: {item.get('positioning', '')}"
+        for item in (competitors_list if isinstance(competitors_list, list) else [])
+    )[:600]
+
+    swot = mi_sections.get("swot", {})
+    swot_text = json.dumps(swot, ensure_ascii=False)[:600] if swot else ""
+
+    honesty_note = (
+        "HONESTY RULE: If the user's memory has no data (memory_quality = none), clearly state that "
+        "and provide generic applicability only. Do NOT fabricate a comparison if you have no "
+        "information about their business."
+    )
+
+    system_msg = (
+        f"You are a senior marketing strategist. You have studied {company_name} in depth. "
+        "Now apply the most relevant lessons to the user's business. "
+        "Return ONLY valid JSON — no markdown, no explanation.\n\n"
+        + honesty_note
+    )
+    user_msg = (
+        f"TARGET COMPANY STUDIED: {company_name}\n\n"
+        f"=== KEY LESSONS FROM {company_name} ===\n{lessons_text}\n\n"
+        f"=== COMPETITORS FOUND ===\n{comp_text}\n\n"
+        f"=== SWOT ===\n{swot_text}\n\n"
+        f"=== USER BUSINESS MEMORY (memory_quality={memory_quality}) ===\n"
+        + (memory_context if memory_context else "No stored memory found for this business.") + "\n\n"
+        f"User's business URL: {my_business_url or 'not provided'}\n"
+        f"Industry: {my_industry or 'not provided'}\n"
+        f"City: {my_city or 'not provided'}\n\n"
+        "Return JSON with EXACTLY this schema:\n"
+        '{"relevance_score": 75, "relevance_rationale": "...", '
+        f'"memory_used": {"true" if memory_quality != "none" else "false"}, "memory_quality": "{memory_quality}", '
+        '"transferable_strategies": [{"strategy": "...", "what_to_adapt": "...", "priority": "high/medium/low"}], '
+        '"do_not_copy": [{"tactic": "...", "reason": "budget/market/scale mismatch: ..."}], '
+        '"execution_plan_90_days": {"days_1_30": ["...", "..."], "days_31_60": ["...", "..."], "days_61_90": ["...", "..."]}, '
+        '"rough_budget_estimate": {"minimum": "₹X/month", "recommended": "₹Y/month", '
+        '"note": "rough projection based on strategy complexity"}, '
+        '"expected_results": {"30_days": "...", "60_days": "...", "90_days": "...", '
+        '"note": "projections only — actual results depend on execution quality and market conditions"}, '
+        '"priority_actions": ["..."]}'
+    )
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=2500,
+        )
+        result = json.loads(resp.choices[0].message.content)
+        result["memory_quality"] = memory_quality
+        result["memory_used"] = memory_quality != "none"
+        return result
+    except Exception as _e:
+        logger.error(f"[MI] apply_to_business failed: {_e}")
+        return {"error": str(_e), "memory_quality": memory_quality}
+
+
+@app.post("/marketing-intelligence")
+async def marketing_intelligence(request: MarketingIntelligenceRequest):
+    company_input = (request.company_input or "").strip()
+    if not company_input:
+        return {"success": False, "error": "company_input is required"}
+
+    compare_cfg = request.compare_to_my_business or {}
+
+    # ── Step 1: Research ────────────────────────────────────────────────────
+    try:
+        research = await _mi_research_company(company_input)
+    except Exception as _e:
+        logger.error(f"[MI] Research step failed: {_e}")
+        return {"success": False, "error": f"Research failed: {_e}"}
+
+    company_name = research.get("company_name") or company_input
+
+    # ── Step 2: Build social platforms dict from social_raw ─────────────────
+    social_raw = research.get("social_raw", "")
+    # Extract any platform URLs/handles mentioned in the social research
+    platforms_dict: dict = {}
+    for platform, pattern in [
+        ("instagram", r'instagram\.com/([A-Za-z0-9_.]+)'),
+        ("facebook",  r'facebook\.com/([A-Za-z0-9_./-]+)'),
+        ("linkedin",  r'linkedin\.com/(?:company|in)/([A-Za-z0-9_.-]+)'),
+        ("youtube",   r'youtube\.com/(?:@|c/|channel/)?([A-Za-z0-9_.-]+)'),
+    ]:
+        m = re.search(pattern, social_raw, re.I)
+        if m:
+            platforms_dict[platform] = f"https://{platform}.com/{m.group(1)}"
+
+    # ── Step 3: Run all 4 section generators + social step in parallel ───────
+    section_results = await asyncio.gather(
+        _mi_sections_overview_dna_timeline(company_name, research),
+        _mi_sections_audience_channels_ads(company_name, research),
+        _mi_sections_seo_creatives_offers_funnels(company_name, research),
+        _mi_sections_competitors_swot_lessons(company_name, research),
+        _sie_social_observed_step(company_name, platforms_dict, ""),
+        return_exceptions=True,
+    )
+
+    def _safe(result, label: str):
+        if isinstance(result, Exception):
+            logger.error(f"[MI] Section '{label}' raised: {result}")
+            return {"_error": str(result)}
+        if not isinstance(result, dict):
+            return {}
+        return result
+
+    s_overview_dna_timeline  = _safe(section_results[0], "overview_dna_timeline")
+    s_audience_channels_ads  = _safe(section_results[1], "audience_channels_ads")
+    s_seo_creatives_offers   = _safe(section_results[2], "seo_creatives_offers_funnels")
+    s_competitors_swot       = _safe(section_results[3], "competitors_swot_lessons")
+    s_social                 = _safe(section_results[4], "social")
+
+    # ── Step 4: Assemble flat sections dict ─────────────────────────────────
+    sections: dict = {}
+    sections.update(s_overview_dna_timeline)
+    sections.update(s_audience_channels_ads)
+    sections.update(s_seo_creatives_offers)
+    sections.update(s_competitors_swot)
+    sections["social"] = s_social
+
+    # ── Step 5: Optional comparison section ─────────────────────────────────
+    if compare_cfg:
+        my_url      = (compare_cfg.get("url") or "").strip()
+        my_industry = (compare_cfg.get("industry") or "").strip()
+        my_city     = (compare_cfg.get("city") or "").strip()
+        try:
+            apply_result = await _mi_apply_to_business(
+                company_name, sections, my_url, my_industry, my_city
+            )
+        except Exception as _e:
+            logger.error(f"[MI] apply_to_business step failed: {_e}")
+            apply_result = {"error": str(_e)}
+        sections["apply_to_my_business"] = apply_result
+        sections["action_plan"] = apply_result.get("execution_plan_90_days", {})
+
+    # ── Step 6: Clean banned words across the entire result ─────────────────
+    sections = _clean_banned_words_deep(sections)
+
+    # ── Step 7: Log to activity ─────────────────────────────────────────────
+    try:
+        log_activity(
+            activity_type="marketing_intelligence",
+            business_name=company_name,
+            business_key=re.sub(r'[^a-z0-9]', '_', company_name.lower().strip()),
+            summary=f"MI report generated for {company_name}",
+        )
+    except Exception as _e:
+        logger.warning(f"[MI] log_activity failed (non-fatal): {_e}")
+
+    return {
+        "success":       True,
+        "company_name":  company_name,
+        "company_input": company_input,
+        "sections":      sections,
+    }
