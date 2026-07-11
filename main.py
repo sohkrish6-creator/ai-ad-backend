@@ -14512,12 +14512,15 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
         return_exceptions=True,
     )
 
-    def _safe(result, label: str):
+    def _safe(result, label: str) -> dict:
         if isinstance(result, Exception):
-            logger.error(f"[MI] Section '{label}' raised: {result}")
-            return {"_error": str(result)}
+            logger.error(f"[MI] Section '{label}' raised: {type(result).__name__}: {result}")
+            return {"_section_error": f"{label}: {type(result).__name__}: {str(result)[:200]}"}
         if not isinstance(result, dict):
+            logger.warning(f"[MI] Section '{label}' returned non-dict: {type(result)}")
             return {}
+        if not result:
+            logger.warning(f"[MI] Section '{label}' returned empty dict {{}}")
         return result
 
     s_overview_dna_timeline  = _safe(section_results[0], "overview_dna_timeline")
@@ -14563,9 +14566,16 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     except Exception as _e:
         logger.warning(f"[MI] log_activity failed (non-fatal): {_e}")
 
+    # Collect any section errors for debugging (removed after stable)
+    section_errors = {
+        k: v for d in [s_overview_dna_timeline, s_audience_channels_ads,
+                        s_seo_creatives_offers, s_competitors_swot]
+        for k, v in d.items() if k == "_section_error"
+    }
     return {
         "success":       True,
         "company_name":  company_name,
         "company_input": company_input,
         "sections":      sections,
+        **({"_section_errors": list(section_errors.values())} if section_errors else {}),
     }
