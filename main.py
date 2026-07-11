@@ -13887,6 +13887,7 @@ async def _mi_research_company(company_input: str) -> dict:
         "timeline":    f"{company_input} history milestones marketing campaigns brand evolution key events year",
         "controversy": f"{company_input} marketing mistakes criticism controversy failed campaigns backlash",
         "comp2":       f"{company_input} competitors comparison alternatives brands India market rivals",
+        "iconic_ads":  f"{company_input} most famous iconic advertising campaign history mascot tagline",
     }
     keys   = list(queries.keys())
     tasks  = [fetch_tavily(queries[k]) for k in keys]
@@ -13956,6 +13957,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         f"Company: {company_name}\n\n"
         f"=== OVERVIEW RESEARCH ===\n{cap('overview_raw')}\n\n"
         f"=== MARKETING HISTORY & MILESTONES ===\n{cap('timeline_raw')}\n\n"
+        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw')}\n\n"
         f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
         f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
         f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
@@ -14137,6 +14139,7 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
         f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
         f"=== CONTROVERSY / CRITICISM / MISTAKES ===\n{cap('controversy_raw')}\n\n"
+        f"=== ICONIC CAMPAIGNS & LESSONS ===\n{cap('iconic_ads_raw')}\n\n"
         "Return JSON matching EXACTLY this schema:\n"
         '{"competitors": [{"name": "...", "positioning": "...", "estimated_strengths": ["..."], '
         '"observable_weakness": "...", "market_share_signal": "not found / rough estimate from research", '
