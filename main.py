@@ -13977,7 +13977,13 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "IMPORTANT FOR TIMELINE: Extract ALL milestones found across the research above — founding, "
         "major product launches, famous campaigns, leadership changes, acquisitions, pivots, awards, etc. "
         "Return 4–10 entries if the research supports it. Do NOT artificially limit to 1 entry. "
-        "Sort chronologically oldest-first."
+        "Sort chronologically oldest-first.\n\n"
+        "SPECIFICALLY FOR ICONIC CAMPAIGNS: The '=== ICONIC CAMPAIGNS & MASCOTS ===' section may describe "
+        "a named mascot, character, long-running slogan, or signature campaign with a known launch year. "
+        "If ANY such campaign is mentioned (e.g. 'Amul Girl', 'Just Do It', 'Taste the Thunder', a brand mascot, "
+        "a tagline in use since a specific year) — include it as a DEDICATED timeline entry with that launch year. "
+        "Use the campaign's own name in the milestone field (e.g. 'Amul Girl topical ad campaign launched'). "
+        "Do NOT generalize this into 'brand consistency' — give it its own timeline entry."
     )
     try:
         resp = await asyncio.to_thread(
@@ -14140,6 +14146,11 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
         f"=== CONTROVERSY / CRITICISM / MISTAKES ===\n{cap('controversy_raw')}\n\n"
         f"=== ICONIC CAMPAIGNS & LESSONS ===\n{cap('iconic_ads_raw')}\n\n"
+        "SPECIFICALLY FOR LESSONS: If the '=== ICONIC CAMPAIGNS & LESSONS ===' section describes a named mascot, "
+        "long-running campaign, or signature tagline, create a DEDICATED lesson for it — naming the campaign "
+        "explicitly (e.g. 'The Amul Girl campaign'), stating how long it has run, what made it work, and what "
+        "other brands can learn from its longevity. This should be a separate, named lesson, not merged into "
+        "a generic 'brand consistency' observation.\n\n"
         "Return JSON matching EXACTLY this schema:\n"
         '{"competitors": [{"name": "...", "positioning": "...", "estimated_strengths": ["..."], '
         '"observable_weakness": "...", "market_share_signal": "not found / rough estimate from research", '
