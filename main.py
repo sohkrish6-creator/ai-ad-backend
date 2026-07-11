@@ -13909,17 +13909,23 @@ async def _mi_fetch_wikipedia(company_name: str) -> str:
     Returns plain-text extract (up to 9000 chars), empty string on failure."""
     try:
         title = company_name.replace(" ", "_")
-        # Note: do NOT include exintro param — its mere presence limits to intro only
         params = {
             "action": "query",
             "prop": "extracts",
             "titles": title,
-            "explaintext": True,
+            "explaintext": "true",
             "format": "json",
-            "redirects": 1,
+            "redirects": "1",
         }
-        async with httpx.AsyncClient(timeout=12) as c:
-            resp = await c.get("https://en.wikipedia.org/w/api.php", params=params)
+        headers = {
+            "User-Agent": "AdsohMarketingIntel/1.0 (https://adsoh.com; contact@adsoh.com) python-httpx",
+        }
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://en.wikipedia.org/w/api.php",
+                params=params,
+                headers=headers,
+            )
             data = resp.json()
             pages = data.get("query", {}).get("pages", {})
             for page in pages.values():
@@ -13927,7 +13933,8 @@ async def _mi_fetch_wikipedia(company_name: str) -> str:
                 if extract and not page.get("missing"):
                     return extract[:9000]
         return ""
-    except Exception:
+    except Exception as _e:
+        logger.warning(f"[MI] Wikipedia fetch failed for '{company_name}': {_e}")
         return ""
 
 
@@ -14066,13 +14073,18 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "intelligence reports. Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
         + _MI_HONESTY_RULES
     )
+    wiki_text = cap('wikipedia_raw', 7000)
+    wiki_block = (
+        f"=== WIKIPEDIA ARTICLE (primary source — extract ALL year-anchored facts) ===\n{wiki_text}\n\n"
+        if wiki_text.strip() else ""
+    )
     user_msg = (
         f"Company: {company_name}\n\n"
-        f"=== WIKIPEDIA ARTICLE (primary source — extract year-anchored facts from here) ===\n{cap('wikipedia_raw', 7000)}\n\n"
-        f"=== OVERVIEW ===\n{cap('overview_raw', 700)}\n\n"
-        f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 700)}\n\n"
-        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 700)}\n\n"
-        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:4000]}\n\n"
+        + wiki_block
+        + f"=== OVERVIEW ===\n{cap('overview_raw', 900)}\n\n"
+        f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 900)}\n\n"
+        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 900)}\n\n"
+        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:7000]}\n\n"
         f"=== REVENUE / FINANCIAL HISTORY ===\n{cap('revenue_raw', 900)}\n{cap('revenue2_raw', 900)}\n\n"
         f"=== UNIQUE STORIES & ANECDOTES ===\n{cap('stories_raw', 900)}\n{cap('stories2_raw', 900)}\n\n"
         f"=== NEWS / RECENT ===\n{cap('news_raw', 700)}\n\n"
