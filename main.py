@@ -14000,7 +14000,8 @@ async def _mi_research_company(company_input: str) -> dict:
 
     # Extract company_name AND founding_year together via one GPT-mini JSON call
     overview_snippet = research.get("overview_raw", "")[:800]
-    company_name = company_input
+    # Default: use URL-derived clean name (never the raw URL) so section calls always get a real name
+    company_name = company_query
     founding_year: int | None = None
     if overview_snippet.strip():
         try:
@@ -14050,8 +14051,8 @@ async def _mi_research_company(company_input: str) -> dict:
 
     keys_p2 = list(phase2_qs.keys())
     tasks_p2 = [fetch_tavily(phase2_qs[k]) for k in keys_p2]
-    # Also fetch Wikipedia article directly — much richer timeline data than snippets
-    tasks_p2.append(_mi_fetch_wikipedia(company_name))
+    # Wikipedia fetch: use p2_name (falls back to URL-derived name, never the raw URL)
+    tasks_p2.append(_mi_fetch_wikipedia(p2_name))
 
     results_p2 = await asyncio.gather(*tasks_p2, return_exceptions=True)
     for i, k in enumerate(keys_p2):
