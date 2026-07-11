@@ -14173,7 +14173,11 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         )
         _raw_ov = resp.choices[0].message.content or ""
         logger.info(f"[MI] overview raw (first 300c): {_raw_ov[:300]}")
-        return json.loads(_raw_ov)
+        parsed = json.loads(_raw_ov)
+        if not parsed:
+            logger.warning("[MI] overview/dna/timeline GPT returned empty JSON {}")
+            return {"_dbg_overview_empty": True, "_dbg_overview_raw": _raw_ov[:300]}
+        return parsed
     except Exception as _e:
         logger.error(f"[MI] overview/dna/timeline section failed: {type(_e).__name__}: {_e}")
         return {"_dbg_overview_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_overview_raw": _raw_ov[:300]}
@@ -14232,7 +14236,11 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
         )
         _raw_aud = resp.choices[0].message.content or ""
         logger.info(f"[MI] audience raw (first 300c): {_raw_aud[:300]}")
-        return json.loads(_raw_aud)
+        parsed = json.loads(_raw_aud)
+        if not parsed:
+            logger.warning("[MI] audience/channels/ads GPT returned empty JSON {}")
+            return {"_dbg_audience_empty": True, "_dbg_audience_raw": _raw_aud[:300]}
+        return parsed
     except Exception as _e:
         logger.error(f"[MI] audience/channels/ads section failed: {type(_e).__name__}: {_e}")
         return {"_dbg_audience_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_audience_raw": _raw_aud[:300]}
@@ -14296,7 +14304,11 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         )
         _raw_seo = resp.choices[0].message.content or ""
         logger.info(f"[MI] seo raw (first 300c): {_raw_seo[:300]}")
-        return json.loads(_raw_seo)
+        parsed = json.loads(_raw_seo)
+        if not parsed:
+            logger.warning("[MI] seo/creatives/offers/funnels GPT returned empty JSON {}")
+            return {"_dbg_seo_empty": True, "_dbg_seo_raw": _raw_seo[:300]}
+        return parsed
     except Exception as _e:
         logger.error(f"[MI] seo/creatives/offers/funnels section failed: {type(_e).__name__}: {_e}")
         return {"_dbg_seo_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_seo_raw": _raw_seo[:300]}
@@ -14375,6 +14387,9 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         _raw_comp = resp.choices[0].message.content or ""
         logger.info(f"[MI] competitors raw (first 300c): {_raw_comp[:300]}")
         result = json.loads(_raw_comp)
+        if not result:
+            logger.warning("[MI] competitors/swot/lessons GPT returned empty JSON {}")
+            return {"_dbg_comp_empty": True, "_dbg_comp_raw": _raw_comp[:300]}
         n_comp = len(result.get("competitors") or [])
         n_swot_s = len((result.get("swot") or {}).get("strengths") or [])
         n_lessons = len(result.get("lessons") or [])
