@@ -13870,120 +13870,217 @@ HONESTY RULES — MANDATORY, DO NOT VIOLATE:
 """.strip()
 
 
+def _mi_build_decade_queries(company_input: str, founding_year: int | None) -> dict:
+    """
+    Build decade-paired Tavily queries from the founding decade to present.
+    Pairs decades (1940s+1950s, 1960s+1970s, …) to cap at ≤5 queries.
+    Returns dict of {key: query_string} — keys become decade_{year}_raw in research.
+    """
+    current_year = 2025
+    if not founding_year or not (1800 <= founding_year <= current_year):
+        return {
+            "decade_recent": f"{company_input} history milestones growth campaigns 2000s 2010s 2020s",
+        }
+    start = (founding_year // 10) * 10
+    queries: dict = {}
+    d = start
+    while d <= current_year:
+        d2 = d + 10
+        label = f"{d}s {d2}s" if d2 <= current_year else f"{d}s"
+        queries[f"decade_{d}"] = (
+            f"{company_input} history milestones campaigns growth {label}"
+        )
+        d += 20  # pair decades so ≤5 queries for an 80-yr company
+    return queries
+
+
 async def _mi_research_company(company_input: str) -> dict:
     """
-    Parallel Tavily research (6 queries) + optional Firecrawl if a URL is
-    detected in company_input. Extracts a clean company_name via a tiny
-    GPT-mini call. Returns a flat research dict with 8 keys.
+    Two-phase deep research:
+    Phase 1  — 12 parallel Tavily queries + optional Firecrawl.
+               Immediately extracts company_name + founding_year via GPT-mini.
+    Phase 2  — Decade-segmented Tavily queries (based on founding_year)
+               + revenue history + unique-story queries (all parallel).
+    Returns a flat research dict with all *_raw keys.
     """
-    queries = {
+    # ── Phase 1 ────────────────────────────────────────────────────────────
+    queries_p1 = {
         "overview":    f"{company_input} company overview founded history CEO employees business model",
         "marketing":   f"{company_input} marketing strategy brand campaigns advertising 2024 2025",
         "social":      f"{company_input} Instagram Facebook LinkedIn YouTube followers social media",
         "competitors": f"{company_input} top competitors market share competitive landscape",
         "product":     f"{company_input} products services pricing offers website ecommerce",
         "news":        f"{company_input} news funding revenue growth expansion 2025",
-        # Dedicated targeted queries for sections that need deeper specific research
         "timeline":    f"{company_input} history milestones marketing campaigns brand evolution key events year",
         "controversy": f"{company_input} marketing mistakes criticism controversy failed campaigns backlash",
         "comp2":       f"{company_input} competitors comparison alternatives brands India market rivals",
         "iconic_ads":  f"{company_input} most famous iconic advertising campaign history mascot tagline",
+        "revenue":     f"{company_input} revenue turnover annual growth financial history year",
+        "stories":     f"{company_input} untold story lesser known history interesting facts behind the scenes",
     }
-    keys   = list(queries.keys())
-    tasks  = [fetch_tavily(queries[k]) for k in keys]
+    keys_p1 = list(queries_p1.keys())
+    tasks_p1: list = [fetch_tavily(queries_p1[k]) for k in keys_p1]
 
-    # Detect URL in input — fetch website content via Firecrawl if found
     url_match = re.search(r'https?://[^\s]+|(?:www\.)[^\s]+', company_input, re.I)
     detected_url = url_match.group(0) if url_match else None
     if detected_url and not detected_url.startswith("http"):
         detected_url = "https://" + detected_url
     if detected_url:
-        tasks.append(fetch_firecrawl(detected_url))
+        tasks_p1.append(fetch_firecrawl(detected_url))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results_p1 = await asyncio.gather(*tasks_p1, return_exceptions=True)
 
-    research = {}
-    for i, k in enumerate(keys):
-        val = results[i]
+    research: dict = {}
+    for i, k in enumerate(keys_p1):
+        val = results_p1[i]
         research[k + "_raw"] = val if isinstance(val, str) else ""
 
-    # Website content (last result if URL was found)
-    website_content = ""
     if detected_url:
-        wc = results[len(keys)]
-        if isinstance(wc, str):
-            website_content = wc[:3000]
-    research["website_content"] = website_content
+        wc = results_p1[len(keys_p1)]
+        research["website_content"] = wc[:3000] if isinstance(wc, str) else ""
+    else:
+        research["website_content"] = ""
 
-    # Extract clean company_name via GPT mini
-    overview_snippet = research.get("overview_raw", "")[:600]
-    company_name = company_input  # fallback
+    # Extract company_name AND founding_year together via one GPT-mini JSON call
+    overview_snippet = research.get("overview_raw", "")[:800]
+    company_name = company_input
+    founding_year: int | None = None
     if overview_snippet.strip():
         try:
-            name_resp = await asyncio.to_thread(
+            meta_resp = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "Extract the company's proper name from the snippet. Return ONLY the company name — no explanation, no punctuation."},
-                    {"role": "user",   "content": f"Input: {company_input}\nSnippet: {overview_snippet}"},
+                    {"role": "system", "content": (
+                        "Return JSON with exactly two fields:\n"
+                        "  company_name: the company's proper name (string)\n"
+                        "  founding_year: 4-digit integer year the company was founded, "
+                        "or null if not found in the text.\n"
+                        "No other fields, no explanation."
+                    )},
+                    {"role": "user", "content": f"Input: {company_input}\nSnippet: {overview_snippet}"},
                 ],
-                max_tokens=30,
+                response_format={"type": "json_object"},
+                max_tokens=40,
                 temperature=0.0,
             )
-            extracted = (name_resp.choices[0].message.content or "").strip().strip('"').strip("'")
-            if extracted:
-                company_name = extracted
+            meta = json.loads(meta_resp.choices[0].message.content or "{}")
+            if meta.get("company_name"):
+                company_name = str(meta["company_name"]).strip().strip('"').strip("'")
+            fy = meta.get("founding_year")
+            if isinstance(fy, int) and 1800 <= fy <= 2024:
+                founding_year = fy
         except Exception as _e:
-            logger.warning(f"[MI] company_name extraction failed: {_e}")
+            logger.warning(f"[MI] meta extraction failed: {_e}")
 
     research["company_name"] = company_name
+    research["founding_year"] = founding_year
+
+    # ── Phase 2 — decade-segmented + revenue + stories (parallel) ──────────
+    decade_qs = _mi_build_decade_queries(company_input, founding_year)
+    phase2_qs: dict = {**decade_qs}   # already has decade_* keys
+    # add dedicated revenue-history and unique-story queries at phase-2 depth
+    phase2_qs["revenue2"] = (
+        f"{company_input} annual revenue turnover sales figures history "
+        f"{'year by year' if not founding_year else str(founding_year) + ' to 2025'}"
+    )
+    phase2_qs["stories2"] = (
+        f"{company_input} behind the scenes founding story struggle near failure "
+        "pivot anecdote history article retrospective"
+    )
+
+    keys_p2 = list(phase2_qs.keys())
+    results_p2 = await asyncio.gather(
+        *[fetch_tavily(phase2_qs[k]) for k in keys_p2],
+        return_exceptions=True,
+    )
+    for i, k in enumerate(keys_p2):
+        val = results_p2[i]
+        research[k + "_raw"] = val if isinstance(val, str) else ""
+
     return research
 
 
 async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) -> dict:
     """
-    GPT-4o call → {overview, business_dna, timeline}
-    Uses: overview_raw, news_raw, website_content, product_raw (capped at 1200 chars each).
+    GPT-4o call → {overview, business_dna, timeline, revenue_timeline, unique_stories}
+    Phase-2 research (decade_*_raw, revenue2_raw, stories2_raw) is consumed here.
     """
-    def cap(key: str) -> str:
-        return (research.get(key) or "")[:1200]
+    def cap(key: str, n: int = 1000) -> str:
+        return (research.get(key) or "")[:n]
+
+    # Collect decade blocks — each decade key is "decade_{year}_raw"
+    decade_blocks: list[str] = []
+    for k in sorted(research.keys()):
+        if k.startswith("decade_") and k.endswith("_raw"):
+            txt = (research.get(k) or "")[:700]
+            if txt.strip():
+                era = k.replace("decade_", "").replace("_raw", "")
+                decade_blocks.append(f"--- {era}s ---\n{txt}")
+    decade_combined = "\n\n".join(decade_blocks) if decade_blocks else "(no decade research)"
 
     system_msg = (
-        "You are a senior business analyst producing structured JSON intelligence reports. "
-        "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
+        "You are a senior business historian and marketing analyst producing structured JSON "
+        "intelligence reports. Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
         + _MI_HONESTY_RULES
     )
     user_msg = (
         f"Company: {company_name}\n\n"
-        f"=== OVERVIEW RESEARCH ===\n{cap('overview_raw')}\n\n"
-        f"=== MARKETING HISTORY & MILESTONES ===\n{cap('timeline_raw')}\n\n"
-        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw')}\n\n"
-        f"=== NEWS / GROWTH ===\n{cap('news_raw')}\n\n"
-        f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
-        f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
-        "Return JSON matching EXACTLY this schema:\n"
-        '{"overview": {"company_name": "...", "industry": "...", "founded": "YYYY or \'not found in research\'", '
-        '"headquarters": "...", "business_model": "...", "core_value_proposition": "one sentence", '
-        '"estimated_size": "startup/SMB/mid-market/enterprise", '
-        '"revenue": "if publicly disclosed in research else \'not publicly disclosed\'", '
-        '"key_products_services": ["..."], "confidence": 75, "evidence": "brief source quote", '
-        '"data_source": "Tavily research"}, '
-        '"business_dna": {"brand_positioning": "...", "target_customer_profile": "...", '
-        '"unique_differentiators": ["..."], "brand_voice_tone": "...", '
-        '"pricing_tier": "budget/mid/premium/luxury or \'not determined\'", '
-        '"distribution_model": "...", "confidence": 70, "evidence": "...", "data_source": "..."}, '
-        '"timeline": [{"year": "YYYY", "milestone": "...", "significance": "...", '
-        '"evidence": "from research snippet", "confidence": 80}]}\n\n'
-        "IMPORTANT FOR TIMELINE: Extract ALL milestones found across the research above — founding, "
-        "major product launches, famous campaigns, leadership changes, acquisitions, pivots, awards, etc. "
-        "Return 4–10 entries if the research supports it. Do NOT artificially limit to 1 entry. "
-        "Sort chronologically oldest-first.\n\n"
-        "SPECIFICALLY FOR ICONIC CAMPAIGNS: The '=== ICONIC CAMPAIGNS & MASCOTS ===' section may describe "
-        "a named mascot, character, long-running slogan, or signature campaign with a known launch year. "
-        "If ANY such campaign is mentioned (e.g. 'Amul Girl', 'Just Do It', 'Taste the Thunder', a brand mascot, "
-        "a tagline in use since a specific year) — include it as a DEDICATED timeline entry with that launch year. "
-        "Use the campaign's own name in the milestone field (e.g. 'Amul Girl topical ad campaign launched'). "
-        "Do NOT generalize this into 'brand consistency' — give it its own timeline entry."
+        f"=== OVERVIEW ===\n{cap('overview_raw', 900)}\n\n"
+        f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 900)}\n\n"
+        f"=== ICONIC CAMPAIGNS & MASCOTS ===\n{cap('iconic_ads_raw', 900)}\n\n"
+        f"=== DECADE-BY-DECADE RESEARCH ===\n{decade_combined[:3000]}\n\n"
+        f"=== REVENUE / FINANCIAL HISTORY ===\n{cap('revenue_raw', 900)}\n{cap('revenue2_raw', 900)}\n\n"
+        f"=== UNIQUE STORIES & ANECDOTES ===\n{cap('stories_raw', 900)}\n{cap('stories2_raw', 900)}\n\n"
+        f"=== NEWS / RECENT ===\n{cap('news_raw', 700)}\n\n"
+        f"=== PRODUCTS / SERVICES ===\n{cap('product_raw', 600)}\n\n"
+        "Return JSON matching EXACTLY this schema — no extra keys:\n"
+        "{\n"
+        '  "overview": {\n'
+        '    "company_name": "...", "industry": "...", "founded": "YYYY or \'not found\'",\n'
+        '    "headquarters": "...", "business_model": "...", "core_value_proposition": "one sentence",\n'
+        '    "estimated_size": "startup/SMB/mid-market/enterprise",\n'
+        '    "revenue": "most recent figure found in research, or \'not publicly disclosed\'",\n'
+        '    "key_products_services": ["..."], "confidence": 75,\n'
+        '    "evidence": "brief source quote", "data_source": "Tavily research"\n'
+        '  },\n'
+        '  "business_dna": {\n'
+        '    "brand_positioning": "...", "target_customer_profile": "...",\n'
+        '    "unique_differentiators": ["..."], "brand_voice_tone": "...",\n'
+        '    "pricing_tier": "budget/mid/premium/luxury or \'not determined\'",\n'
+        '    "distribution_model": "...", "confidence": 70, "evidence": "...", "data_source": "..."\n'
+        '  },\n'
+        '  "timeline": [\n'
+        '    {"year": "YYYY", "decade": "1940s", "milestone": "...", "significance": "...",\n'
+        '     "evidence": "specific text from research", "data_source": "decade research / iconic-ads research / etc.", "confidence": 80}\n'
+        '  ],\n'
+        '  "revenue_timeline": [\n'
+        '    {"period": "FY2023", "revenue_or_metric": "₹52,000 crore", "source_context": "exact quote from research", "confidence": 80}\n'
+        '  ],\n'
+        '  "unique_stories": [\n'
+        '    {"story": "...", "significance": "why this is remarkable", "source_context": "...", "confidence": 65}\n'
+        '  ]\n'
+        "}\n\n"
+        "RULES FOR TIMELINE (read carefully):\n"
+        "1. Extract milestones from ALL research blocks above — decade-by-decade blocks are the primary source.\n"
+        "2. Return UP TO 15 real milestones. Do NOT cap at 5. Do NOT pad with invented ones.\n"
+        "3. For ICONIC CAMPAIGNS: if any named mascot/campaign/tagline with a known launch year is mentioned "
+        "(e.g. 'Amul Girl', 'Just Do It', a mascot, a long-running slogan) — include it as its OWN timeline "
+        "entry with that exact year. Name it explicitly in milestone. Do not merge it into 'brand consistency'.\n"
+        "4. Each entry MUST have a data_source that indicates WHICH research block it came from "
+        "(e.g. 'decade 1960s research', 'iconic-ads research', 'overview research').\n"
+        "5. Sort chronologically, oldest first.\n\n"
+        "RULES FOR REVENUE TIMELINE:\n"
+        "1. ONLY include years/periods where a specific revenue figure appears verbatim in the research.\n"
+        "2. Do NOT interpolate, estimate, or fill gaps. If only FY2020 and FY2025 have real numbers, "
+        "the array has exactly 2 entries. Never fabricate a smooth curve.\n"
+        "3. source_context must be a partial quote of the text that contained the figure.\n"
+        "4. If NO revenue figures are found, return revenue_timeline as [].\n\n"
+        "RULES FOR UNIQUE STORIES:\n"
+        "1. Surface only anecdotes that are genuinely specific and surprising — founding struggles, "
+        "near-failures, unusual pivots, famous internal decisions, serendipitous moments.\n"
+        "2. Do NOT include generic corporate facts (e.g. 'was founded in X' is not a unique story).\n"
+        "3. If nothing genuinely interesting is found, return unique_stories as []."
     )
     try:
         resp = await asyncio.to_thread(
@@ -13995,7 +14092,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
-            max_tokens=2500,
+            max_tokens=4000,
         )
         return json.loads(resp.choices[0].message.content)
     except Exception as _e:
