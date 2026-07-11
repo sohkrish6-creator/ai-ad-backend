@@ -13867,10 +13867,11 @@ _MI_HONESTY_RULES = """
 HONESTY RULES — MANDATORY, DO NOT VIOLATE:
 1. Revenue/financials: ONLY quote if explicitly found in the research below. If not found say "not publicly disclosed." NEVER estimate revenue.
 2. Founding date: Only if found in research. If estimating from context clues, label "circa YYYY (estimated)".
-3. Timeline: Include ONLY milestones supported by evidence in the research. Minimum 1, maximum the number actually found. Do NOT invent or pad.
+3. Timeline: Include ONLY milestones supported by evidence in the research OR your verified model knowledge. Label each entry's data_source as "research" or "model knowledge" accordingly.
 4. Follower counts, engagement rates: handled in Social section separately — do NOT guess them here.
-5. Sparse data handling: If a SECTION has little research data, lower its confidence score to 20-35. For individual FIELDS with no data, use null or an empty array [] — NEVER write "Limited public data available" or any similar filler phrase as a field value. A null value is cleaner and more honest than a repeated placeholder. You may add ONE "data_note" string field per section-level object to explain overall data gaps — but do NOT paste the same note into every sub-field.
-6. Confidence discipline: a section returning mostly-null fields MUST show confidence ≤ 35. If you observed real data for most fields, confidence 60-80 is appropriate.
+5. Model knowledge fallback: If research snippets are sparse or empty but the company is a globally recognised brand (Fortune 500, major tech platform, well-known consumer brand), USE YOUR TRAINING KNOWLEDGE to populate the section — but label every such field or array item with data_source: "model knowledge". Model knowledge from training is acceptable and preferred over empty output for well-documented companies.
+6. Sparse data for obscure businesses: For local, niche, or private companies with limited public presence, return null / [] for unknown fields and add a single "data_note" per section explaining the gap. NEVER paste a repeated placeholder string ("Limited public data available", "Not enough data", etc.) into multiple fields — that is a broken fallback, not honest reporting.
+7. Confidence discipline: sections built entirely from model knowledge should show confidence 55-65. Sections with verified live research data 70-85. Sections that are genuinely unknown 20-35.
 """.strip()
 
 
@@ -14185,7 +14186,10 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
     system_msg = (
         "You are a senior marketing strategist producing structured JSON intelligence reports. "
         "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
-        + _MI_HONESTY_RULES
+        + _MI_HONESTY_RULES + "\n\n"
+        "For well-known companies (major platforms, global brands), supplement sparse research with your "
+        "training knowledge — label those fields with data_source: 'model knowledge'. "
+        "Never return null/empty for a globally recognised brand's audience profile."
     )
     user_msg = (
         f"Company: {company_name}\n\n"
@@ -14303,14 +14307,18 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
         + _MI_HONESTY_RULES + "\n\n"
         "ADDITIONAL RULES:\n"
-        "- Competitors: Extract EVERY named competitor brand found anywhere across ALL research sections below. "
-        "Scan all four research blocks carefully — competitor names often appear in marketing or news sections, "
-        "not only in the dedicated competitor block. Include any brand mentioned as a rival, alternative, or "
-        "comparison. If 2 are found, return 2; if 5 are found, return 5. Do NOT pad, but do NOT miss any.\n"
-        "- Mistakes: Look specifically in the controversy/criticism research block. If ANY public criticism, "
-        "campaign backlash, controversy, or strategic misstep is mentioned, include it with evidence. "
-        "Only return an empty mistakes array if the controversy research is genuinely empty.\n"
-        "- Lessons: ONLY include those supported by evidence. Quality over quantity."
+        "- Competitors: First scan ALL research blocks for named rivals. Then, if the company is well-known "
+        "(major tech platform, global brand, Fortune 500), also include competitors from your training "
+        "knowledge that you are confident about — label those entries with data_label: 'model knowledge'. "
+        "A well-known company should ALWAYS have at least 3 competitors listed.\n"
+        "- SWOT: For globally recognised companies, populate SWOT from a mix of research + model knowledge. "
+        "Empty SWOT for a well-known company is WRONG — use your knowledge.\n"
+        "- Mistakes: Check the controversy block AND your model knowledge for known public controversies, "
+        "lawsuits, algorithm changes, PR crises, or failed products. Include with evidence.\n"
+        "- Lessons: Surface the most transferable strategic lesson from this company's growth story. "
+        "For well-known companies this should never be empty — there is always at least 1 key lesson.\n"
+        "- data_label field: use 'OBSERVED from research' when from Tavily/Wikipedia, "
+        "'model knowledge' when from training data."
     )
     user_msg = (
         f"Company: {company_name}\n\n"
