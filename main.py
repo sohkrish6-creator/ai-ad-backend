@@ -14158,6 +14158,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "2. Do NOT include generic corporate facts (e.g. 'was founded in X' is not a unique story).\n"
         "3. If nothing genuinely interesting is found, return unique_stories as []."
     )
+    _raw_ov = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14170,10 +14171,12 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
             temperature=0.2,
             max_tokens=5000,
         )
-        return json.loads(resp.choices[0].message.content)
+        _raw_ov = resp.choices[0].message.content or ""
+        logger.info(f"[MI] overview raw (first 300c): {_raw_ov[:300]}")
+        return json.loads(_raw_ov)
     except Exception as _e:
-        logger.error(f"[MI] overview/dna/timeline section failed: {_e}")
-        return {}
+        logger.error(f"[MI] overview/dna/timeline section failed: {type(_e).__name__}: {_e}")
+        return {"_dbg_overview_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_overview_raw": _raw_ov[:300]}
 
 
 async def _mi_sections_audience_channels_ads(company_name: str, research: dict) -> dict:
@@ -14214,6 +14217,7 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
     marketing_len = len(cap('marketing_raw'))
     website_len   = len(cap('website_content'))
     logger.info(f"[MI] audience/channels/ads: marketing_data={marketing_len}c website={website_len}c")
+    _raw_aud = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14226,10 +14230,12 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
             temperature=0.2,
             max_tokens=2000,
         )
-        return json.loads(resp.choices[0].message.content)
+        _raw_aud = resp.choices[0].message.content or ""
+        logger.info(f"[MI] audience raw (first 300c): {_raw_aud[:300]}")
+        return json.loads(_raw_aud)
     except Exception as _e:
-        logger.error(f"[MI] audience/channels/ads section failed: {_e}")
-        return {}
+        logger.error(f"[MI] audience/channels/ads section failed: {type(_e).__name__}: {_e}")
+        return {"_dbg_audience_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_audience_raw": _raw_aud[:300]}
 
 
 async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research: dict) -> dict:
@@ -14275,6 +14281,7 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         '"referral_program": "observed / not confirmed", '
         '"confidence": 60, "evidence": "...", "data_source": "..."}}'
     )
+    _raw_seo = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14287,10 +14294,12 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
             temperature=0.2,
             max_tokens=2000,
         )
-        return json.loads(resp.choices[0].message.content)
+        _raw_seo = resp.choices[0].message.content or ""
+        logger.info(f"[MI] seo raw (first 300c): {_raw_seo[:300]}")
+        return json.loads(_raw_seo)
     except Exception as _e:
-        logger.error(f"[MI] seo/creatives/offers/funnels section failed: {_e}")
-        return {}
+        logger.error(f"[MI] seo/creatives/offers/funnels section failed: {type(_e).__name__}: {_e}")
+        return {"_dbg_seo_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_seo_raw": _raw_seo[:300]}
 
 
 async def _mi_sections_competitors_swot_lessons(company_name: str, research: dict) -> dict:
@@ -14350,6 +14359,7 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         f"[MI] competitors/swot/lessons: competitor_data={comp_data_len}c "
         f"news={news_data_len}c controversy={controversy_len}c"
     )
+    _raw_comp = ""
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14362,16 +14372,17 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
             temperature=0.3,
             max_tokens=2500,
         )
-        result = json.loads(resp.choices[0].message.content)
-        # Log section quality
+        _raw_comp = resp.choices[0].message.content or ""
+        logger.info(f"[MI] competitors raw (first 300c): {_raw_comp[:300]}")
+        result = json.loads(_raw_comp)
         n_comp = len(result.get("competitors") or [])
         n_swot_s = len((result.get("swot") or {}).get("strengths") or [])
         n_lessons = len(result.get("lessons") or [])
         logger.info(f"[MI] competitors/swot/lessons output: competitors={n_comp} swot_strengths={n_swot_s} lessons={n_lessons}")
         return result
     except Exception as _e:
-        logger.error(f"[MI] competitors/swot/lessons section failed: {_e}")
-        return {}
+        logger.error(f"[MI] competitors/swot/lessons section failed: {type(_e).__name__}: {_e}")
+        return {"_dbg_comp_error": f"{type(_e).__name__}: {str(_e)[:300]}", "_dbg_comp_raw": _raw_comp[:300]}
 
 
 async def _mi_apply_to_business(
@@ -14566,16 +14577,18 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     except Exception as _e:
         logger.warning(f"[MI] log_activity failed (non-fatal): {_e}")
 
-    # Collect any section errors for debugging (removed after stable)
-    section_errors = {
+    # Collect section debug info — includes both old _section_error and new _dbg_* keys
+    dbg_keys = {"_section_error", "_dbg_overview_error", "_dbg_audience_error", "_dbg_seo_error", "_dbg_comp_error",
+                 "_dbg_overview_raw", "_dbg_audience_raw", "_dbg_seo_raw", "_dbg_comp_raw"}
+    section_debug = {
         k: v for d in [s_overview_dna_timeline, s_audience_channels_ads,
                         s_seo_creatives_offers, s_competitors_swot]
-        for k, v in d.items() if k == "_section_error"
+        for k, v in d.items() if k in dbg_keys
     }
     return {
         "success":       True,
         "company_name":  company_name,
         "company_input": company_input,
         "sections":      sections,
-        **({"_section_errors": list(section_errors.values())} if section_errors else {}),
+        **({"_section_debug": section_debug} if section_debug else {}),
     }
