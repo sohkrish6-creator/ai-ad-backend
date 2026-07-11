@@ -13869,7 +13869,8 @@ HONESTY RULES — MANDATORY, DO NOT VIOLATE:
 2. Founding date: Only if found in research. If estimating from context clues, label "circa YYYY (estimated)".
 3. Timeline: Include ONLY milestones supported by evidence in the research. Minimum 1, maximum the number actually found. Do NOT invent or pad.
 4. Follower counts, engagement rates: handled in Social section separately — do NOT guess them here.
-5. If research is sparse for any field, say so: "Limited public data available."
+5. Sparse data handling: If a SECTION has little research data, lower its confidence score to 20-35. For individual FIELDS with no data, use null or an empty array [] — NEVER write "Limited public data available" or any similar filler phrase as a field value. A null value is cleaner and more honest than a repeated placeholder. You may add ONE "data_note" string field per section-level object to explain overall data gaps — but do NOT paste the same note into every sub-field.
+6. Confidence discipline: a section returning mostly-null fields MUST show confidence ≤ 35. If you observed real data for most fields, confidence 60-80 is appropriate.
 """.strip()
 
 
@@ -13947,28 +13948,39 @@ async def _mi_research_company(company_input: str) -> dict:
                + revenue history + unique-story queries (all parallel).
     Returns a flat research dict with all *_raw keys.
     """
-    # ── Phase 1 ────────────────────────────────────────────────────────────
-    queries_p1 = {
-        "overview":    f"{company_input} company overview founded history CEO employees business model",
-        "marketing":   f"{company_input} marketing strategy brand campaigns advertising 2024 2025",
-        "social":      f"{company_input} Instagram Facebook LinkedIn YouTube followers social media",
-        "competitors": f"{company_input} top competitors market share competitive landscape",
-        "product":     f"{company_input} products services pricing offers website ecommerce",
-        "news":        f"{company_input} news funding revenue growth expansion 2025",
-        "timeline":    f"{company_input} history milestones marketing campaigns brand evolution key events year",
-        "controversy": f"{company_input} marketing mistakes criticism controversy failed campaigns backlash",
-        "comp2":       f"{company_input} competitors comparison alternatives brands India market rivals",
-        "iconic_ads":  f"{company_input} most famous iconic advertising campaign history mascot tagline",
-        "revenue":     f"{company_input} revenue turnover annual growth financial history year",
-        "stories":     f"{company_input} untold story lesser known history interesting facts behind the scenes",
-    }
-    keys_p1 = list(queries_p1.keys())
-    tasks_p1: list = [fetch_tavily(queries_p1[k]) for k in keys_p1]
-
+    # ── Normalize: if URL input, derive a clean company name for search queries ─
     url_match = re.search(r'https?://[^\s]+|(?:www\.)[^\s]+', company_input, re.I)
     detected_url = url_match.group(0) if url_match else None
     if detected_url and not detected_url.startswith("http"):
         detected_url = "https://" + detected_url
+
+    company_query = company_input  # default: use as-is for queries
+    if detected_url:
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(detected_url).netloc.replace("www.", "")
+            company_query = domain.split(".")[0].title()  # "linkedin.com" → "Linkedin"
+        except Exception:
+            pass
+
+    # ── Phase 1 ────────────────────────────────────────────────────────────
+    queries_p1 = {
+        "overview":    f"{company_query} company overview founded history CEO employees business model",
+        "marketing":   f"{company_query} marketing strategy brand campaigns advertising 2024 2025",
+        "social":      f"{company_query} Instagram Facebook LinkedIn YouTube followers social media",
+        "competitors": f"{company_query} top competitors market share competitive landscape",
+        "product":     f"{company_query} products services pricing offers website ecommerce",
+        "news":        f"{company_query} news funding revenue growth expansion 2025",
+        "timeline":    f"{company_query} history milestones marketing campaigns brand evolution key events year",
+        "controversy": f"{company_query} marketing mistakes criticism controversy failed campaigns backlash",
+        "comp2":       f"{company_query} competitors comparison alternatives brands global market rivals",
+        "iconic_ads":  f"{company_query} most famous iconic advertising campaign history mascot tagline",
+        "revenue":     f"{company_query} revenue annual growth financial history year",
+        "stories":     f"{company_query} untold story lesser known history interesting facts behind the scenes",
+    }
+    keys_p1 = list(queries_p1.keys())
+    tasks_p1: list = [fetch_tavily(queries_p1[k]) for k in keys_p1]
+
     if detected_url:
         tasks_p1.append(fetch_firecrawl(detected_url))
 
@@ -14021,15 +14033,17 @@ async def _mi_research_company(company_input: str) -> dict:
     research["founding_year"] = founding_year
 
     # ── Phase 2 — decade-segmented + revenue + stories (parallel) ──────────
-    decade_qs = _mi_build_decade_queries(company_input, founding_year)
+    # Use extracted company_name (not raw URL) for all Phase 2 queries
+    p2_name = company_name or company_query
+    decade_qs = _mi_build_decade_queries(p2_name, founding_year)
     phase2_qs: dict = {**decade_qs}   # already has decade_* keys
     # add dedicated revenue-history and unique-story queries at phase-2 depth
     phase2_qs["revenue2"] = (
-        f"{company_input} annual revenue turnover sales figures history "
+        f"{p2_name} annual revenue turnover sales figures history "
         f"{'year by year' if not founding_year else str(founding_year) + ' to 2025'}"
     )
     phase2_qs["stories2"] = (
-        f"{company_input} behind the scenes founding story struggle near failure "
+        f"{p2_name} behind the scenes founding story struggle near failure "
         "pivot anecdote history article retrospective"
     )
 
@@ -14192,6 +14206,9 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
         '"estimated_spend": "rough estimate from research or \'not found in available data\'", '
         '"confidence": 60, "evidence": "...", "data_source": "..."}}'
     )
+    marketing_len = len(cap('marketing_raw'))
+    website_len   = len(cap('website_content'))
+    logger.info(f"[MI] audience/channels/ads: marketing_data={marketing_len}c website={website_len}c")
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14317,6 +14334,13 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         '"mistakes": [{"mistake": "...", "evidence": "...", "lesson": "..."}], '
         '"future_opportunities": [{"opportunity": "...", "rationale": "based on research signal: ...", "confidence": 70}]}'
     )
+    comp_data_len  = len(cap('competitor_raw')) + len(cap('comp2_raw'))
+    news_data_len  = len(cap('news_raw'))
+    controversy_len = len(cap('controversy_raw'))
+    logger.info(
+        f"[MI] competitors/swot/lessons: competitor_data={comp_data_len}c "
+        f"news={news_data_len}c controversy={controversy_len}c"
+    )
     try:
         resp = await asyncio.to_thread(
             client.chat.completions.create,
@@ -14329,7 +14353,13 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
             temperature=0.3,
             max_tokens=2500,
         )
-        return json.loads(resp.choices[0].message.content)
+        result = json.loads(resp.choices[0].message.content)
+        # Log section quality
+        n_comp = len(result.get("competitors") or [])
+        n_swot_s = len((result.get("swot") or {}).get("strengths") or [])
+        n_lessons = len(result.get("lessons") or [])
+        logger.info(f"[MI] competitors/swot/lessons output: competitors={n_comp} swot_strengths={n_swot_s} lessons={n_lessons}")
+        return result
     except Exception as _e:
         logger.error(f"[MI] competitors/swot/lessons section failed: {_e}")
         return {}
