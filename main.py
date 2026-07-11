@@ -13931,7 +13931,7 @@ async def _mi_fetch_wikipedia(company_name: str) -> str:
             for page in pages.values():
                 extract = page.get("extract", "")
                 if extract and not page.get("missing"):
-                    return extract[:9000]
+                    return extract[:14000]
         return ""
     except Exception as _e:
         logger.warning(f"[MI] Wikipedia fetch failed for '{company_name}': {_e}")
@@ -14073,9 +14073,9 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "intelligence reports. Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
         + _MI_HONESTY_RULES
     )
-    wiki_text = cap('wikipedia_raw', 7000)
+    wiki_text = cap('wikipedia_raw', 11000)
     wiki_block = (
-        f"=== WIKIPEDIA ARTICLE (primary source — extract ALL year-anchored facts) ===\n{wiki_text}\n\n"
+        f"=== WIKIPEDIA ARTICLE (extract ALL year-anchored facts, including campaigns/mascots) ===\n{wiki_text}\n\n"
         if wiki_text.strip() else ""
     )
     user_msg = (
@@ -14527,11 +14527,4 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
         "company_name":  company_name,
         "company_input": company_input,
         "sections":      sections,
-        "_debug": {
-            "wikipedia_raw_len": len(research.get("wikipedia_raw") or ""),
-            "timeline_raw_len":  len(research.get("timeline_raw") or ""),
-            "iconic_ads_raw_len": len(research.get("iconic_ads_raw") or ""),
-            "decade_keys": [k for k in research if k.startswith("decade_") and k.endswith("_raw")],
-            "wikipedia_snippet": (research.get("wikipedia_raw") or "")[:200],
-        },
     }
