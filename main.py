@@ -2373,7 +2373,17 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "brand/competitor names in headlines or descriptions. NO phone numbers written directly in ad text — "
         "phone numbers only go through Call extensions, never in a headline/description string. NO 'click here' "
         "or 'click now' — use one of the exact CTAs from rule 3 instead. NO ALL-CAPS words (reads as shouting and "
-        "gets flagged) — normal sentence case only, Hinglish included.\n\n"
+        "gets flagged) — normal sentence case only, Hinglish included.\n"
+        "10. SOUNDS HUMAN, NOT AI — mandatory naturalness rules:\n"
+        "   a. Vary sentence length: mix short punchy sentences (under 8 words) with longer explanatory ones. "
+        "      NEVER write 3+ consecutive lines of the same length or starting the same way.\n"
+        "   b. One concrete specific detail per line — not abstractions. Instead of 'improve your marketing', "
+        "      write 'add 3 new leads/week from WhatsApp' or 'cut cost-per-lead from ₹800 to ₹200'.\n"
+        "   c. Write like a sharp human copywriter who knows THIS business, not a generic template.\n"
+        "   d. SELF-CHECK before output: scan every ad line. If it could run word-for-word for any other "
+        "      business in this industry, rewrite it with a detail specific to this business, city, or offer.\n"
+        "   e. Forbidden AI patterns: 'unlock your potential', 'transform your journey', 'achieve your goals', "
+        "      'take the first step', 'your dream awaits', 'elevate your experience'. Rewrite with specifics.\n\n"
         "=== META ADS LAUNCH KIT ===\n"
         f"Campaign Name: [exact name — format: City_Industry_Goal_{_month_short}, e.g. {city_label.replace(' ', '')}_Coaching_Leads_{_month_short}]\n"
         f"Objective: [exact Meta objective — Leads / Traffic / Engagement / Sales — state which and why]\n"
@@ -2391,6 +2401,13 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "1. [behavior]\n2. [behavior]\n3. [behavior if relevant]\n"
         "Exclude: [specific audience to exclude — e.g. existing customers, competitors, students]\n"
         "Placements: Automatic placements recommended. Exclude: Audience Network (low quality), Right Column (low CTR).\n"
+        "TARGETING PARAMETERS (paste-ready for Meta Ads Manager — must be precise, not generic):\n"
+        "Interest/Behavior Targeting — list 5-8 exact Meta interest names AS THEY APPEAR IN ADS MANAGER:\n"
+        "(e.g. 'Small business owners', 'Digital marketing', 'HubSpot', 'Shopify', not 'business people')\n"
+        "Budget Optimization: [CBO — explain why / ABO — explain why, for this specific business type]\n"
+        "Placement Selection: [which of Feed/Story/Reels/Audience Network to INCLUDE, which to EXCLUDE — "
+        "with one-line reason for each decision based on this audience's behavior]\n"
+        "Data Label: [REAL — from this account's past performance data / BENCHMARK — industry estimate]\n\n"
         "---\n"
         "AD VARIATION 1 — PAIN ANGLE\n"
         "Primary Text: [4-5 lines. Open with their specific pain. Close with exact CTA: 'WhatsApp pe FREE AUDIT bhejo']\n"
@@ -2688,15 +2705,45 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         except Exception:
             pass
 
+    # ── Meta-specific Competitive Edge ────────────────────────────────────────
+    meta_competitive_edge_report = None
+    try:
+        _meta_ce_query    = f'{_ce_industry} Meta Facebook ads competitor India {city_label} 2026 social media creative'
+        _meta_ce_research = await fetch_tavily(_meta_ce_query)
+        _meta_headlines   = campaign_assets["headlines"][:3]
+        _meta_descs       = campaign_assets["descriptions"][:2]
+        if _meta_ce_research and (_meta_headlines or _meta_descs):
+            meta_competitive_edge_report = await _score_competitive_edge(
+                business_label=biz_label,
+                city_label=city_label,
+                industry=request.industry or biz_label,
+                sample_headlines=_meta_headlines,
+                sample_descriptions=_meta_descs,
+                competitor_research=_meta_ce_research,
+            )
+            meta_dimensions = [
+                "Hook Strength (first 3 words)",
+                "Visual-Text Alignment",
+                "Scroll-Stopping Potential",
+                "CTA Clarity",
+            ]
+            if meta_competitive_edge_report and meta_competitive_edge_report.get("dimensions_compared"):
+                for i, dim in enumerate(meta_competitive_edge_report["dimensions_compared"]):
+                    if i < len(meta_dimensions):
+                        dim["dimension"] = meta_dimensions[i]
+    except Exception as _mce:
+        logger.warning(f"[CAMPAIGN KIT] Meta competitive edge scoring skipped: {_mce}")
+
     return {
-        "success":                True,
-        "meta_kit":               meta_kit or full_text,
-        "google_kit":             google_kit,
-        "remarketing_kit":        remarketing_kit,
-        "tracking_kit":           tracking_kit,
-        "lp_checklist":           lp_checklist,
-        "business_key":           business_key,
-        "competitive_edge_report": competitive_edge_report,
+        "success":                     True,
+        "meta_kit":                    meta_kit or full_text,
+        "google_kit":                  google_kit,
+        "remarketing_kit":             remarketing_kit,
+        "tracking_kit":                tracking_kit,
+        "lp_checklist":                lp_checklist,
+        "business_key":                business_key,
+        "competitive_edge_report":     competitive_edge_report,
+        "meta_competitive_edge_report": meta_competitive_edge_report,
     }
 
 
@@ -8216,6 +8263,66 @@ def _policy_precheck_ad_copy(headlines: list, descriptions: list) -> tuple:
     return clean_headlines, clean_descriptions, warnings
 
 
+def _meta_policy_precheck_ad_copy(primary_text: str, headline: str) -> tuple:
+    """
+    Meta-specific policy pre-flight cleaner: strips/flags patterns that violate
+    Meta's ad policies (personal attributes, before/after claims, health/earnings
+    promises, unsubstantiated superlatives, discriminatory targeting signals).
+    Returns (clean_primary_text, clean_headline, warnings: list[dict]) where each
+    warning has {policy_category, flagged_text, reason}.
+    """
+    warnings_list = []
+
+    _META_RULES = [
+        {
+            "pattern": re.compile(r'\bare you\b.*\?|\bdo you\b.*\?|\bif you\b.*(?:struggle|suffer|have trouble|can\'t|cant|losing|feel)', re.I),
+            "policy_category": "Personal Attributes (Meta Policy 4.3)",
+            "reason": "Meta prohibits ad copy that implies knowledge of a user's personal attributes or circumstances.",
+        },
+        {
+            "pattern": re.compile(r'\b(?:in \d+ days?|in just \d+|in as little as|lose \d+|gained \d+ pounds?|results in|guaranteed results)\b', re.I),
+            "policy_category": "Before/After Claims (Meta Policy 4.4)",
+            "reason": "Meta prohibits before/after depictions or result-promise claims without substantiation.",
+        },
+        {
+            "pattern": re.compile(r'\b(?:cure[sd]?|treat[s]?|heal[s]?|diagnos|earn[s]? (?:₹|\$|Rs\.?)\s*\d+|passive income|make money (?:from home|online|fast)|guaranteed income)\b', re.I),
+            "policy_category": "Health/Earnings Claims (Meta Policy 3.1)",
+            "reason": "Meta prohibits unsubstantiated health claims and income/earnings guarantees.",
+        },
+        {
+            "pattern": re.compile(r'\b(?:#1|number one|world\'s (?:best|top|leading)|most trusted|only one that)\b', re.I),
+            "policy_category": "Unsubstantiated Superlatives (Meta Policy 4.7)",
+            "reason": "Meta requires proof for superlative claims; unverifiable #1/world's-best language is prohibited.",
+        },
+        {
+            "pattern": re.compile(r'\b(?:over \d{2}s only|for (?:men|women) only|only for (?:hindus?|muslims?|christians?))\b', re.I),
+            "policy_category": "Discrimination (Meta Policy 4.2)",
+            "reason": "Meta prohibits ads that discriminate or restrict audience based on personal attributes.",
+        },
+    ]
+
+    def _scrub(text: str) -> str:
+        for rule in _META_RULES:
+            m = rule["pattern"].search(text)
+            if m:
+                flagged = m.group(0)
+                warnings_list.append({
+                    "policy_category": rule["policy_category"],
+                    "flagged_text":    flagged,
+                    "reason":          rule["reason"],
+                })
+                text = rule["pattern"].sub('', text)
+                text = re.sub(r'\s{2,}', ' ', text).strip(' -,.')
+        return text
+
+    clean_primary = _scrub(primary_text)
+    clean_headline = _scrub(headline)
+
+    if warnings_list:
+        logger.info(f"[META PRECHECK] Cleaned {len(warnings_list)} policy-risk pattern(s): {warnings_list}")
+    return clean_primary, clean_headline, warnings_list
+
+
 def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
                     final_url: str, customer_id: str):
     """
@@ -9044,6 +9151,27 @@ async def meta_ads_performance(date_range: str = "last_30d"):
 
 # ── Meta Ads Campaign Creation (write access — PAUSED by default) ───────────
 
+class MetaPreflightRequest(BaseModel):
+    url:          str   = ""
+    budget_daily: float = 500
+    primary_text: str   = ""
+    headline:     str   = ""
+    creative_id:  str   = ""
+
+
+@app.post("/meta-ads/preflight")
+async def meta_ads_preflight(request: MetaPreflightRequest):
+    """Zero-Waste Meta pre-flight check — call this before showing the Meta launch confirmation."""
+    result = await run_meta_launch_preflight(
+        url=request.url,
+        budget_daily=request.budget_daily,
+        primary_text=request.primary_text,
+        headline=request.headline,
+        creative_id=request.creative_id,
+    )
+    return {"success": True, "launch_readiness": result}
+
+
 class CreateMetaCampaignRequest(BaseModel):
     campaign_name: str   = ""              # auto-derived from url/industry/city if blank
     objective:     str   = "OUTCOME_LEADS"
@@ -9056,6 +9184,7 @@ class CreateMetaCampaignRequest(BaseModel):
     creative_id:   str   = ""              # existing Post ID (object_story_id), created manually
                                             # in Ads Manager — required to complete the Ad step
                                             # while the app is in Development Mode (see below)
+    force_override: bool = False           # skip blocking pre-flight issues
 
 
 def _resolve_meta_targeting_sync(city: str) -> dict:
@@ -9118,21 +9247,13 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
     from facebook_business.adobjects.ad import Ad
     from facebook_business.exceptions import FacebookRequestError
 
-    try:
-        _, account_id = get_meta_ads_client()
-    except RuntimeError as _e:
-        return {"success": False, "error": str(_e)}
-
-    # ── Resolve business_key (same derivation + city-fallback lookup as
-    # /google-ads/create-campaign) so a blank/mismatched city or legacy key
-    # still resolves to the right campaign_memory row ───────────────────────
+    # ── Resolve business_key + pull ad copy FIRST (needed for preflight) ────
     lookup_source = request.business_key or request.url
     resolved_business_key = (
         derive_business_key(lookup_source, request.industry, request.city)
         if lookup_source else ""
     )
 
-    # ── Pull ad copy / city / landing URL from campaign_memory ──────────────
     headline      = "Grow Your Business Today"
     primary_text  = "Reach more customers with a campaign built for results."
     description   = ""
@@ -9167,8 +9288,6 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         final_url = (website.get("url") or "").strip()
 
         if not final_url:
-            # business_key is derived as "domain.com::industry::city" for
-            # URL-mode businesses — reuse the domain segment as a last resort.
             domain = resolved_business_key.strip().split("::")[0].strip()
             if domain and "." in domain and " " not in domain:
                 final_url = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
@@ -9193,6 +9312,28 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
         f"[META ADS CREATE] business_key={request.business_key!r} city={city!r} "
         f"final_url={final_url!r} placeholder={final_url_is_placeholder}"
     )
+
+    # ── Meta account config (needed for actual API calls) ───────────────────
+    try:
+        _, account_id = get_meta_ads_client()
+    except RuntimeError as _e:
+        return {"success": False, "error": str(_e)}
+
+    # ── Zero-Waste Meta pre-flight check ────────────────────────────────────
+    _meta_preflight = await run_meta_launch_preflight(
+        url=(request.url or "").strip(),
+        budget_daily=request.daily_budget,
+        primary_text=primary_text,
+        headline=headline,
+        creative_id=request.creative_id,
+    )
+    if not _meta_preflight["ready_to_launch"] and not request.force_override:
+        return {
+            "success":          False,
+            "preflight_blocked": True,
+            "launch_readiness": _meta_preflight,
+            "message":          "Meta pre-flight check failed.",
+        }
 
     created = {}
     try:
@@ -9277,6 +9418,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
                 "targeting_used":        targeting,
                 "message":               message,
                 "meta_ads_manager_link": ads_manager_link,
+                "launch_readiness":      _meta_preflight,
             }
 
         # creative_id given: reference the EXISTING post via object_story_id
@@ -9328,6 +9470,7 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
             "final_url":               final_url,
             "final_url_is_placeholder": final_url_is_placeholder,
             "meta_ads_manager_link":   ads_manager_link,
+            "launch_readiness":        _meta_preflight,
         }
 
     except FacebookRequestError as ex:
@@ -11259,6 +11402,9 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     # ── PROMPT 2: creative copy + design recommendations ─────────────────────
     prompt_creative = (
         _identity + shared_context + _compliance_rules +
+        "HUMAN COPYWRITER RULE: Write like a human marketer who knows this specific business, not a generic "
+        "template. Vary sentence length, use concrete specific details (numbers, city names, outcomes), "
+        "avoid stacked emotional intensifiers and formulaic hook-body-CTA patterns.\n\n"
         f"TASK: Generate ONLY the creative ad copy and design recommendations for this {business_type} "
         "campaign — headlines, descriptions, CTAs, and visual design guidance. Nothing else.\n\n"
         "CHARACTER LIMITS — STRICT:\n"
@@ -12214,6 +12360,138 @@ async def run_launch_preflight(
         "warnings":         warnings,
         "tracking_status":  tracking_status,
         "tracking_label":   label,
+        "summary": (
+            f"Ready to launch — {len(warnings)} note(s)" if ready
+            else f"{len(blocking_issues)} blocking issue(s), {len(warnings)} warning(s)"
+        ),
+    }
+
+
+async def run_meta_launch_preflight(
+    url: str,
+    budget_daily: float,
+    primary_text: str,
+    headline: str,
+    creative_id: str,
+) -> dict:
+    """Run all Zero-Waste pre-flight checks before launching a Meta campaign."""
+    blocking_issues: list = []
+    warnings: list = []
+
+    # Check 1 — Account configuration
+    def _check_meta_account():
+        get_meta_ads_client()
+
+    try:
+        await asyncio.to_thread(_check_meta_account)
+    except RuntimeError as _ae:
+        blocking_issues.append({
+            "code":     "META_ACCOUNT_NOT_CONFIGURED",
+            "message":  (
+                f"Meta Ads account not configured: {_ae}. "
+                "Set META_APP_ID, META_APP_SECRET, META_ACCESS_TOKEN, META_AD_ACCOUNT_ID env vars."
+            ),
+            "severity": "blocking",
+        })
+
+    # Check 2 — Landing page reachability
+    if url:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10) as hc:
+                resp = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code >= 400:
+                blocking_issues.append({
+                    "code":     "LANDING_PAGE_ERROR",
+                    "message":  (
+                        f"Landing page returned HTTP {resp.status_code}. "
+                        "Ad spend will be wasted on a broken destination. Fix the URL before launching."
+                    ),
+                    "severity": "blocking",
+                })
+            elif str(resp.url) != url:
+                warnings.append({
+                    "code":     "LANDING_PAGE_REDIRECT",
+                    "message":  f"Landing page redirects to {resp.url}. Verify the final destination is correct.",
+                    "severity": "warning",
+                })
+        except Exception as _le:
+            blocking_issues.append({
+                "code":     "LANDING_PAGE_UNREACHABLE",
+                "message":  (
+                    f"Landing page is unreachable ({type(_le).__name__}: {str(_le)[:80]}). "
+                    "Verify the URL is live before launching."
+                ),
+                "severity": "blocking",
+            })
+    else:
+        warnings.append({
+            "code":     "NO_LANDING_URL",
+            "message":  "No landing page URL provided. Verify ad destination is set in Meta Ads Manager.",
+            "severity": "warning",
+        })
+
+    # Check 3 — Budget significance (30-day projection)
+    thirty_day = budget_daily * 30
+    if thirty_day < _DATA_SUFFICIENCY_THRESHOLDS["min_spend"]:
+        blocking_issues.append({
+            "code":     "BUDGET_INSUFFICIENT",
+            "message":  (
+                f"₹{budget_daily}/day = ₹{thirty_day:.0f} over 30 days — "
+                f"below the ₹{_DATA_SUFFICIENCY_THRESHOLDS['min_spend']} minimum needed to collect meaningful data. "
+                "Increase budget or you'll never have enough signal to optimize."
+            ),
+            "severity": "blocking",
+        })
+    elif thirty_day < 2000:
+        warnings.append({
+            "code":     "BUDGET_LOW",
+            "message":  (
+                f"₹{budget_daily}/day is low. Meta needs sufficient budget to exit the learning phase — "
+                f"aim for ₹{int(2000/30)+1}+/day to get meaningful delivery and optimization data."
+            ),
+            "severity": "warning",
+        })
+
+    # Check 4 — Meta Pixel
+    if not _genv("META_PIXEL_ID"):
+        warnings.append({
+            "code":     "NO_META_PIXEL",
+            "message":  (
+                "META_PIXEL_ID not configured. Conversion tracking will not record which ads drove results. "
+                "Set up Meta Pixel and configure conversion events."
+            ),
+            "severity": "warning",
+        })
+
+    # Check 5 — Creative / Post ID (warning only — expected in Dev Mode)
+    if not (creative_id or "").strip():
+        warnings.append({
+            "code":     "NO_CREATIVE_ID",
+            "message":  (
+                "No Post ID provided. Meta Ads in Development Mode cannot auto-create ad creatives — "
+                "you'll need to manually create the ad in Meta Ads Manager after the campaign is created. "
+                "This is a Meta platform restriction, not an Adsoh limitation."
+            ),
+            "severity": "warning",
+        })
+
+    # Check 6 — Policy pre-check on ad copy
+    if primary_text or headline:
+        _, _, policy_flags = _meta_policy_precheck_ad_copy(primary_text or "", headline or "")
+        for pf in policy_flags[:5]:
+            warnings.append({
+                "code":     "META_POLICY_RISK",
+                "message":  (
+                    f"[{pf['policy_category']}] Flagged text: \"{pf['flagged_text']}\" — {pf['reason']}"
+                ),
+                "severity": "warning",
+            })
+
+    ready = len(blocking_issues) == 0
+    return {
+        "ready_to_launch": ready,
+        "blocking_issues": blocking_issues,
+        "warnings":        warnings,
         "summary": (
             f"Ready to launch — {len(warnings)} note(s)" if ready
             else f"{len(blocking_issues)} blocking issue(s), {len(warnings)} warning(s)"
