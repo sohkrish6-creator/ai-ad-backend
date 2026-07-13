@@ -10619,6 +10619,175 @@ except Exception:
     pass
 
 
+# ── Placement-level performance memory ───────────────────────────────────────
+_PLACEMENT_PERF_DDL = """
+CREATE TABLE IF NOT EXISTS placement_performance_memory (
+    id                BIGSERIAL PRIMARY KEY,
+    business_key      TEXT NOT NULL,
+    business_type     TEXT NOT NULL DEFAULT 'Cricket Community',
+    placement_name    TEXT NOT NULL,
+    placement_url     TEXT,
+    campaign_id       TEXT,
+    impressions       INTEGER DEFAULT 0,
+    clicks            INTEGER DEFAULT 0,
+    ctr               REAL DEFAULT 0,
+    cost              REAL DEFAULT 0,
+    joins             REAL DEFAULT 0,
+    cost_per_join     REAL DEFAULT 0,
+    performance_rating TEXT DEFAULT 'average',
+    recorded_at       TEXT
+);
+"""
+
+def _create_placement_perf_table():
+    try:
+        ddl = _PLACEMENT_PERF_DDL
+        if _is_sqlite:
+            ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        with engine.connect() as conn:
+            conn.execute(text(ddl))
+            conn.commit()
+        logger.info("[CRICKET] placement_performance_memory table ready")
+    except Exception as _e:
+        logger.warning(f"[CRICKET] placement_performance_memory create failed: {_e}")
+
+try:
+    _create_placement_perf_table()
+except Exception:
+    pass
+
+
+def save_placement_performance(business_key: str, business_type: str, rows: list):
+    """Insert placement-level performance rows from a Google Ads placement report."""
+    now = datetime.utcnow().isoformat()
+    saved = 0
+    try:
+        with engine.begin() as conn:
+            for row in rows:
+                pname = (row.get("placement_name") or "").strip()
+                if not pname:
+                    continue
+                impr   = int(row.get("impressions") or 0)
+                clicks = int(row.get("clicks") or 0)
+                cost   = float(row.get("cost") or 0)
+                joins  = float(row.get("joins") or 0)
+                ctr    = float(row.get("ctr") or 0)
+                cpj    = round(cost / joins, 2) if joins > 0 else 0.0
+                if joins > 0 or ctr > 1.5:
+                    rating = "good"
+                elif ctr < 0.3 and impr > 100:
+                    rating = "poor"
+                else:
+                    rating = "average"
+                conn.execute(text(
+                    "INSERT INTO placement_performance_memory "
+                    "(business_key, business_type, placement_name, placement_url, campaign_id, "
+                    "impressions, clicks, ctr, cost, joins, cost_per_join, performance_rating, recorded_at) "
+                    "VALUES (:bk, :bt, :pn, :pu, :ci, :imp, :cl, :ctr, :cost, :joins, :cpj, :rating, :ts)"
+                ), {
+                    "bk": business_key, "bt": business_type,
+                    "pn": pname, "pu": row.get("placement_url", ""),
+                    "ci": row.get("campaign_id", ""),
+                    "imp": impr, "cl": clicks, "ctr": ctr,
+                    "cost": cost, "joins": joins, "cpj": cpj,
+                    "rating": rating, "ts": now,
+                })
+                saved += 1
+        logger.info(f"[CRICKET] Saved {saved} placement_performance rows for {business_key!r}")
+    except Exception as _e:
+        logger.warning(f"[CRICKET] placement_performance_memory save failed: {_e}")
+
+
+def get_placement_track_records(business_key: str, business_type: str) -> dict:
+    """
+    Return a dict keyed by lowercased placement_name. Each value contains aggregated
+    stats across all recorded runs. Primary signal: exact business_key (data_label=REAL).
+    Secondary: cross-business same business_type (data_label=BENCHMARK).
+    """
+    from collections import Counter
+    buckets: dict = {}
+    try:
+        with engine.connect() as conn:
+            for is_same, rows in (
+                (True,  conn.execute(text(
+                    "SELECT placement_name, placement_url, impressions, clicks, cost, joins, performance_rating "
+                    "FROM placement_performance_memory WHERE business_key=:bk ORDER BY recorded_at DESC"
+                ), {"bk": business_key}).mappings().all()),
+                (False, conn.execute(text(
+                    "SELECT placement_name, placement_url, impressions, clicks, cost, joins, performance_rating "
+                    "FROM placement_performance_memory WHERE business_type=:bt AND business_key!=:bk "
+                    "ORDER BY recorded_at DESC LIMIT 60"
+                ), {"bt": business_type, "bk": business_key}).mappings().all()),
+            ):
+                for r in rows:
+                    pn = (r["placement_name"] or "").lower().strip()
+                    if not pn or (pn in buckets and buckets[pn]["is_same_business"]):
+                        continue  # same-business data takes precedence
+                    if pn not in buckets:
+                        buckets[pn] = {
+                            "placement_name": r["placement_name"],
+                            "placement_url":  r["placement_url"] or "",
+                            "campaigns": 0, "total_joins": 0.0, "total_cost": 0.0,
+                            "total_impr": 0, "total_clicks": 0,
+                            "ratings": [], "is_same_business": is_same,
+                            "data_label": "REAL" if is_same else "BENCHMARK",
+                        }
+                    b = buckets[pn]
+                    b["campaigns"]    += 1
+                    b["total_joins"]  += float(r["joins"]       or 0)
+                    b["total_cost"]   += float(r["cost"]        or 0)
+                    b["total_impr"]   += int(r["impressions"]   or 0)
+                    b["total_clicks"] += int(r["clicks"]        or 0)
+                    b["ratings"].append(r["performance_rating"] or "average")
+    except Exception as _e:
+        logger.warning(f"[CRICKET] get_placement_track_records failed: {_e}")
+        return {}
+
+    result = {}
+    for pn, b in buckets.items():
+        avg_cpj = round(b["total_cost"] / b["total_joins"], 2) if b["total_joins"] > 0 else 0.0
+        avg_ctr = round(b["total_clicks"] / b["total_impr"] * 100, 2) if b["total_impr"] > 0 else 0.0
+        dominant = Counter(b["ratings"]).most_common(1)[0][0] if b["ratings"] else "average"
+        result[pn] = {
+            "placement_name":   b["placement_name"],
+            "placement_url":    b["placement_url"],
+            "campaigns":        b["campaigns"],
+            "avg_cost_per_join": avg_cpj,
+            "avg_ctr":          avg_ctr,
+            "performance_rating": dominant,
+            "is_same_business": b["is_same_business"],
+            "data_label":       b["data_label"],
+        }
+    return result
+
+
+def placement_learning_block(track_records: dict) -> str:
+    """Render placement track records as a prompt-ready instruction block."""
+    if not track_records:
+        return ""
+    lines = []
+    for _pn, rec in sorted(track_records.items(),
+                            key=lambda x: (x[1]["performance_rating"] != "good", -x[1]["campaigns"])):
+        scope  = "this business" if rec["is_same_business"] else "cross-business same type"
+        cpj    = f"₹{rec['avg_cost_per_join']}/join" if rec["avg_cost_per_join"] else "no join data"
+        lines.append(
+            f"- {rec['placement_name']}: {rec['campaigns']} campaign(s) [{scope}], "
+            f"avg CTR {rec['avg_ctr']}%, {cpj}, rated {rec['performance_rating'].upper()} "
+            f"[data: {rec['data_label']}]"
+        )
+    return (
+        "PLACEMENT TRACK RECORD — real performance data from past campaigns "
+        "(use this to adjust suitability_score and priority before output):\n"
+        + "\n".join(lines) + "\n"
+        "INSTRUCTIONS FOR TRACK RECORD:\n"
+        "- Rated GOOD: boost suitability_score by +10 (cap 100), keep/raise priority to high\n"
+        "- Rated POOR: lower priority to low (still include), lower suitability_score by -10\n"
+        "- Set track_record field: 'Used in N past campaign(s), avg CTR X%, avg cost/join ₹Y, "
+        "rated [GOOD/AVERAGE/POOR] | data: [REAL/BENCHMARK]'\n"
+        "- For placements NOT in this list: track_record = 'No prior data — benchmark estimate only'\n\n"
+    )
+
+
 def save_cricket_memory(business_key: str, data: dict):
     _now = datetime.utcnow().isoformat()
     try:
@@ -10754,6 +10923,24 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
 
     # ── 2b. Learning Engine: cross-business winning patterns for sports/gaming ──
     _growth_block = growth_learning_block("sports_gaming", label="SPORTS/GAMING LEARNING")
+
+    # ── 2c. Placement-level track records for this business + cross-business ──
+    _track_records    = get_placement_track_records(biz_key, business_type)
+    _placement_learning = placement_learning_block(_track_records)
+    # Build a human-readable note for placements where learning changed the score
+    _placement_learning_note = ""
+    if _track_records:
+        _influenced = [
+            f"{rec['placement_name']} (rated {rec['performance_rating']}, "
+            f"{rec['campaigns']} campaign(s), data: {rec['data_label']})"
+            for rec in _track_records.values()
+            if rec["performance_rating"] in ("good", "poor")
+        ]
+        if _influenced:
+            _placement_learning_note = (
+                "Placement learning influenced recommendations: "
+                + "; ".join(_influenced[:6])
+            )
 
     # ── 3. Shared context + 4 parallel prompts ───────────────────────────────
     # Cricket Media Buying Brain upgrade: the single mega-prompt this endpoint used
@@ -11053,7 +11240,8 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         _identity + shared_context +
         f"TASK: Generate ONLY the placement inventory and YouTube inventory for this {business_type} campaign. "
         "Nothing else.\n\n"
-        "KNOWN PLACEMENT IDs — use these exact values in placement_url and app_package_name:\n"
+        + _placement_learning  # empty string when no track records exist — no impact on output
+        + "KNOWN PLACEMENT IDs — use these exact values in placement_url and app_package_name:\n"
         "- Cricbuzz: website=cricbuzz.com | Android app=com.cricbuzz.android | placement_id_type=EXACT_URL_FOUND\n"
         "- ESPN Cricinfo: website=espncricinfo.com | Android app=com.espncricinfo.escore | placement_id_type=EXACT_URL_FOUND\n"
         "- Fancode: website=fancode.sports | Android app=com.dream11.fancode | placement_id_type=EXACT_URL_FOUND\n"
@@ -11110,8 +11298,9 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '"expected_join_rate": "...", "competition": "medium", "suitability_score": 0, '
         '"recommended_creative_type": "...", "banner_sizes": ["300x250", "320x50"], "priority": "high", '
         '"daily_budget": "₹...", "campaign_days": 14, "total_allocation": "₹... for 14 days", '
-        '"expected_joins": "...", "data_label": "BENCHMARK" }\n'
-        '    // ... 7-9 more items (8-10 total), each a DIFFERENT platform, with placement_url/app_package_name/placement_id_type/ad_unit_position/daily_budget/campaign_days/total_allocation/expected_joins/data_label ALL populated\n'
+        '"expected_joins": "...", "data_label": "BENCHMARK", '
+        '"track_record": "No prior data — benchmark estimate only" }\n'
+        '    // ... 7-9 more items (8-10 total), each a DIFFERENT platform, with ALL fields including track_record populated\n'
         '  ],\n'
         '  "youtube_inventory": [\n'
         '    { "channel": "Star Sports", "audience": "...", "estimated_reach": "...", "ad_type_fit": "skippable", '
@@ -11523,11 +11712,13 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     )
 
     return {
-        "success":        True,
-        "data":           result,
-        "business_type":  business_type,
-        "memory_reused":  memory_reused,
-        "warnings":       warnings,
+        "success":                  True,
+        "data":                     result,
+        "business_type":            business_type,
+        "memory_reused":            memory_reused,
+        "warnings":                 warnings,
+        "placement_learning_note":  _placement_learning_note,
+        "placement_track_records":  len(_track_records),
     }
 
 
@@ -11909,6 +12100,41 @@ async def cricket_ads_performance(customer_id: str, login_customer_id: str = "",
         "date_range":       f"{days}d",
         "overall_health":   performance_data["overall_health"],
     })
+
+    # ── Attempt placement-level breakdown from group_placement_view ──────────
+    placement_rows: list = []
+    placement_data_note: str = ""
+    try:
+        raw_placements = await asyncio.to_thread(
+            _fetch_gads_placement_sync, client_, cid,
+            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+        )
+        if raw_placements:
+            placement_rows = raw_placements
+            await asyncio.to_thread(
+                save_placement_performance,
+                business_key, "Cricket Community", raw_placements,
+            )
+            placement_data_note = (
+                f"Captured {len(raw_placements)} placement(s) from Google Ads placement report "
+                f"and saved to placement_performance_memory for future recommendations."
+            )
+            logger.info(f"[CRICKET-PERF] Saved {len(raw_placements)} placement records for {business_key!r}")
+        else:
+            placement_data_note = (
+                "Google Ads placement report returned 0 rows for this window — "
+                "campaign may have no Display Network spend yet, or data is still processing."
+            )
+    except Exception as _pe:
+        placement_data_note = (
+            f"Placement-level report unavailable via API ({type(_pe).__name__}). "
+            "Performance captured at campaign level only — placement learning will activate "
+            "once campaigns have accrued Display Network impressions."
+        )
+        logger.info(f"[CRICKET-PERF] Placement-level fetch skipped: {_pe}")
+
+    performance_data["placement_breakdown"] = placement_rows
+    performance_data["placement_data_note"] = placement_data_note
 
     return {
         "success":      True,
@@ -13212,6 +13438,42 @@ def _fetch_gads_ad_groups_sync(client_, customer_id: str, start: str, end: str) 
             "clicks": r.metrics.clicks,
             "cost_micros": r.metrics.cost_micros,
             "conversions": r.metrics.conversions,
+        })
+    return rows
+
+
+def _fetch_gads_placement_sync(client_, customer_id: str, start: str, end: str) -> list:
+    """Fetch Display Network placement-level performance via group_placement_view GAQL."""
+    svc = client_.get_service("GoogleAdsService")
+    query = f"""
+        SELECT group_placement_view.display_name,
+               group_placement_view.placement,
+               group_placement_view.placement_type,
+               campaign.id,
+               metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM group_placement_view
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+          AND metrics.impressions > 0
+        ORDER BY metrics.impressions DESC
+        LIMIT 60
+    """
+    rows = []
+    for r in svc.search(customer_id=customer_id, query=query):
+        impr   = r.metrics.impressions
+        clicks = r.metrics.clicks
+        cost   = r.metrics.cost_micros / 1_000_000
+        ctr    = round(clicks / impr * 100, 3) if impr else 0.0
+        placement = r.group_placement_view.placement or ""
+        display   = r.group_placement_view.display_name or placement
+        rows.append({
+            "placement_name": display,
+            "placement_url":  placement,
+            "campaign_id":    str(r.campaign.id),
+            "impressions":    impr,
+            "clicks":         clicks,
+            "cost":           cost,
+            "ctr":            ctr,
+            "joins":          r.metrics.conversions,
         })
     return rows
 
