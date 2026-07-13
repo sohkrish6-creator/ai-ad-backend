@@ -2669,51 +2669,18 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
                 f"{len(campaign_assets['headlines'])} headlines, {len(campaign_assets['descriptions'])} descriptions",
     )
 
-    # ── Competitive Edge Score ─────────────────────────────────────────────────
+    # ── Competitive Edge Score (shared function) ───────────────────────────────
     competitive_edge_report = None
     try:
         _competitor_research = await _ce_task   # wait for the parallel Tavily call
-        _sample_headlines = campaign_assets["headlines"][:6]
-        _sample_descs     = campaign_assets["descriptions"][:3]
-
-        if _competitor_research and (_sample_headlines or _sample_descs):
-            _edge_prompt = (
-                f"You are an honest ad strategist. Compare this business's generated ad copy against "
-                f"real competitor ads found in research. Be brutally honest — do NOT hide competitor strengths.\n\n"
-                f"BUSINESS: {biz_label} | CITY: {city_label} | INDUSTRY: {request.industry}\n\n"
-                f"OUR GENERATED HEADLINES:\n" + "\n".join(f"- {h}" for h in _sample_headlines) + "\n\n"
-                f"OUR DESCRIPTIONS:\n" + "\n".join(f"- {d}" for d in _sample_descs) + "\n\n"
-                f"COMPETITOR AD RESEARCH (live web data):\n{_competitor_research[:2500]}\n\n"
-                "Score our ad vs competitors on 4 dimensions (1-10 each). For each, note what competitors do better.\n"
-                "Return ONLY valid JSON (no markdown):\n"
-                '{"dimensions_compared": ['
-                '{"dimension": "Headline Specificity", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
-                '{"dimension": "Offer Clarity", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
-                '{"dimension": "CTA Strength", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
-                '{"dimension": "Unique Differentiator", "our_score": 7, "competitor_avg": 6, "notes": "..."}'
-                '], "where_we_win": ["one specific thing our ad does better"], '
-                '"where_competitors_are_stronger": ["one specific honest gap — never leave this empty"], '
-                '"overall_edge_summary": "2-sentence honest summary"}'
-            )
-
-            def _edge_score_sync():
-                r = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": _edge_prompt}],
-                    temperature=0.2,
-                    max_tokens=600,
-                    response_format={"type": "json_object"},
-                )
-                return r.choices[0].message.content
-
-            _edge_raw = await asyncio.to_thread(_edge_score_sync)
-            competitive_edge_report = json.loads(_edge_raw)
-
-            # Enforce honesty — never allow an empty "where they're stronger" list
-            if not competitive_edge_report.get("where_competitors_are_stronger"):
-                competitive_edge_report["where_competitors_are_stronger"] = [
-                    "Insufficient competitor data to identify specific gaps — treat all scores with caution"
-                ]
+        competitive_edge_report = await _score_competitive_edge(
+            business_label=biz_label,
+            city_label=city_label,
+            industry=request.industry or biz_label,
+            sample_headlines=campaign_assets["headlines"][:6],
+            sample_descriptions=campaign_assets["descriptions"][:3],
+            competitor_research=_competitor_research or "",
+        )
     except Exception as _cee:
         logger.warning(f"[CAMPAIGN KIT] Competitive edge scoring skipped (non-fatal): {_cee}")
         try:
@@ -7843,6 +7810,7 @@ class CreateCampaignRequest(BaseModel):
     url:            str  = ""             # business website — used as key fallback + ad final_url
     industry:       str  = ""             # used with city for get_memory_with_city_fallback
     city:           str  = ""
+    force_override: bool = False           # skip blocking pre-flight issues
 
 class CreateAdRequest(BaseModel):
     campaign_id:    str
@@ -8367,12 +8335,63 @@ def _create_sitelinks_sync(campaign_rn: str, sitelinks: list, customer_id: str):
     return [r.resource_name for r in link_resp.results]
 
 
+class GadsPreflightRequest(BaseModel):
+    url:          str   = ""
+    budget_daily: float = 500
+    headlines:    list  = []
+    descriptions: list  = []
+
+
+@app.post("/google-ads/preflight")
+async def gads_preflight(request: GadsPreflightRequest):
+    """Zero-Waste pre-flight check for the main Google Ads account."""
+    final_url    = request.url.strip()
+    budget_daily = request.budget_daily
+    headlines    = request.headlines
+    descriptions = request.descriptions
+    customer_id  = _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
+    try:
+        preflight = await run_launch_preflight(
+            customer_id=customer_id,
+            login_customer_id=None,
+            final_url=final_url,
+            budget_daily=budget_daily,
+            headlines=headlines,
+            descriptions=descriptions,
+            tracking_status_fn=_fetch_conversion_tracking_status,
+        )
+        return {"success": True, "launch_readiness": preflight}
+    except Exception as _e:
+        logger.error(f"[GADS-PREFLIGHT] Error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
 @app.post("/google-ads/create-campaign")
 async def gads_create_campaign(request: CreateCampaignRequest):
     try:
         customer_id = _gads_customer_id()
         if not customer_id:
             return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
+
+        # ── Zero-Waste pre-flight (safety net) ──────────────────────────────
+        _preflight = await run_launch_preflight(
+            customer_id=customer_id,
+            login_customer_id=None,
+            final_url=request.url.strip(),
+            budget_daily=request.budget_daily,
+            headlines=[],
+            descriptions=[],
+            tracking_status_fn=_fetch_conversion_tracking_status,
+        )
+        if not _preflight["ready_to_launch"] and not request.force_override:
+            return {
+                "success":          False,
+                "preflight_blocked": True,
+                "launch_readiness": _preflight,
+                "message":          "Pre-flight check failed. Fix blocking issues or set force_override=true to proceed.",
+            }
 
         logger.info(f"[GADS-CREATE] campaign={request.campaign_name!r} budget_daily={request.budget_daily} type={request.campaign_type}")
 
@@ -8563,7 +8582,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             reference_id=result["campaign_id"],
         )
 
-        return {"success": True, **result}
+        return {"success": True, "launch_readiness": _preflight, **result}
 
     except GoogleAdsException as ex:
         error_details = []
@@ -10952,6 +10971,7 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     calendar_context = ""
     competitor_context = ""
     inventory_context = ""
+    _ce_research = ""   # competitive edge research, fetched in parallel below
     if TAVILY_API_KEY:
         _now_str = datetime.now().strftime("%B %Y")
         _q_context = (
@@ -10975,8 +10995,13 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
             "cricket, OEM cricket widgets, YouTube cricket channels like Star Sports and ICC — audience size, "
             "app usage trends, ad inventory availability"
         )
-        cricket_context, calendar_context, competitor_context, inventory_context = await asyncio.gather(
-            fetch_tavily(_q_context), fetch_tavily(_q_calendar), fetch_tavily(_q_competitor), fetch_tavily(_q_inventory),
+        _q_ce_research = (
+            f"{business_type} ads competitor advertising India {request.city} 2026 "
+            f"cricket sports community WhatsApp group promotions"
+        )
+        cricket_context, calendar_context, competitor_context, inventory_context, _ce_research = await asyncio.gather(
+            fetch_tavily(_q_context), fetch_tavily(_q_calendar), fetch_tavily(_q_competitor),
+            fetch_tavily(_q_inventory), fetch_tavily(_q_ce_research),
         )
 
     # ── 2b. Learning Engine: cross-business winning patterns for sports/gaming ──
@@ -11769,6 +11794,22 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         summary="Sports Growth Engine analysis generated",
     )
 
+    # ── Competitive Edge Score (shared function) ───────────────────────────────
+    _cricket_competitive_edge = None
+    try:
+        _cricket_headlines = result.get("creative_assets", {}).get("headlines_15", [])[:6]
+        _cricket_descs     = result.get("creative_assets", {}).get("descriptions_10", [])[:3]
+        _cricket_competitive_edge = await _score_competitive_edge(
+            business_label=request.url or business_type,
+            city_label=request.city or "India",
+            industry=request.industry or business_type,
+            sample_headlines=_cricket_headlines,
+            sample_descriptions=_cricket_descs,
+            competitor_research=_ce_research or "",
+        )
+    except Exception as _cce:
+        logger.warning(f"[CRICKET] Competitive edge scoring skipped (non-fatal): {_cce}")
+
     return {
         "success":                  True,
         "data":                     result,
@@ -11777,6 +11818,7 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "warnings":                 warnings,
         "placement_learning_note":  _placement_learning_note,
         "placement_track_records":  len(_track_records),
+        "competitive_edge_report":  _cricket_competitive_edge,
     }
 
 
@@ -11982,6 +12024,57 @@ def _fetch_cricket_tracking_status_sync(customer_id: str, login_customer_id: str
         return "UNKNOWN"
 
 
+async def _score_competitive_edge(
+    business_label: str,
+    city_label: str,
+    industry: str,
+    sample_headlines: list,
+    sample_descriptions: list,
+    competitor_research: str,
+) -> dict | None:
+    """Score generated ad copy vs real competitor ads on 4 dimensions.
+    Shared by campaign_launch_kit and cricket_ads_intelligence."""
+    if not competitor_research or (not sample_headlines and not sample_descriptions):
+        return None
+
+    _edge_prompt = (
+        f"You are an honest ad strategist. Compare this business's generated ad copy against "
+        f"real competitor ads found in research. Be brutally honest — do NOT hide competitor strengths.\n\n"
+        f"BUSINESS: {business_label} | CITY: {city_label} | INDUSTRY: {industry}\n\n"
+        f"OUR GENERATED HEADLINES:\n" + "\n".join(f"- {h}" for h in sample_headlines) + "\n\n"
+        f"OUR DESCRIPTIONS:\n" + "\n".join(f"- {d}" for d in sample_descriptions) + "\n\n"
+        f"COMPETITOR AD RESEARCH (live web data):\n{competitor_research[:2500]}\n\n"
+        "Score our ad vs competitors on 4 dimensions (1-10 each). For each, note what competitors do better.\n"
+        "Return ONLY valid JSON (no markdown):\n"
+        '{"dimensions_compared": ['
+        '{"dimension": "Headline Specificity", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
+        '{"dimension": "Offer Clarity", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
+        '{"dimension": "CTA Strength", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
+        '{"dimension": "Unique Differentiator", "our_score": 7, "competitor_avg": 6, "notes": "..."}'
+        '], "where_we_win": ["one specific thing our ad does better"], '
+        '"where_competitors_are_stronger": ["one specific honest gap — never leave this empty"], '
+        '"overall_edge_summary": "2-sentence honest summary"}'
+    )
+
+    def _score_sync():
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": _edge_prompt}],
+            temperature=0.2,
+            max_tokens=600,
+            response_format={"type": "json_object"},
+        )
+        return r.choices[0].message.content
+
+    _edge_raw = await asyncio.to_thread(_score_sync)
+    report = json.loads(_edge_raw)
+    if not report.get("where_competitors_are_stronger"):
+        report["where_competitors_are_stronger"] = [
+            "Insufficient competitor data to identify specific gaps — treat all scores with caution"
+        ]
+    return report
+
+
 async def run_launch_preflight(
     customer_id: str,
     login_customer_id: str | None,
@@ -11989,15 +12082,21 @@ async def run_launch_preflight(
     budget_daily: float,
     headlines: list,
     descriptions: list,
+    tracking_status_fn=None,  # optional callable() -> str; defaults to cricket account check
 ) -> dict:
-    """Run all Zero-Waste pre-flight checks before launching a campaign."""
+    """Run all Zero-Waste pre-flight checks before launching a campaign.
+    Pass tracking_status_fn for non-cricket accounts (e.g. _fetch_conversion_tracking_status
+    for the main Google Ads account); omit for cricket sub-account checks."""
     blocking_issues: list = []
     warnings: list = []
 
     # Check 1 — Conversion tracking
-    tracking_status = await asyncio.to_thread(
-        _fetch_cricket_tracking_status_sync, customer_id, login_customer_id
-    )
+    if tracking_status_fn is not None:
+        tracking_status = await asyncio.to_thread(tracking_status_fn)
+    else:
+        tracking_status = await asyncio.to_thread(
+            _fetch_cricket_tracking_status_sync, customer_id, login_customer_id
+        )
     label = _TRACKING_STATUS_LABELS.get(tracking_status, tracking_status)
     if tracking_status == "NOT_CONVERSION_TRACKED":
         blocking_issues.append({
