@@ -2578,6 +2578,11 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "If ANY found — rewrite that sentence completely before returning."
     )
 
+    # Start competitor research in background while GPT generates the kit
+    _ce_industry = request.industry or biz_label
+    _ce_query    = f'{_ce_industry} ads India {city_label} competitor advertising campaigns 2026'
+    _ce_task     = asyncio.create_task(fetch_tavily(_ce_query))
+
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -2664,14 +2669,67 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
                 f"{len(campaign_assets['headlines'])} headlines, {len(campaign_assets['descriptions'])} descriptions",
     )
 
+    # ── Competitive Edge Score ─────────────────────────────────────────────────
+    competitive_edge_report = None
+    try:
+        _competitor_research = await _ce_task   # wait for the parallel Tavily call
+        _sample_headlines = campaign_assets["headlines"][:6]
+        _sample_descs     = campaign_assets["descriptions"][:3]
+
+        if _competitor_research and (_sample_headlines or _sample_descs):
+            _edge_prompt = (
+                f"You are an honest ad strategist. Compare this business's generated ad copy against "
+                f"real competitor ads found in research. Be brutally honest — do NOT hide competitor strengths.\n\n"
+                f"BUSINESS: {biz_label} | CITY: {city_label} | INDUSTRY: {request.industry}\n\n"
+                f"OUR GENERATED HEADLINES:\n" + "\n".join(f"- {h}" for h in _sample_headlines) + "\n\n"
+                f"OUR DESCRIPTIONS:\n" + "\n".join(f"- {d}" for d in _sample_descs) + "\n\n"
+                f"COMPETITOR AD RESEARCH (live web data):\n{_competitor_research[:2500]}\n\n"
+                "Score our ad vs competitors on 4 dimensions (1-10 each). For each, note what competitors do better.\n"
+                "Return ONLY valid JSON (no markdown):\n"
+                '{"dimensions_compared": ['
+                '{"dimension": "Headline Specificity", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
+                '{"dimension": "Offer Clarity", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
+                '{"dimension": "CTA Strength", "our_score": 7, "competitor_avg": 6, "notes": "..."},'
+                '{"dimension": "Unique Differentiator", "our_score": 7, "competitor_avg": 6, "notes": "..."}'
+                '], "where_we_win": ["one specific thing our ad does better"], '
+                '"where_competitors_are_stronger": ["one specific honest gap — never leave this empty"], '
+                '"overall_edge_summary": "2-sentence honest summary"}'
+            )
+
+            def _edge_score_sync():
+                r = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": _edge_prompt}],
+                    temperature=0.2,
+                    max_tokens=600,
+                    response_format={"type": "json_object"},
+                )
+                return r.choices[0].message.content
+
+            _edge_raw = await asyncio.to_thread(_edge_score_sync)
+            competitive_edge_report = json.loads(_edge_raw)
+
+            # Enforce honesty — never allow an empty "where they're stronger" list
+            if not competitive_edge_report.get("where_competitors_are_stronger"):
+                competitive_edge_report["where_competitors_are_stronger"] = [
+                    "Insufficient competitor data to identify specific gaps — treat all scores with caution"
+                ]
+    except Exception as _cee:
+        logger.warning(f"[CAMPAIGN KIT] Competitive edge scoring skipped (non-fatal): {_cee}")
+        try:
+            _ce_task.cancel()
+        except Exception:
+            pass
+
     return {
-        "success":        True,
-        "meta_kit":       meta_kit or full_text,
-        "google_kit":     google_kit,
-        "remarketing_kit": remarketing_kit,
-        "tracking_kit":   tracking_kit,
-        "lp_checklist":   lp_checklist,
-        "business_key":   business_key,
+        "success":                True,
+        "meta_kit":               meta_kit or full_text,
+        "google_kit":             google_kit,
+        "remarketing_kit":        remarketing_kit,
+        "tracking_kit":           tracking_kit,
+        "lp_checklist":           lp_checklist,
+        "business_key":           business_key,
+        "competitive_edge_report": competitive_edge_report,
     }
 
 
@@ -11887,12 +11945,181 @@ class CricketPushRequest(BaseModel):
     login_customer_id: str = ""
     campaign_name:     str
     budget_daily:      float
+    final_url:         str  = ""   # landing page URL for pre-flight reachability check
     headlines:         list = []
     long_headlines:    list = []
     descriptions:      list = []
     whatsapp_link:     str  = ""
-    business_type:     str  = "Cricket Community"   # for the growth_memory learning packet
-    top_audience:       str  = ""                    # winning audience segment name, if known
+    business_type:     str  = "Cricket Community"
+    top_audience:      str  = ""
+    force_override:    bool = False  # acknowledge blocking issues and launch anyway
+
+
+class CricketPreflightRequest(BaseModel):
+    customer_id:       str
+    login_customer_id: str   = ""
+    final_url:         str   = ""
+    budget_daily:      float = 500
+    headlines:         list  = []
+    descriptions:      list  = []
+
+
+def _fetch_cricket_tracking_status_sync(customer_id: str, login_customer_id: str | None) -> str:
+    """Query conversion tracking status for a cricket-specific account."""
+    try:
+        client = _build_cricket_client(login_customer_id)
+        svc    = client.get_service("GoogleAdsService")
+        rows   = list(svc.search(
+            customer_id=customer_id,
+            query="SELECT customer.conversion_tracking_setting.conversion_tracking_status FROM customer LIMIT 1",
+        ))
+        if rows:
+            status = rows[0].customer.conversion_tracking_setting.conversion_tracking_status
+            return status.name if hasattr(status, "name") else str(status)
+        return "UNKNOWN"
+    except Exception as _e:
+        logger.warning(f"[PREFLIGHT] Tracking status check failed: {_e}")
+        return "UNKNOWN"
+
+
+async def run_launch_preflight(
+    customer_id: str,
+    login_customer_id: str | None,
+    final_url: str,
+    budget_daily: float,
+    headlines: list,
+    descriptions: list,
+) -> dict:
+    """Run all Zero-Waste pre-flight checks before launching a campaign."""
+    blocking_issues: list = []
+    warnings: list = []
+
+    # Check 1 — Conversion tracking
+    tracking_status = await asyncio.to_thread(
+        _fetch_cricket_tracking_status_sync, customer_id, login_customer_id
+    )
+    label = _TRACKING_STATUS_LABELS.get(tracking_status, tracking_status)
+    if tracking_status == "NOT_CONVERSION_TRACKED":
+        blocking_issues.append({
+            "code": "NO_CONVERSION_TRACKING",
+            "message": (
+                "Conversion tracking is NOT set up on this Google Ads account. "
+                "Every click will be invisible — you'll never know if this campaign is working. "
+                "Set up Google Ads conversion tracking (form submissions, WhatsApp clicks) before launching."
+            ),
+            "severity": "blocking",
+        })
+    elif tracking_status in ("UNKNOWN", "UNSPECIFIED"):
+        warnings.append({
+            "code": "TRACKING_UNKNOWN",
+            "message": f"Conversion tracking status could not be verified ({label}). Confirm manually in Google Ads > Tools > Conversions before launch.",
+            "severity": "warning",
+        })
+
+    # Check 2 — Landing page reachability
+    if final_url:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10) as hc:
+                resp = await hc.get(final_url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code >= 400:
+                blocking_issues.append({
+                    "code": "LANDING_PAGE_ERROR",
+                    "message": (
+                        f"Landing page returned HTTP {resp.status_code}. "
+                        "Ad spend will be wasted on a broken destination. Fix the URL before launching."
+                    ),
+                    "severity": "blocking",
+                })
+        except Exception as _le:
+            blocking_issues.append({
+                "code": "LANDING_PAGE_UNREACHABLE",
+                "message": (
+                    f"Landing page is unreachable ({type(_le).__name__}: {str(_le)[:80]}). "
+                    "Verify the URL is live before launching."
+                ),
+                "severity": "blocking",
+            })
+    else:
+        warnings.append({
+            "code": "NO_LANDING_URL",
+            "message": "No landing page URL provided. Verify ad destination is set in Google Ads.",
+            "severity": "warning",
+        })
+
+    # Check 3 — Budget significance (30-day projection)
+    thirty_day = budget_daily * 30
+    if thirty_day < _DATA_SUFFICIENCY_THRESHOLDS["min_spend"]:
+        blocking_issues.append({
+            "code": "BUDGET_INSUFFICIENT",
+            "message": (
+                f"₹{budget_daily}/day = ₹{thirty_day:.0f} over 30 days — "
+                f"below the ₹{_DATA_SUFFICIENCY_THRESHOLDS['min_spend']} minimum needed to collect meaningful data. "
+                "Increase budget or you'll never have enough signal to optimize."
+            ),
+            "severity": "blocking",
+        })
+    elif thirty_day < 2000:
+        warnings.append({
+            "code": "BUDGET_LOW",
+            "message": (
+                f"₹{budget_daily}/day is low. Statistical significance typically needs "
+                f"₹{int(2000/30)+1}+/day — low budgets slow learning and delay optimization."
+            ),
+            "severity": "warning",
+        })
+
+    # Check 4 — Ad copy breadth
+    if len(headlines) < 3:
+        warnings.append({
+            "code": "INSUFFICIENT_HEADLINES",
+            "message": (
+                f"Only {len(headlines)} headline(s) provided. "
+                "Google Display Ads need at least 3 (recommended 5+) for effective rotation."
+            ),
+            "severity": "warning",
+        })
+    if len(descriptions) < 2:
+        warnings.append({
+            "code": "INSUFFICIENT_DESCRIPTIONS",
+            "message": (
+                f"Only {len(descriptions)} description(s) provided. "
+                "At least 2 descriptions are required."
+            ),
+            "severity": "warning",
+        })
+
+    # Check 5 — Policy pre-check on ad copy
+    if headlines or descriptions:
+        _, _, policy_flags = _policy_precheck_ad_copy(headlines or [], descriptions or [])
+        for pf in policy_flags[:3]:
+            warnings.append({
+                "code": "POLICY_RISK",
+                "message": f"Policy risk auto-cleaned before send: {pf}",
+                "severity": "warning",
+            })
+
+    # Check 6 — Negative placements reminder (always a warning)
+    warnings.append({
+        "code": "NEGATIVE_PLACEMENTS_REMINDER",
+        "message": (
+            "Reminder: Add negative placement categories in Google Ads (e.g. parked domains, "
+            "error pages, adult content) to avoid wasted impressions on irrelevant sites."
+        ),
+        "severity": "info",
+    })
+
+    ready = len(blocking_issues) == 0
+    return {
+        "ready_to_launch":  ready,
+        "blocking_issues":  blocking_issues,
+        "warnings":         warnings,
+        "tracking_status":  tracking_status,
+        "tracking_label":   label,
+        "summary": (
+            f"Ready to launch — {len(warnings)} note(s)" if ready
+            else f"{len(blocking_issues)} blocking issue(s), {len(warnings)} warning(s)"
+        ),
+    }
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -11944,12 +12171,50 @@ async def cricket_delete_account(customer_id: str):
         return {"success": False, "error": str(_e)}
 
 
+@app.post("/cricket-ads/preflight")
+async def cricket_preflight(request: CricketPreflightRequest):
+    """Zero-Waste pre-flight check — call this before showing the launch confirmation."""
+    cid  = request.customer_id.replace("-", "").strip()
+    lcid = (request.login_customer_id or "").replace("-", "").strip() or None
+    if not cid:
+        return {"success": False, "error": "customer_id is required"}
+    try:
+        preflight = await run_launch_preflight(
+            cid, lcid,
+            request.final_url.strip(),
+            request.budget_daily,
+            request.headlines,
+            request.descriptions,
+        )
+        return {"success": True, "launch_readiness": preflight}
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[PREFLIGHT] Error: {_e}\n{tb}")
+        return {"success": False, "error": str(_e)}
+
+
 @app.post("/cricket-ads/push-to-google")
 async def cricket_push_to_google(request: CricketPushRequest):
     cid   = request.customer_id.replace("-", "").strip()
     lcid  = (request.login_customer_id or "").replace("-", "").strip() or None
     if not cid:
         return {"success": False, "error": "customer_id is required"}
+
+    # ── Zero-Waste pre-flight (safety net even if frontend already checked) ────
+    final_url = request.final_url.strip() or request.whatsapp_link.strip()
+    preflight = await run_launch_preflight(
+        cid, lcid, final_url,
+        request.budget_daily,
+        request.headlines,
+        request.descriptions,
+    )
+    if not preflight["ready_to_launch"] and not request.force_override:
+        return {
+            "success":          False,
+            "preflight_blocked": True,
+            "launch_readiness": preflight,
+            "message":          "Pre-flight check failed. Fix blocking issues or acknowledge risks to proceed.",
+        }
 
     try:
         result = await asyncio.to_thread(
@@ -12000,6 +12265,7 @@ async def cricket_push_to_google(request: CricketPushRequest):
         "status":               "PAUSED",
         "google_ads_dashboard": f"https://ads.google.com/aw/campaigns?campaignId={campaign_id}",
         "note":                 "Campaign created PAUSED. Add image assets in Google Ads dashboard before enabling.",
+        "launch_readiness":     preflight,
     }
 
 
