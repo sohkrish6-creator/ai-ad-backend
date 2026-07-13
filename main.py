@@ -14580,6 +14580,32 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     sections.update(s_competitors_swot)
     sections["social"] = s_social
 
+    # ── Step 4b: Reconcile overview.revenue vs revenue_timeline ─────────────
+    # The two fields come from separate GPT calls and can disagree.
+    # If revenue_timeline has real documented entries but overview.revenue still
+    # says "not publicly disclosed" (or similar), patch overview.revenue with
+    # the most recent figure so the two fields agree.
+    _UNDISCLOSED_SIGNALS = ("not publicly disclosed", "undisclosed", "not disclosed", "unknown", "n/a")
+    ov_section = sections.get("overview") or {}
+    rt_list    = sections.get("revenue_timeline") or []
+    if isinstance(ov_section, dict) and isinstance(rt_list, list) and rt_list:
+        ov_rev = (ov_section.get("revenue") or "").strip().lower()
+        needs_patch = not ov_rev or any(sig in ov_rev for sig in _UNDISCLOSED_SIGNALS)
+        if needs_patch:
+            # Find the entry with the latest period (sort numerically where possible)
+            def _rt_sort_key(entry):
+                try:
+                    return int(str(entry.get("period", "0"))[:4])
+                except Exception:
+                    return 0
+            best = sorted(rt_list, key=_rt_sort_key, reverse=True)[0]
+            best_val    = (best.get("revenue_or_metric") or "").strip()
+            best_period = (str(best.get("period") or "")).strip()
+            if best_val and best_period:
+                ov_section["revenue"] = f"{best_val} ({best_period}, per revenue timeline)"
+                sections["overview"] = ov_section
+                logger.info(f"[MI] Patched overview.revenue from revenue_timeline: {ov_section['revenue']}")
+
     # ── Step 5: Optional comparison section ─────────────────────────────────
     if compare_cfg:
         my_url      = (compare_cfg.get("url") or "").strip()
