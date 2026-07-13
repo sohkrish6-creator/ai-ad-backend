@@ -39,6 +39,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://ai-ad-frontend.vercel.app",
         "https://sohjustbe.com",
         "https://www.sohjustbe.com",
         "http://localhost:5173",
@@ -50,11 +51,14 @@ app.add_middleware(
 
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    """Reject requests that don't carry the correct X-API-Key header.
-    Skips OPTIONS (CORS preflight). No-ops when BACKEND_API_KEY is not set (local dev)."""
+    """Reject requests missing the correct X-API-Key header.
+    Skips: OPTIONS (CORS preflight) and GET / (uptime monitoring).
+    No-ops when ADSOH_API_KEY env var is not set (local dev without config)."""
     if request.method == "OPTIONS":
         return await call_next(request)
-    secret = os.getenv("BACKEND_API_KEY", "")
+    if request.method == "GET" and request.url.path == "/":
+        return await call_next(request)
+    secret = os.getenv("ADSOH_API_KEY", "")
     if secret:
         incoming = request.headers.get("X-API-Key", "")
         if not incoming or not hmac.compare_digest(incoming.encode(), secret.encode()):
