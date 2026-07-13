@@ -10842,6 +10842,35 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "- Each segment needs: priority_score (0-100), intent_score (0-100), competition (low/medium/high), "
         "expected_conversion (specific range), platform_match (real targeting mechanism, never an app name), "
         "confidence (0-100), evidence (one sentence citing what supports it), reason.\n\n"
+        "TARGETING PRECISION — for every audience_segments item, include a targeting_params object:\n"
+        "- google_affinity: exact affinity category name from Google Ads taxonomy (e.g. 'Sports Fans', "
+        "'Cricket Enthusiasts', 'Gamers') — pick the closest real category, not a made-up one\n"
+        "- google_in_market: exact in-market category path (e.g. 'Sports & Fitness/Team Sports', "
+        "'Mobile Games', 'Sports Tickets & Memorabilia') — closest real Google Ads in-market category\n"
+        "- age_range: exact bracket this segment skews toward (e.g. '18-24', '18-34', '25-44')\n"
+        "- device_targeting: exact device split supported by data/benchmarks (e.g. 'Mobile only', "
+        "'Mobile 85% / Desktop 15%')\n"
+        "- geo_radius: exact radius or region tied to the request city (e.g. '50 km radius around "
+        "Mumbai city center', 'Tier-1 cities: Mumbai, Delhi, Bengaluru, Hyderabad')\n"
+        "- frequency_cap: exact cap for this segment's intent level (e.g. '5 impressions/user/day', "
+        "'3 impressions/user/week for retargeting')\n"
+        "- contextual_keywords: array of 3-5 exact keyword strings for contextual targeting overlay\n"
+        "- placement_layer: 1-3 placement domains/apps to layer on top of this audience (use exact "
+        "IDs: cricbuzz.com, espncricinfo.com, com.cricbuzz.android, com.espncricinfo.escore, "
+        "in.flashscore.com, fancode.sports, com.dream11.fancode)\n\n"
+        "HONESTY LABELING — every audience_segments item must include data_label:\n"
+        "- 'REAL': this exact number/range comes from actual account performance_data in PLATFORM "
+        "INTELLIGENCE (only valid if that block has CTR/CPC broken out by this specific segment)\n"
+        "- 'BENCHMARK': grounded in Indian Display/sports industry benchmarks — clearly an estimate\n"
+        "- 'INSUFFICIENT_DATA': no reliable benchmark or account data exists for this specific claim\n"
+        "If even one field is estimated, label the segment 'BENCHMARK'. Only use 'REAL' when PLATFORM "
+        "INTELLIGENCE has specific numbers supporting this exact segment.\n\n"
+        "DAYPARTING RULES — from UPCOMING EVENTS CALENDAR, build exact bid-adjustment rules:\n"
+        "Include a dayparting_rules array inside campaign_structure (one rule per major event). Each "
+        "rule: trigger (specific event name), bid_adjustment (e.g. '+40%'), schedule (exact hour window, "
+        "e.g. '2 hours before match start to 1 hour after final whistle'), specific_dates (actual dates "
+        "from the calendar — use the real dates you found, or empty array if none found). If no live "
+        "calendar data, still output one general guidance rule and set specific_dates to [].\n\n"
         "KEY RECOMMENDATIONS (top_audience, top_placement, timing) — FULL RECOMMENDATION DEPTH:\n"
         "- For the single HIGHEST-priority audience segment, HIGHEST-priority placement, and the launch timing "
         "decision, produce: observation (what the data shows), why (the reasoning connecting evidence to the "
@@ -10880,27 +10909,49 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         '    "budget_daily": "₹...",\n'
         '    "bidding_strategy": "...",\n'
         '    "devices": "Mobile priority",\n'
-        '    "frequency_cap": "..."\n'
+        '    "frequency_cap": "...",\n'
+        '    "dayparting_rules": [\n'
+        '      { "trigger": "...", "bid_adjustment": "+40%", "schedule": "2 hours before to 1 hour after match", "specific_dates": ["..."] }\n'
+        '    ]\n'
         '  },\n'
         '  "audience_segments": [\n'
         '    { "name": "...", "intent": "high", "estimated_cpc": "₹2-4", "estimated_ctr": "0.5%", "priority_score": 85, '
         '"intent_score": 80, "competition": "medium", "expected_conversion": "3-6% join rate", '
-        '"platform_match": "In-market: Fantasy Sports Apps", "confidence": 75, "evidence": "...", "reason": "..." },\n'
+        '"platform_match": "In-market: Fantasy Sports Apps", "confidence": 75, "evidence": "...", "reason": "...", '
+        '"targeting_params": { "google_affinity": "...", "google_in_market": "...", "age_range": "18-34", '
+        '"device_targeting": "Mobile only", "geo_radius": "50 km radius around [city] center", '
+        '"frequency_cap": "5 impressions/user/day", "contextual_keywords": ["...", "...", "..."], '
+        '"placement_layer": "cricbuzz.com, espncricinfo.com" }, "data_label": "BENCHMARK" },\n'
         '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
         '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
-        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '"confidence": 0, "evidence": "...", "reason": "...", '
+        '"targeting_params": { "google_affinity": "...", "google_in_market": "...", "age_range": "...", '
+        '"device_targeting": "...", "geo_radius": "...", "frequency_cap": "...", '
+        '"contextual_keywords": ["...", "...", "..."], "placement_layer": "..." }, "data_label": "BENCHMARK" },\n'
         '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
         '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
-        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '"confidence": 0, "evidence": "...", "reason": "...", '
+        '"targeting_params": { "google_affinity": "...", "google_in_market": "...", "age_range": "...", '
+        '"device_targeting": "...", "geo_radius": "...", "frequency_cap": "...", '
+        '"contextual_keywords": ["...", "...", "..."], "placement_layer": "..." }, "data_label": "BENCHMARK" },\n'
         '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
         '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
-        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '"confidence": 0, "evidence": "...", "reason": "...", '
+        '"targeting_params": { "google_affinity": "...", "google_in_market": "...", "age_range": "...", '
+        '"device_targeting": "...", "geo_radius": "...", "frequency_cap": "...", '
+        '"contextual_keywords": ["...", "...", "..."], "placement_layer": "..." }, "data_label": "BENCHMARK" },\n'
         '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
         '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
-        '"confidence": 0, "evidence": "...", "reason": "..." },\n'
+        '"confidence": 0, "evidence": "...", "reason": "...", '
+        '"targeting_params": { "google_affinity": "...", "google_in_market": "...", "age_range": "...", '
+        '"device_targeting": "...", "geo_radius": "...", "frequency_cap": "...", '
+        '"contextual_keywords": ["...", "...", "..."], "placement_layer": "..." }, "data_label": "BENCHMARK" },\n'
         '    { "name": "...", "intent": "...", "estimated_cpc": "...", "estimated_ctr": "...", "priority_score": 0, '
         '"intent_score": 0, "competition": "...", "expected_conversion": "...", "platform_match": "...", '
-        '"confidence": 0, "evidence": "...", "reason": "..." }\n'
+        '"confidence": 0, "evidence": "...", "reason": "...", '
+        '"targeting_params": { "google_affinity": "...", "google_in_market": "...", "age_range": "...", '
+        '"device_targeting": "...", "geo_radius": "...", "frequency_cap": "...", '
+        '"contextual_keywords": ["...", "...", "..."], "placement_layer": "..." }, "data_label": "BENCHMARK" }\n'
         '  ],\n'
         '  "placement_recommendations": [\n'
         '    { "placement": "...", "why": "...", "estimated_reach": "...", "priority": "high" },\n'
@@ -11002,6 +11053,22 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         _identity + shared_context +
         f"TASK: Generate ONLY the placement inventory and YouTube inventory for this {business_type} campaign. "
         "Nothing else.\n\n"
+        "KNOWN PLACEMENT IDs — use these exact values in placement_url and app_package_name:\n"
+        "- Cricbuzz: website=cricbuzz.com | Android app=com.cricbuzz.android | placement_id_type=EXACT_URL_FOUND\n"
+        "- ESPN Cricinfo: website=espncricinfo.com | Android app=com.espncricinfo.escore | placement_id_type=EXACT_URL_FOUND\n"
+        "- Fancode: website=fancode.sports | Android app=com.dream11.fancode | placement_id_type=EXACT_URL_FOUND\n"
+        "- CricHeroes: website=cricheroes.in | Android app=com.cricheroes.android | placement_id_type=EXACT_URL_FOUND\n"
+        "- Dailyhunt Sports: website=m.dailyhunt.in | Android app=com.eterno | placement_id_type=EXACT_URL_FOUND\n"
+        "- Flashscore: website=in.flashscore.com | Android app=com.flashscore.sports | placement_id_type=EXACT_URL_FOUND\n"
+        "- Glance lock screen: Android app=com.glance.internet | placement_id_type=EXACT_PACKAGE_FOUND\n"
+        "- SportsTak: website=sportstiger.com | app package unverified | placement_id_type=NAME_ONLY\n"
+        "- Cricket Exchange: website=cricketexchange.com | app package unverified | placement_id_type=NAME_ONLY\n"
+        "- Google Discover Sports / GDA: not a URL — Demand Gen audience targeting | placement_id_type=NAME_ONLY\n"
+        "- InMobi sports inventory: DSP-level buying, no direct URL | placement_id_type=NAME_ONLY\n"
+        "- OEM cricket widgets: device-level, no URL | placement_id_type=NAME_ONLY\n"
+        "- Opera News cricket: website=opera.com (news section) | placement_id_type=NAME_ONLY\n"
+        "Set placement_id_type strictly: EXACT_URL_FOUND (confirmed domain), EXACT_PACKAGE_FOUND (confirmed "
+        "Android package), NAME_ONLY (platform name only — no confirmed targeting ID).\n\n"
         "PLACEMENT INVENTORY:\n"
         "- From this named cricket/sports inventory, pick the 8-10 MOST RELEVANT to this business_type: Cricbuzz, "
         "ESPN Cricinfo, CricHeroes, SportsTiger, SportsTak, Flashscore, Cricket Exchange, Fancode, Google Discover "
@@ -11014,7 +11081,19 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "competition (low/medium/high), suitability_score (0-100 for THIS business_type), "
         "recommended_creative_type, banner_sizes (real Google Display sizes, e.g. 300x250, 320x50, 728x90, "
         "160x600), priority (high/medium/low).\n"
-        "- Use INVENTORY RELEVANCE RESEARCH above to ground current-relevance reasoning where it has real data.\n\n"
+        "- Use INVENTORY RELEVANCE RESEARCH above to ground current-relevance reasoning where it has real data.\n"
+        f"BUDGET BREAKDOWN per placement — for the ₹{_effective_budget} monthly budget:\n"
+        "- daily_budget: exact ₹ per day to allocate to this specific placement (must sum to monthly budget across "
+        "all placements when multiplied by campaign_days — reason about each platform's suitability_score and "
+        "expected ROI when splitting the budget)\n"
+        "- campaign_days: recommended run duration in days for this placement (15-30 for always-on, shorter for "
+        "event-specific bursts tied to the sports calendar)\n"
+        "- total_allocation: daily_budget × campaign_days as '₹X,XXX for YY days'\n"
+        "- expected_joins: estimated joins this placement will generate ('X-Y joins') based on estimated_reach, "
+        "expected_ctr, and expected_join_rate — show the math briefly\n"
+        "HONESTY LABELING: every placement item must have data_label — 'REAL' (from this account's actual "
+        "performance data in PLATFORM INTELLIGENCE), 'BENCHMARK' (industry estimate for Indian Display), or "
+        "'INSUFFICIENT_DATA' (no reliable estimate possible).\n\n"
         "YOUTUBE INVENTORY:\n"
         "- Pick 5-7 channels most relevant to this business_type from: Star Sports, ICC, Cricbuzz, SportsTak, "
         "ESPN Cricinfo, RevSportz, CricXtasy, or other real, well-known Indian cricket YouTube channels.\n"
@@ -11024,11 +11103,15 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
         "fields for every item — do not leave any field as a placeholder:\n"
         "{\n"
         '  "placement_inventory": [\n'
-        '    { "platform": "Cricbuzz", "audience_type": "...", "traffic_quality": "...", "device_split": "...", '
+        '    { "platform": "Cricbuzz", "placement_url": "cricbuzz.com", "app_package_name": "com.cricbuzz.android", '
+        '"placement_id_type": "EXACT_URL_FOUND", "ad_unit_position": "pre-match score card banner (300x250 above the fold)", '
+        '"audience_type": "...", "traffic_quality": "...", "device_split": "...", '
         '"estimated_reach": "...", "estimated_cpm": "₹...", "estimated_cpc": "₹...", "expected_ctr": "...", '
         '"expected_join_rate": "...", "competition": "medium", "suitability_score": 0, '
-        '"recommended_creative_type": "...", "banner_sizes": ["300x250", "320x50"], "priority": "high" }\n'
-        '    // ... 7-9 more items (8-10 total), each a DIFFERENT named platform from the list above, each with ALL fields populated with real, distinct values\n'
+        '"recommended_creative_type": "...", "banner_sizes": ["300x250", "320x50"], "priority": "high", '
+        '"daily_budget": "₹...", "campaign_days": 14, "total_allocation": "₹... for 14 days", '
+        '"expected_joins": "...", "data_label": "BENCHMARK" }\n'
+        '    // ... 7-9 more items (8-10 total), each a DIFFERENT platform, with placement_url/app_package_name/placement_id_type/ad_unit_position/daily_budget/campaign_days/total_allocation/expected_joins/data_label ALL populated\n'
         '  ],\n'
         '  "youtube_inventory": [\n'
         '    { "channel": "Star Sports", "audience": "...", "estimated_reach": "...", "ad_type_fit": "skippable", '
