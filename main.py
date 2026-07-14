@@ -2248,7 +2248,7 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
         # match-type prefix — strip any such wrapping so the literal quote
         # characters never end up in the keyword text sent to Google Ads.
         kw = raw.strip().rstrip(".")
-        kw = kw.strip('"\'“”‘’').strip()
+        kw = kw.strip('"\'""''').strip()
         return kw
 
     keywords, headlines, descriptions, sitelinks = [], [], [], []
@@ -2262,7 +2262,7 @@ def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
             if kw:
                 keywords.append({"text": kw, "match_type": "EXACT"})
             continue
-        m = re.match(r'^["“]phrase match["”]\s*(.+)$', line, re.I)
+        m = re.match(r'^[""]phrase match[""]\s*(.+)$', line, re.I)
         if m:
             kw = _clean_kw(m.group(1))
             if kw:
@@ -2709,60 +2709,19 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     lp_checklist = re.sub(r'\n?CRITICAL FINAL CHECK:.*$', '', lp_checklist, flags=re.S).strip()
 
     # ── Post-generation copy review pass (GPT-4o-mini) ───────────────────────
-    # Prompt-level rules alone don't reliably prevent boilerplate at generation
-    # time. This second pass sends ONLY the ad copy lines (not the full kit),
-    # gets back a compact list of {original, replacement} pairs, and applies
-    # them via string substitution — keeping token usage small.
+    # ── Pass 1: Style review (capture-your-X, generic clichés) ──────────────
+    # Factual claims and urgency filler are handled by verify_ad_claims below.
     try:
-        import re as _re
-
         def _extract_ad_lines(text: str) -> str:
-            """Pull just headline/description/primary-text lines from a kit section."""
             lines = []
             for line in text.splitlines():
-                stripped = line.strip()
-                if stripped.startswith(("Headline", "Description", "Primary Text", "H1:", "H2:", "H3:", "D1:", "D2:")):
-                    lines.append(stripped)
+                s = line.strip()
+                if s.startswith(("Headline", "Description", "Primary Text", "H1:", "H2:", "H3:", "D1:", "D2:")):
+                    lines.append(s)
             return "\n".join(lines)
 
-        _gads_lines = _extract_ad_lines(google_kit)
-        _meta_lines = _extract_ad_lines(meta_kit or "")
-        _copy_to_review = f"GOOGLE ADS LINES:\n{_gads_lines}\n\nMETA ADS LINES:\n{_meta_lines}"
-
-        _review_prompt = (
-            f"You are a strict ad copy quality enforcer for {biz_label} in {city_label}.\n"
-            "Find lines below that violate these rules and provide exact replacements.\n\n"
-            "RULES:\n"
-            "1. CAPTURE-YOUR-X — 'capture your moments/memories/day/story/love/special day' "
-            "(any form) → rewrite naming a concrete specific outcome or shot.\n"
-            "2. GENERIC URGENCY FILLER — 'don't miss out', 'don't miss your [X]', 'act now', "
-            "'hurry', 'limited time' when NO new specific constraint is added → remove filler; "
-            "keep only the real constraint (e.g. '3 slots left') if one exists.\n"
-            "3. UNSUBSTANTIATED SUPERLATIVES — 'award-winning', '#1', 'best in [city]', "
-            "'top-rated', 'most trusted' without proof in the copy → reword to a verifiable fact.\n"
-            "4. GENERIC DESCRIPTORS — 'hassle-free', 'seamless experience', 'perfect memories', "
-            "'quality service', 'expert [role]' without a specific modifier → rewrite specifically.\n\n"
-            "Return JSON: {\"fixes\": [{\"original\": \"<exact substring>\", \"replacement\": \"<rewritten line>\"}]}\n"
-            "Return an empty fixes list if nothing violates the rules. "
-            "original must be the EXACT substring as it appears in the text below.\n\n"
-            f"{_copy_to_review}"
-        )
-
-        _review_resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": _review_prompt}],
-            max_tokens=800,
-            temperature=0.2,
-        )
-        _reviewed = json.loads(_review_resp.choices[0].message.content)
-        _fixes = _reviewed.get("fixes", [])
-
-        # GPT returns straight-quote apostrophes but kit text often has curly
-        # Unicode ones (U+2018/U+2019). Normalise both sides before matching,
-        # then apply the replacement at the correct position in the original text.
         def _nq(s: str) -> str:
-            return s.replace('‘', "'").replace('’', "'").replace('“', '"').replace('”', '"')
+            return s.replace('\u2018', "'").replace('\u2019', "'").replace('\u201c', '"').replace('\u201d', '"')
 
         def _apply_fix(text: str, orig: str, repl: str) -> str:
             norm_text = _nq(text)
@@ -2772,24 +2731,55 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
                 return text
             return text[:idx] + repl + text[idx + len(norm_orig):]
 
-        _applied = 0
-        for fix in _fixes:
-            orig = fix.get("original", "")
-            repl = fix.get("replacement", "")
-            if not orig or not repl or _nq(orig) == _nq(repl):
-                continue
-            new_gk = _apply_fix(google_kit, orig, repl)
-            if new_gk != google_kit:
-                google_kit = new_gk
-                _applied += 1
-            if meta_kit:
-                new_mk = _apply_fix(meta_kit, orig, repl)
-                if new_mk != meta_kit:
-                    meta_kit = new_mk
-                    _applied += 1
-        logger.info(f"[CAMPAIGN KIT] Copy review pass: {len(_fixes)} violation(s) found, {_applied} fix(es) applied")
+        _copy_to_review = (
+            f"GOOGLE ADS LINES:\n{_extract_ad_lines(google_kit)}\n\n"
+            f"META ADS LINES:\n{_extract_ad_lines(meta_kit or '')}"
+        )
+        _style_prompt = (
+            f"Ad copy style enforcer for {biz_label} in {city_label}.\n"
+            "Fix STYLE violations only (not factual claims — those are checked separately).\n\n"
+            "STYLE RULES:\n"
+            "1. CAPTURE-YOUR-X — any variant of 'capture your/the/our moments/memories/day/"
+            "story/love/special day/wedding' → rewrite as a concrete specific outcome.\n"
+            "2. GENERIC CLICHÉS — 'hassle-free', 'seamless experience', 'quality service', "
+            "'perfect memories', 'expert [role]' without a specific modifier → rewrite specifically.\n"
+            "3. AI STACKING — 'transform your journey', 'your dream awaits', 'unlock your potential', "
+            "'elevate your experience' → rewrite with a real detail about this business.\n\n"
+            "Return JSON: {\"fixes\": [{\"original\": \"<exact substring>\", \"replacement\": \"<rewrite>\"}]}\n"
+            "Empty list if no violations.  original must be verbatim from the text.\n\n"
+            f"{_copy_to_review}"
+        )
+        _sr = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": _style_prompt}],
+            max_tokens=600,
+            temperature=0.2,
+        )
+        _s_applied = 0
+        for fix in json.loads(_sr.choices[0].message.content).get("fixes", []):
+            orig, repl = fix.get("original", ""), fix.get("replacement", "")
+            if orig and repl and _nq(orig) != _nq(repl):
+                new_gk = _apply_fix(google_kit, orig, repl)
+                if new_gk != google_kit:
+                    google_kit = new_gk; _s_applied += 1
+                if meta_kit:
+                    new_mk = _apply_fix(meta_kit, orig, repl)
+                    if new_mk != meta_kit:
+                        meta_kit = new_mk; _s_applied += 1
+        logger.info(f"[CAMPAIGN KIT] Style pass: {_s_applied} fix(es) applied")
     except Exception as _rev_e:
-        logger.warning(f"[CAMPAIGN KIT] Copy review pass skipped (non-fatal): {_rev_e}")
+        logger.warning(f"[CAMPAIGN KIT] Style pass skipped (non-fatal): {_rev_e}")
+
+    # ── Pass 2: Claim verification gate (verify_ad_claims) ───────────────────
+    # Hard code-level check: numbers, superlatives, ratings, certifications,
+    # and semantic urgency filler — all verified against real stored memory.
+    try:
+        google_kit = await verify_ad_claims(google_kit, business_key)
+        if meta_kit:
+            meta_kit = await verify_ad_claims(meta_kit, business_key)
+    except Exception as _vce:
+        logger.warning(f"[CAMPAIGN KIT] Claim verification gate skipped (non-fatal): {_vce}")
 
     # ── Save keywords/headlines/descriptions to campaign_memory ─────────────
     # so /google-ads/create-campaign can pull them back when the user clicks
@@ -12294,6 +12284,217 @@ def _fetch_cricket_tracking_status_sync(customer_id: str, login_customer_id: str
     except Exception as _e:
         logger.warning(f"[PREFLIGHT] Tracking status check failed: {_e}")
         return "UNKNOWN"
+
+
+async def verify_ad_claims(ad_copy_text: str, business_key: str) -> str:
+    """
+    Hard post-processing gate: extract every factual claim from ad copy, verify
+    each against the business's REAL stored memory, delete or replace anything
+    that cannot be substantiated.  Also removes urgency filler semantically
+    (pressure language that adds no new concrete fact to what's already stated).
+
+    Returns cleaned copy text.  Never raises — original text returned on any error.
+    """
+    if not ad_copy_text or not ad_copy_text.strip():
+        return ad_copy_text
+
+    # ── Pull all real business data from memory ──────────────────────────────
+    mem_parts: list[str] = []
+    try:
+        _mem = get_memory(business_key)
+        if not _mem:
+            # fallback: derive_business_key already done by caller — try LIKE scan
+            with engine.connect() as _c:
+                _row = _c.execute(
+                    text("SELECT business_key FROM business_memory WHERE business_key LIKE :p ORDER BY updated_at DESC LIMIT 1"),
+                    {"p": business_key.split("::")[0] + "%"}
+                ).first()
+            if _row:
+                _mem = get_memory(_row[0])
+        for mem_type, mem_data in (_mem or {}).items():
+            if not mem_data:
+                continue
+            # Skip campaign_memory — it contains AI-generated copy, not real facts.
+            # Using past campaign data as ground truth would legitimise invented numbers.
+            if mem_type == "campaign":
+                continue
+            # Flatten JSON-string columns before serialising
+            _flat = {}
+            for col, val in (mem_data if isinstance(mem_data, dict) else {}).items():
+                if col in ("id", "created_at", "updated_at", "business_key"):
+                    continue
+                if isinstance(val, str) and val.startswith(("{", "[")):
+                    try:
+                        val = json.loads(val)
+                    except Exception:
+                        pass
+                if val:
+                    _flat[col] = val
+            if _flat:
+                mem_parts.append(f"[{mem_type.upper()}]\n{json.dumps(_flat, default=str, ensure_ascii=False)[:1800]}")
+    except Exception as _me:
+        logger.warning(f"[VERIFY-CLAIMS] Memory read failed (non-fatal): {_me}")
+
+    memory_context = "\n\n".join(mem_parts) if mem_parts else "NO_STORED_DATA"
+
+    _no_data_preamble = ""
+    if memory_context == "NO_STORED_DATA":
+        _no_data_preamble = (
+            "CRITICAL — NO STORED BUSINESS DATA EXISTS.\n"
+            "Every specific number or metric in this ad copy was invented by an AI model "
+            "and is completely unverifiable.  You MUST include ALL of them in fixes.\n"
+            "THESE ARE ALL FABRICATED — find and replace every one:\n"
+            "  - Count claims: '100+', '150+', '50 weddings', '25+ Jaipur couples', "
+            "'Trusted by 120+', 'over 50 clients', 'more than 30 reviews'\n"
+            "  - Multiplier claims: '2x better', '3x faster', '2x more memorable'\n"
+            "  - Percentage claims: '95% satisfaction', '98% positive', '4.8 stars', "
+            "'5-star rated'\n"
+            "  - Superlatives: 'award-winning', '#1', 'top-rated', 'best in Jaipur'\n"
+            "Replace all of the above with 'many/numerous/trusted/proven' as appropriate.\n"
+            "There is no real data to verify anything — everything specific is fabricated.\n\n"
+        )
+
+    # ── Single GPT-4o-mini pass: extract + verify + generate replacement pairs ─
+    _prompt = (
+        "You are a factual accuracy enforcer for ad copy.  Your only job: find claims "
+        "in the ad copy that are NOT supported by the real business data, and return "
+        "exact substring replacements.\n\n"
+        + _no_data_preamble +
+        "REAL BUSINESS DATA (the ONLY source of truth — if it is not here, it is unverified):\n"
+        f"{memory_context}\n\n"
+        "CLAIM TYPES TO CHECK:\n"
+        "1. SPECIFIC NUMBERS — 'X+ customers', 'X weddings', 'X years', 'over X couples', "
+        "'X-star', 'X reviews'.  Rule: KEEP only if that approximate number (or a higher "
+        "one) appears explicitly in the real data.  If absent or unverifiable: replace "
+        "with non-specific language ('many', 'numerous', 'several') or delete the phrase.\n"
+        "2. SUPERLATIVES & AWARDS — 'award-winning', '#1', 'best in [city]', 'most trusted', "
+        "'top-rated', 'India's leading'.  Rule: KEEP only if a specific named award or "
+        "#1 ranking is stated in the real data.  If absent: delete entirely — do NOT "
+        "reword to a synonym superlative.\n"
+        "3. RATINGS — '5-star', '4.8 stars', 'X reviews'.  Rule: KEEP only if the exact "
+        "rating/count is in the real data.  If absent: delete the rating phrase.\n"
+        "4. CERTIFICATIONS & GUARANTEES — 'ISO certified', 'guaranteed results', 'certified "
+        "partner'.  Same rule: real data must confirm it, else delete.\n"
+        "5. URGENCY FILLER (semantic check) — does this phrase add pressure/urgency "
+        "WITHOUT adding a new concrete fact that is not already stated elsewhere in the copy? "
+        "Example: if '3 slots left for July' is already written, then 'Don't miss out!' "
+        "immediately after it is filler — it adds zero new information.  Delete such filler. "
+        "'3 slots left for July' itself is a concrete fact — keep it.\n\n"
+        "REPLACEMENT RULES:\n"
+        "  - If the claim is a STANDALONE phrase (whole headline, whole sentence, or a phrase "
+        "that can simply be deleted without leaving a grammatical gap): use empty string.\n"
+        "  - If the claim is EMBEDDED mid-sentence where removing it would leave a gap "
+        "(e.g. 'Consistent 5-star results from clients' → removing '5-star results' leaves "
+        "'Consistent  from clients'): replace with 'trusted' or 'proven' to maintain grammar.\n"
+        "  - For unverifiable NUMBERS: replace with 'many', 'numerous', or 'several'.\n\n"
+        "RETURN FORMAT: JSON {\"fixes\": [{\"original\": \"<exact substring>\", "
+        "\"replacement\": \"<cleaned text or empty string to delete>\"}]}\n"
+        "Return empty list if nothing needs changing.\n"
+        "CRITICAL: 'original' MUST be an exact verbatim substring of the ad copy below — "
+        "copy it character-for-character.\n\n"
+        f"AD COPY:\n{ad_copy_text}"
+    )
+
+    try:
+        _resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": _prompt}],
+            max_tokens=900,
+            temperature=0,
+        )
+        _result = json.loads(_resp.choices[0].message.content)
+        _fixes  = _result.get("fixes", [])
+    except Exception as _ge:
+        logger.warning(f"[VERIFY-CLAIMS] GPT call failed (non-fatal): {_ge}")
+        return ad_copy_text
+
+    # ── Apply fixes — quote-normalised matching so curly/straight don't mismatch ─
+    def _nq(s: str) -> str:
+        return s.replace('\u2018', "'").replace('\u2019', "'").replace('\u201c', '"').replace('\u201d', '"')
+
+    cleaned = ad_copy_text
+    applied = 0
+    for fix in _fixes:
+        orig = fix.get("original", "")
+        repl = fix.get("replacement", "")
+        if not orig:
+            continue
+        norm_cleaned = _nq(cleaned)
+        norm_orig    = _nq(orig)
+        idx = norm_cleaned.find(norm_orig)
+        if idx != -1:
+            cleaned = cleaned[:idx] + repl + cleaned[idx + len(norm_orig):]
+            applied += 1
+
+    # ── Programmatic post-pass: strip what GPT still misses ────────────────────────────────────────────
+    import re as _re
+
+    # 1) Urgency filler -- curly + straight apostrophe.
+    #    Patterns consume the whole clause to avoid leaving dangling fragments.
+    _URGENCY = _re.compile(
+        r"(?i)(don[\u2018\u2019']t\s+miss\s+out(?:\s+\w+){0,4}"
+        r"|don[\u2018\u2019']t\s+miss\s+[^\n.!?]{0,50}"
+        r"|don[\u2018\u2019']?t\s+wait\s+[^\n.!?]{0,50}"
+        r"|limited\s+time\s+offer"
+        r"|(?:before|till|until)\s+it[\u2018\u2019']?s\s+too\s+late"
+        r"|act\s+now(?!\s+to\b)(?!\s+and\b))[!.]?",
+        _re.MULTILINE,
+    )
+    pre_urgency = cleaned
+    cleaned = _URGENCY.sub("", cleaned)
+    if cleaned != pre_urgency:
+        applied += 1
+        logger.info("[VERIFY-CLAIMS] Urgency filler stripped via regex post-pass")
+
+    # 2) Specific-number / metric claims (always active).
+    #    a) Count claims with optional middle adjective/city word.
+    _NUM_FULL = _re.compile(
+        r"(?i)(?:(?:more\s+than|over)\s+)?(\d[\d,]*)\+?\s*(?:\w+\s+)?"
+        r"(weddings?|couples?|clients?|customers?|photoshoots?|reviews?)"
+    )
+    #    b) Bare 'trusted by N+' / 'N+' alone at word boundary.
+    _BARE_NUM = _re.compile(
+        r"(?i)(?:trusted\s+by\s+)?(\d[\d,]*)\+(?=\s|$|[,;!?])"
+    )
+    #    c) Multiplier claims: '2x better', '3x faster'.
+    _MULT = _re.compile(
+        r"(?i)(\d+)x\s+(better|faster|more|improved?|great\w*)"
+    )
+    #    d) Percentage claims: '95% satisfaction', '4.8 stars'.
+    _PCT = _re.compile(
+        r"(?i)(\d+(?:\.\d+)?)[%\s]*(?:\w+\s+)?(stars?|satisfaction|success|"
+        r"positive|accuracy|rating|out\s+of\s+\d+)"
+    )
+
+    if memory_context == "NO_STORED_DATA":
+        def _num_sub_all(m: "_re.Match") -> str:
+            return "many " + m.group(2).lower()
+        pre_num = cleaned
+        cleaned = _NUM_FULL.sub(_num_sub_all, cleaned)
+        cleaned = _BARE_NUM.sub("many satisfied clients", cleaned)
+        cleaned = _MULT.sub(r"truly \2", cleaned)
+        cleaned = _PCT.sub("highly rated", cleaned)
+        if cleaned != pre_num:
+            applied += 1
+            logger.info("[VERIFY-CLAIMS] Stray numbers/metrics stripped via regex post-pass (no stored data)")
+    else:
+        def _num_sub_partial(m: "_re.Match") -> str:
+            num_str = m.group(1).replace(",", "")
+            if num_str in memory_context or num_str + "+" in memory_context:
+                return m.group(0)
+            return "many " + m.group(2).lower()
+        pre_num = cleaned
+        cleaned = _NUM_FULL.sub(_num_sub_partial, cleaned)
+        if cleaned != pre_num:
+            applied += 1
+            logger.info("[VERIFY-CLAIMS] Unverified numbers stripped via regex post-pass")
+
+    # Collapse multiple consecutive horizontal spaces left by mid-sentence claim removal
+    cleaned = _re.sub(r"[ \t]{2,}", " ", cleaned)
+
+    logger.info(f"[VERIFY-CLAIMS] {len(_fixes)} claim(s) flagged, {applied} fix(es) applied for key={business_key!r}")
+    return cleaned
 
 
 async def _score_competitive_edge(
