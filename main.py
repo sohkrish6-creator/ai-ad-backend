@@ -2409,11 +2409,13 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "with one-line reason for each decision based on this audience's behavior]\n"
         "Data Label: [REAL — from this account's past performance data / BENCHMARK — industry estimate]\n\n"
         "---\n"
+        "META AD GLOBAL RULES (apply to ALL 3 variations, every line):\n"
+        "  Pattern ban 1 — 'Capture your X' in any form (moments/memories/day/story) is banned. Name a specific shot or outcome instead.\n"
+        "  Pattern ban 2 — Generic urgency filler ('don't miss out', 'limited time', 'act now', 'hurry') without a specific real constraint is banned. State the real constraint; drop the filler.\n"
+        "  Pattern ban 3 — Unsubstantiated claims: 'award-winning', 'best in [city]', '#1', 'top-rated', 'India's leading' require real evidence from the website/memory above. If not present, omit or reword to a verifiable fact.\n"
+        "  Vary sentence length — mix short lines (under 8 words) with longer ones. No two consecutive lines start the same way.\n"
+        "\n"
         "AD VARIATION 1 — PAIN ANGLE\n"
-        "NATURALNESS CHECK before writing: would this line work word-for-word for any other business in this industry? "
-        "If yes, rewrite with a detail specific to THIS business. "
-        f"BANNED phrases: 'Capture Your Big Day', 'Don't Miss Out', 'Hassle-free', 'Expert Photographers', 'Best in {city_label}', 'Transform your journey', 'Your dream awaits', 'Unlock your potential'. "
-        "Vary sentence length — mix short punchy lines with longer ones. No line should start the same way as the previous line.\n"
         "Primary Text: [4-5 lines. Open with their specific pain using a concrete scenario, not an abstract claim. Close with exact CTA: 'WhatsApp pe FREE AUDIT bhejo']\n"
         "Headline: [max 40 chars — include a specific number, location, or concrete outcome — NOT a generic benefit phrase]\n"
         "Description: [max 30 chars — action-oriented, specific]\n"
@@ -2468,13 +2470,32 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "close you get to 15 UNIQUE headlines spanning distinct angles — filling only 8-10 or reusing "
         "the same idea in different words scores 'Poor'. Every one of the 15 below must be a genuinely "
         "different angle (not a reword of another headline) and must fit in 30 characters:\n"
-        "GLOBAL NATURALNESS RULE (applies to EVERY headline AND description below — no exceptions):\n"
-        "Before writing any line ask: could this run word-for-word for any other business in this industry? If yes, rewrite with a specific detail.\n"
-        "BANNED PHRASES — do NOT use these or close variants in any headline or description: "
-        "'Capture Your Big Day', 'Capture Your Special Day', 'Don't miss out' (any apostrophe form), "
-        "'Don't Miss Out', 'Hassle-free', 'Expert Photographers', 'Quality Service', 'Best [Service]', "
-        "'Transform your journey', 'Your dream awaits', 'Unlock your potential', 'Elevate your experience', "
-        "'Trusted by [N] Couples' (unless real verified number), 'Perfect memories, perfect photos'.\n"
+        "GLOBAL RULES (apply to EVERY headline AND description — no exceptions):\n"
+        "\n"
+        "RULE A — SPECIFICITY: Before writing any line ask: could this run unchanged for ANY other business "
+        "in this industry? If yes, rewrite with a detail specific to THIS business (a number, a city, a "
+        "named outcome, a concrete service detail).\n"
+        "\n"
+        "RULE B — BANNED PATTERNS (ban the CATEGORY, not just the exact phrase):\n"
+        "  1. 'Capture your X' boilerplate — ANY phrasing of 'capture your moments / memories / story / "
+        "     day / journey / special day' is banned. Instead name a concrete specific shot or outcome.\n"
+        "  2. Generic urgency filler — ANY variant of 'don't miss out / don't miss your chance / limited "
+        "     time offer / act now / hurry' used WITHOUT a specific, real, dateable constraint is banned. "
+        "     '3 slots left for July' is fine. 'Don't miss out!' stacked on top of that is not — it adds "
+        "     no information and reads as filler. If you have a real constraint, state the constraint; "
+        "     do not add urgency filler language around it.\n"
+        "  3. Generic quality descriptors — 'hassle-free', 'seamless', 'quality [service]', "
+        "     'professional [service]', 'expert [role]', 'perfect [noun]' without a specific modifier.\n"
+        "  4. AI-pattern stacking — 'transform your journey', 'your dream awaits', 'unlock your "
+        "     potential', 'elevate your experience', 'achieve your goals'.\n"
+        "\n"
+        "RULE C — CLAIM SUBSTANTIATION: Any claim implying awards, certifications, industry rankings, "
+        "or superlatives ('award-winning', '#1', 'best in [city]', 'top-rated', 'India's leading') MUST "
+        "be directly supported by evidence in the business website or memory context provided above. "
+        "If no such evidence exists in the context, do NOT use the claim — reword to what IS verifiable "
+        "(e.g. a client count, a year established, a specific service feature). Inventing credentials "
+        "is a policy violation and creates legal risk for the business.\n"
+        "\n"
         "A keyword-match headline is required for Ad Strength but must still communicate a real idea — "
         "'Wedding Photography in Jaipur' is readable; 'Jaipur Wedding Photography Experts' is keyword spam.\n"
         "AD 1 — BENEFIT ANGLE (what they get — specific outcome)\n"
@@ -2686,6 +2707,89 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     # GPT occasionally echoes the trailing self-check instruction verbatim as
     # the last line of the last section — strip it if it leaked through.
     lp_checklist = re.sub(r'\n?CRITICAL FINAL CHECK:.*$', '', lp_checklist, flags=re.S).strip()
+
+    # ── Post-generation copy review pass (GPT-4o-mini) ───────────────────────
+    # Prompt-level rules alone don't reliably prevent boilerplate at generation
+    # time. This second pass sends ONLY the ad copy lines (not the full kit),
+    # gets back a compact list of {original, replacement} pairs, and applies
+    # them via string substitution — keeping token usage small.
+    try:
+        import re as _re
+
+        def _extract_ad_lines(text: str) -> str:
+            """Pull just headline/description/primary-text lines from a kit section."""
+            lines = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("Headline", "Description", "Primary Text", "H1:", "H2:", "H3:", "D1:", "D2:")):
+                    lines.append(stripped)
+            return "\n".join(lines)
+
+        _gads_lines = _extract_ad_lines(google_kit)
+        _meta_lines = _extract_ad_lines(meta_kit or "")
+        _copy_to_review = f"GOOGLE ADS LINES:\n{_gads_lines}\n\nMETA ADS LINES:\n{_meta_lines}"
+
+        _review_prompt = (
+            f"You are a strict ad copy quality enforcer for {biz_label} in {city_label}.\n"
+            "Find lines below that violate these rules and provide exact replacements.\n\n"
+            "RULES:\n"
+            "1. CAPTURE-YOUR-X — 'capture your moments/memories/day/story/love/special day' "
+            "(any form) → rewrite naming a concrete specific outcome or shot.\n"
+            "2. GENERIC URGENCY FILLER — 'don't miss out', 'don't miss your [X]', 'act now', "
+            "'hurry', 'limited time' when NO new specific constraint is added → remove filler; "
+            "keep only the real constraint (e.g. '3 slots left') if one exists.\n"
+            "3. UNSUBSTANTIATED SUPERLATIVES — 'award-winning', '#1', 'best in [city]', "
+            "'top-rated', 'most trusted' without proof in the copy → reword to a verifiable fact.\n"
+            "4. GENERIC DESCRIPTORS — 'hassle-free', 'seamless experience', 'perfect memories', "
+            "'quality service', 'expert [role]' without a specific modifier → rewrite specifically.\n\n"
+            "Return JSON: {\"fixes\": [{\"original\": \"<exact substring>\", \"replacement\": \"<rewritten line>\"}]}\n"
+            "Return an empty fixes list if nothing violates the rules. "
+            "original must be the EXACT substring as it appears in the text below.\n\n"
+            f"{_copy_to_review}"
+        )
+
+        _review_resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": _review_prompt}],
+            max_tokens=800,
+            temperature=0.2,
+        )
+        _reviewed = json.loads(_review_resp.choices[0].message.content)
+        _fixes = _reviewed.get("fixes", [])
+
+        # GPT returns straight-quote apostrophes but kit text often has curly
+        # Unicode ones (U+2018/U+2019). Normalise both sides before matching,
+        # then apply the replacement at the correct position in the original text.
+        def _nq(s: str) -> str:
+            return s.replace('‘', "'").replace('’', "'").replace('“', '"').replace('”', '"')
+
+        def _apply_fix(text: str, orig: str, repl: str) -> str:
+            norm_text = _nq(text)
+            norm_orig = _nq(orig)
+            idx = norm_text.find(norm_orig)
+            if idx == -1:
+                return text
+            return text[:idx] + repl + text[idx + len(norm_orig):]
+
+        _applied = 0
+        for fix in _fixes:
+            orig = fix.get("original", "")
+            repl = fix.get("replacement", "")
+            if not orig or not repl or _nq(orig) == _nq(repl):
+                continue
+            new_gk = _apply_fix(google_kit, orig, repl)
+            if new_gk != google_kit:
+                google_kit = new_gk
+                _applied += 1
+            if meta_kit:
+                new_mk = _apply_fix(meta_kit, orig, repl)
+                if new_mk != meta_kit:
+                    meta_kit = new_mk
+                    _applied += 1
+        logger.info(f"[CAMPAIGN KIT] Copy review pass: {len(_fixes)} violation(s) found, {_applied} fix(es) applied")
+    except Exception as _rev_e:
+        logger.warning(f"[CAMPAIGN KIT] Copy review pass skipped (non-fatal): {_rev_e}")
 
     # ── Save keywords/headlines/descriptions to campaign_memory ─────────────
     # so /google-ads/create-campaign can pull them back when the user clicks
