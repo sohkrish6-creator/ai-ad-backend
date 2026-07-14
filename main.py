@@ -2410,20 +2410,28 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "Data Label: [REAL — from this account's past performance data / BENCHMARK — industry estimate]\n\n"
         "---\n"
         "AD VARIATION 1 — PAIN ANGLE\n"
-        "Primary Text: [4-5 lines. Open with their specific pain. Close with exact CTA: 'WhatsApp pe FREE AUDIT bhejo']\n"
-        "Headline: [max 40 chars — include number or city or specific benefit]\n"
-        "Description: [max 30 chars — action-oriented]\n"
+        "NATURALNESS CHECK before writing: would this line work word-for-word for any other business in this industry? "
+        "If yes, rewrite with a detail specific to THIS business. "
+        f"BANNED phrases: 'Capture Your Big Day', 'Don't Miss Out', 'Hassle-free', 'Expert Photographers', 'Best in {city_label}', 'Transform your journey', 'Your dream awaits', 'Unlock your potential'. "
+        "Vary sentence length — mix short punchy lines with longer ones. No line should start the same way as the previous line.\n"
+        "Primary Text: [4-5 lines. Open with their specific pain using a concrete scenario, not an abstract claim. Close with exact CTA: 'WhatsApp pe FREE AUDIT bhejo']\n"
+        "Headline: [max 40 chars — include a specific number, location, or concrete outcome — NOT a generic benefit phrase]\n"
+        "Description: [max 30 chars — action-oriented, specific]\n"
         "CTA Button: [exact Meta button label]\n"
         "---\n"
         "AD VARIATION 2 — PROOF ANGLE (numbers, results, credibility — must be distinct from Ad 1)\n"
-        f"Primary Text: [4-5 lines. Open with a specific result ('{city_label} ke 30+ businesses ne X result paya in 60 days'). No generic claims. Close with exact CTA]\n"
-        "Headline: [max 40 chars — include specific result or number — different from Ad 1]\n"
+        "NATURALNESS CHECK: same rules as Ad 1. The proof must feel earned, not fabricated — if a specific client count or result is unknown, say 'multiple' or omit the number rather than inventing one.\n"
+        f"Primary Text: [4-5 lines. Open with a specific result in this format — EXAMPLE ONLY, adapt all numbers/timeframes to what you can realistically infer for this business: "
+        f"'{city_label} ke [realistic-N, NOT literally '30+'] [customer-type] ne [specific-result] paya'. "
+        f"Do NOT copy '30+' or '60 days' literally — estimate from context or omit if unknown. No generic claims. Close with exact CTA]\n"
+        "Headline: [max 40 chars — specific result or number — different from Ad 1 — no generic praise phrases]\n"
         "Description: [max 30 chars]\n"
         "CTA Button: [exact Meta button label]\n"
         "---\n"
         "AD VARIATION 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal — must be distinct from Ads 1 and 2)\n"
-        "Primary Text: [4-5 lines. Reference a real urgency — seasonal, limited spots this month, competitor gaining ground. Close with exact CTA]\n"
-        "Headline: [max 40 chars — state urgency clearly — different from Ads 1 and 2]\n"
+        "NATURALNESS CHECK: urgency must be believable and specific — 'July slots filling' works if it's July; 'wedding season' works if timing fits. Do NOT write vague urgency like 'Limited offer!' or 'Act now!'\n"
+        "Primary Text: [4-5 lines. Reference a real, dateable urgency — seasonal window, specific capacity constraint (e.g. '3 weekend dates left in August'), or a competitor gaining ground with a specific detail. Close with exact CTA]\n"
+        "Headline: [max 40 chars — state urgency with a specific constraint, not a generic 'Hurry!' — different from Ads 1 and 2]\n"
         "Description: [max 30 chars]\n"
         "CTA Button: [exact Meta button label]\n"
         "---\n"
@@ -2461,35 +2469,44 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         "the same idea in different words scores 'Poor'. Every one of the 15 below must be a genuinely "
         "different angle (not a reword of another headline) and must fit in 30 characters:\n"
         "AD 1 — BENEFIT ANGLE (what they get — specific outcome)\n"
-        f"Headline 1: [KEYWORD-MATCH — literally include the PRIMARY KEYWORD phrase + city, e.g. 'Hospitality Marketing {city_label}']\n"
-        "Headline 2: [max 30 chars — include city or specific offer]\n"
-        "Headline 3: [max 30 chars — CTA or urgency]\n"
-        "Description 1: [80-90 chars MANDATORY — specific benefit with number or proof. Last sentence = CTA. Count characters.]\n"
-        "Description 2: [80-90 chars MANDATORY — social proof or differentiator. Last sentence = CTA. Count characters.]\n"
+        "NATURALNESS RULE: Every headline must pass this test — 'Could this headline run unchanged for any other business in this industry?' If yes, rewrite with a specific detail. "
+        f"BANNED headline patterns: '[Service] Experts', '[Service] Professionals', 'Best [Service]', 'Quality [Service]', 'Your [Goal] Awaits', 'Capture Your Big Day', 'Don't Miss Out'. "
+        "A keyword-match headline is fine for relevance but must still read like a human wrote it.\n"
+        f"Headline 1: [KEYWORD-MATCH — PRIMARY KEYWORD phrase + {city_label}. EXAMPLE STRUCTURE ONLY (swap industry): 'Hospitality Marketing {city_label}' → write the real version for THIS business]\n"
+        "Headline 2: [max 30 chars — one concrete specific outcome or offer detail, not a vague promise]\n"
+        "Headline 3: [max 30 chars — CTA or urgency with a real constraint]\n"
+        "Description 1: [80-90 chars MANDATORY — specific benefit with a number or named proof. Last sentence = CTA. Count characters.]\n"
+        "Description 2: [80-90 chars MANDATORY — social proof or differentiator with a concrete detail. Last sentence = CTA. Count characters.]\n"
         "---\n"
         "AD 2 — PROOF ANGLE (numbers, results, credibility — completely different from Ad 1)\n"
-        f"Headline 1: [KEYWORD-MATCH VARIANT — different word order/synonym of the PRIMARY KEYWORD + city, e.g. '{city_label} Hospitality Experts', ALSO include a specific result number]\n"
-        f"Headline 2: [max 30 chars — who got the result, e.g. '{city_label} Hotels Trust Us']\n"
+        "NATURALNESS RULE: Numbers must be realistic for this business — if client count is unknown, say 'multiple clients' or omit the number, do NOT invent '30+' or '100+'. "
+        "The headline must name something specific about this business's proof, not a generic trust signal.\n"
+        f"Headline 1: [KEYWORD-MATCH VARIANT — synonym/different word order of PRIMARY KEYWORD + {city_label}, include a specific result number if known. EXAMPLE STRUCTURE: '{city_label} Hospitality Experts — [N] Hotels Served']\n"
+        f"Headline 2: [max 30 chars — specific proof about THIS business, e.g. a year, a client type, a metric — not just '{city_label} [Industry] Trust Us']\n"
         "Headline 3: [max 30 chars — CTA]\n"
-        "Description 1: [80-90 chars MANDATORY — state the specific result and who achieved it. Last sentence = CTA.]\n"
-        "Description 2: [80-90 chars MANDATORY — credibility signal (years, clients, industry). Last sentence = CTA.]\n"
+        "Description 1: [80-90 chars MANDATORY — state a specific result and who achieved it. Last sentence = CTA.]\n"
+        "Description 2: [80-90 chars MANDATORY — credibility signal (years, specific client type, award, certification). Last sentence = CTA.]\n"
         "---\n"
         "AD 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal — different from Ads 1 and 2)\n"
-        "Headline 1: [max 30 chars — urgency signal, e.g. 'July: 2 Spots Left']\n"
-        "Headline 2: [max 30 chars — what they lose by waiting]\n"
+        "NATURALNESS RULE: Urgency must be dateable and believable — 'August: 3 dates left' works; 'Limited offer!' does not. "
+        "The 'what they lose by waiting' line must name a real consequence specific to this business/season.\n"
+        "Headline 1: [max 30 chars — urgency with a specific constraint, e.g. 'August: 3 Slots Left' or 'Peak Season Starting']\n"
+        "Headline 2: [max 30 chars — what they lose by waiting — concrete, not abstract]\n"
         "Headline 3: [max 30 chars — CTA]\n"
-        "Description 1: [80-90 chars MANDATORY — real urgency tied to season/capacity/competitor. Last sentence = CTA.]\n"
-        "Description 2: [80-90 chars MANDATORY — risk of delay + risk-free first step. Last sentence = CTA.]\n"
+        "Description 1: [80-90 chars MANDATORY — real urgency tied to season/capacity/competitor with a specific detail. Last sentence = CTA.]\n"
+        "Description 2: [80-90 chars MANDATORY — risk of delay + a specific low-risk first step. Last sentence = CTA.]\n"
         "NOTE on 'Free': For Google Ads prefer 'Complimentary', 'No-cost', 'On us' over 'Free' to avoid ad policy flags.\n"
         "---\n"
         "ADDITIONAL RSA HEADLINES (6 more — MANDATORY, brings the total to 15. Each MUST be a completely "
         "different angle from the 9 above and from each other — no rewording of an existing headline):\n"
-        f"Headline 10: [KEYWORD-MATCH — the PRIMARY KEYWORD phrase + city, plain and direct, e.g. 'Hotel Booking {city_label} Experts']\n"
-        "Headline 11: [KEYWORD-MATCH VARIANT — a third distinct phrasing of the PRIMARY KEYWORD + city]\n"
-        "Headline 12: [KEYWORD-MATCH VARIANT — a fourth distinct phrasing, e.g. service + 'near' + city or a neighborhood in the city]\n"
-        "Headline 13: [FEATURE-FOCUSED — name one concrete deliverable/feature, not a vague benefit]\n"
-        "Headline 14: [QUESTION-FOCUSED — must end in '?', speaks to the audience's exact pain point]\n"
-        "Headline 15: [SOCIAL-PROOF-FOCUSED — a specific different proof point than Ad 2 Headline 2, e.g. a rating or review count]\n"
+        "NATURALNESS RULE for Headline 10-15: These exist to maximise Google's Ad Strength — they must be keyword-rich BUT still readable as human writing. "
+        "A line like '[Service] [City] Experts' or '[City] [Service] Services' scores Ad Strength but reads as spam — find keyword-rich phrasing that also communicates a real idea.\n"
+        f"Headline 10: [KEYWORD-MATCH — PRIMARY KEYWORD + {city_label}, plain and direct. Make it readable: e.g. 'Hotel Booking in {city_label}' beats 'Hotel Booking {city_label} Experts']\n"
+        f"Headline 11: [KEYWORD-MATCH VARIANT — third distinct phrasing of PRIMARY KEYWORD + {city_label}]\n"
+        f"Headline 12: [KEYWORD-MATCH VARIANT — fourth phrasing, e.g. service + 'near' + {city_label} or a specific neighbourhood]\n"
+        "Headline 13: [FEATURE-FOCUSED — name one concrete deliverable unique to this business, not a vague benefit]\n"
+        "Headline 14: [QUESTION-FOCUSED — must end in '?', names the audience's specific pain point by role or situation]\n"
+        "Headline 15: [SOCIAL-PROOF-FOCUSED — a specific proof point different from Ad 2 Headline 2 — a rating, a named client type, a year established]\n"
         "---\n"
         "AD EXTENSIONS\n"
         "Sitelinks (6 — link to specific pages, not homepage. Each with 2 description lines, max 35 chars each):\n"
@@ -12378,18 +12395,32 @@ async def run_meta_launch_preflight(
     blocking_issues: list = []
     warnings: list = []
 
-    # Check 1 — Account configuration
+    # Check 1 — Account configuration + token validity (real API call)
     def _check_meta_account():
-        get_meta_ads_client()
+        from facebook_business.adobjects.adaccount import AdAccount as _AdAccount
+        _api, _acct_id = get_meta_ads_client()
+        # Make a lightweight real API call to verify the token is live (not just present)
+        _AdAccount(_acct_id).api_get(fields=["name", "account_status"])
 
     try:
         await asyncio.to_thread(_check_meta_account)
     except RuntimeError as _ae:
+        # env vars missing
         blocking_issues.append({
             "code":     "META_ACCOUNT_NOT_CONFIGURED",
             "message":  (
                 f"Meta Ads account not configured: {_ae}. "
                 "Set META_APP_ID, META_APP_SECRET, META_ACCESS_TOKEN, META_AD_ACCOUNT_ID env vars."
+            ),
+            "severity": "blocking",
+        })
+    except Exception as _ae:
+        # vars present but token expired / wrong permissions
+        blocking_issues.append({
+            "code":     "META_TOKEN_INVALID",
+            "message":  (
+                f"Meta access token is invalid or expired ({type(_ae).__name__}: {str(_ae)[:120]}). "
+                "Generate a new long-lived token in Meta Business Manager > System Users, or refresh via the Graph API."
             ),
             "severity": "blocking",
         })
