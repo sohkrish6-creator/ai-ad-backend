@@ -447,10 +447,12 @@ def _migrate_user_keys():
     ]
     _uid_prefix = _krish_uid + "::"
     logger.info(f"[MIGRATE] Running user key migration for uid={_krish_uid[:8]}...")
-    with engine.begin() as _mc:
-        # Pass 1: prefix business_key on memory + activity tables
-        for _tbl in _tables_with_bk:
-            try:
+
+    # Pass 1: prefix business_key — each table in its OWN transaction so one
+    # failure (e.g. duplicate key on prospect_memory) cannot abort the others.
+    for _tbl in _tables_with_bk:
+        try:
+            with engine.begin() as _mc:
                 if _is_sqlite:
                     _info = _mc.execute(text(f"PRAGMA table_info({_tbl})")).fetchall()
                     _cols = [r[1] for r in _info]
@@ -461,24 +463,29 @@ def _migrate_user_keys():
                     ), {"t": _tbl}).fetchall()
                     _cols = [r[0] for r in _info]
                 if "business_key" not in _cols:
+                    logger.info(f"[MIGRATE] Pass1 {_tbl}: no business_key column, skipped")
                     continue
-                _mc.execute(text(
+                _r1 = _mc.execute(text(
                     f"UPDATE {_tbl} SET business_key = :pfx || business_key "
                     f"WHERE business_key NOT LIKE :like_pfx"
                 ), {"pfx": _uid_prefix, "like_pfx": _uid_prefix + "%"})
-            except Exception as _me2:
-                logger.warning(f"[MIGRATE] Could not migrate business_key on {_tbl}: {_me2}")
+                logger.info(f"[MIGRATE] Pass1 {_tbl}: {_r1.rowcount} rows prefixed OK")
+        except Exception as _me2:
+            logger.warning(f"[MIGRATE] Pass1 {_tbl}: FAILED (non-fatal, won't block Pass2) — {_me2}")
 
-        # Pass 2: stamp user_id column on tables that have one
-        for _tbl in _tables_with_uid_col:
-            try:
-                _mc.execute(text(
+    # Pass 2: stamp user_id column — each table in its OWN transaction.
+    # This MUST run regardless of any Pass 1 failures above.
+    for _tbl in _tables_with_uid_col:
+        try:
+            with engine.begin() as _mc:
+                _r2 = _mc.execute(text(
                     f"UPDATE {_tbl} SET user_id = :uid WHERE user_id IS NULL OR user_id = ''"
                 ), {"uid": _krish_uid})
-            except Exception as _me3:
-                logger.warning(f"[MIGRATE] Could not stamp user_id on {_tbl}: {_me3}")
+                logger.info(f"[MIGRATE] Pass2 {_tbl}: {_r2.rowcount} rows stamped with user_id OK")
+        except Exception as _me3:
+            logger.warning(f"[MIGRATE] Pass2 {_tbl}: FAILED — {_me3}")
 
-    logger.info("[MIGRATE] User key migration complete")
+    logger.info("[MIGRATE] User key migration complete — both passes done")
 
 
 try:
