@@ -902,6 +902,44 @@ async def auth_me(request: Request):
         return JSONResponse({"authenticated": False, "user_id": None}, status_code=401)
     return {"authenticated": True, "user_id": uid}
 
+
+@app.get("/debug/auth-state")
+async def debug_auth_state(request: Request):
+    """Temporary debug endpoint — shows JWT extraction state + DB user_id distribution."""
+    uid = getattr(request.state, "user_id", "")
+    jwt_secret_set = bool(os.getenv("SUPABASE_JWT_SECRET", ""))
+    krish_uid_set = bool(os.getenv("KRISH_USER_ID", ""))
+    auth_header = request.headers.get("Authorization", "")
+    bearer_present = auth_header.startswith("Bearer ")
+
+    db_info = {}
+    try:
+        with engine.connect() as _c:
+            # Distribution of user_id values in activity_log
+            rows = _c.execute(text(
+                "SELECT user_id, COUNT(*) as cnt FROM activity_log GROUP BY user_id ORDER BY cnt DESC LIMIT 10"
+            )).fetchall()
+            db_info["activity_log_user_id_distribution"] = [
+                {"user_id": r[0], "count": r[1]} for r in rows
+            ]
+            null_count = _c.execute(text(
+                "SELECT COUNT(*) FROM activity_log WHERE user_id IS NULL OR user_id = ''"
+            )).scalar()
+            db_info["activity_log_null_user_id_count"] = null_count
+            total_count = _c.execute(text("SELECT COUNT(*) FROM activity_log")).scalar()
+            db_info["activity_log_total"] = total_count
+    except Exception as _e:
+        db_info["error"] = str(_e)
+
+    return {
+        "request_user_id": uid or None,
+        "jwt_secret_configured": jwt_secret_set,
+        "krish_user_id_configured": krish_uid_set,
+        "bearer_token_present_in_request": bearer_present,
+        "auth_active": jwt_secret_set and bearer_present and bool(uid),
+        "db": db_info,
+    }
+
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     import json

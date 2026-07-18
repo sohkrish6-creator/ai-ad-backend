@@ -51,7 +51,7 @@ ALTER TABLE creative_studio_memory ENABLE ROW LEVEL SECURITY;
 -- activity_log
 CREATE POLICY "Users see own activity"
   ON activity_log FOR SELECT
-  USING (auth.uid()::text = user_id OR user_id IS NULL);
+  USING (auth.uid()::text = user_id);
 
 CREATE POLICY "Users insert own activity"
   ON activity_log FOR INSERT
@@ -64,7 +64,7 @@ CREATE POLICY "Users update own activity"
 -- report_snapshot
 CREATE POLICY "Users see own snapshots"
   ON report_snapshot FOR SELECT
-  USING (auth.uid()::text = user_id OR user_id IS NULL);
+  USING (auth.uid()::text = user_id);
 
 CREATE POLICY "Users insert own snapshots"
   ON report_snapshot FOR INSERT
@@ -77,7 +77,7 @@ CREATE POLICY "Users update own snapshots"
 -- smart_analysis_history
 CREATE POLICY "Users see own analysis history"
   ON smart_analysis_history FOR SELECT
-  USING (auth.uid()::text = user_id OR user_id IS NULL);
+  USING (auth.uid()::text = user_id);
 
 CREATE POLICY "Users insert own analysis history"
   ON smart_analysis_history FOR INSERT
@@ -86,7 +86,7 @@ CREATE POLICY "Users insert own analysis history"
 -- leads
 CREATE POLICY "Users see own leads"
   ON leads FOR SELECT
-  USING (auth.uid()::text = user_id OR user_id IS NULL);
+  USING (auth.uid()::text = user_id);
 
 CREATE POLICY "Users insert own leads"
   ON leads FOR INSERT
@@ -103,7 +103,7 @@ CREATE POLICY "Users delete own leads"
 -- analyses
 CREATE POLICY "Users see own analyses"
   ON analyses FOR SELECT
-  USING (auth.uid()::text = user_id OR user_id IS NULL);
+  USING (auth.uid()::text = user_id);
 
 CREATE POLICY "Users insert own analyses"
   ON analyses FOR INSERT
@@ -112,7 +112,7 @@ CREATE POLICY "Users insert own analyses"
 -- reports
 CREATE POLICY "Users see own reports"
   ON reports FOR SELECT
-  USING (auth.uid()::text = user_id OR user_id IS NULL);
+  USING (auth.uid()::text = user_id);
 
 CREATE POLICY "Users insert own reports"
   ON reports FOR INSERT
