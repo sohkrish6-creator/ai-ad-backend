@@ -14734,6 +14734,34 @@ if _krish_for_gads:
     except Exception:
         pass
 
+# Ensure UNIQUE constraint on gads_oauth_tokens.user_id exists so that
+# ON CONFLICT(user_id) DO UPDATE works. Deduplicate first (keep highest id
+# per user_id) in case the column was added without the constraint and
+# duplicate rows snuck in, then add the constraint.
+try:
+    with engine.begin() as _gc:
+        # Delete lower-id duplicates per user_id (keeps the latest row).
+        _gc.execute(text("""
+            DELETE FROM gads_oauth_tokens a
+            USING gads_oauth_tokens b
+            WHERE a.user_id IS NOT NULL
+              AND a.user_id != ''
+              AND a.user_id = b.user_id
+              AND a.id < b.id
+        """))
+except Exception as _gue:
+    logger.warning(f"[MIGRATE] gads_oauth_tokens dedup: {_gue}")
+
+try:
+    with engine.begin() as _gc:
+        _gc.execute(text(
+            "ALTER TABLE gads_oauth_tokens ADD CONSTRAINT gads_oauth_tokens_user_id_key UNIQUE (user_id)"
+        ))
+    logger.info("[MIGRATE] gads_oauth_tokens: UNIQUE(user_id) constraint added")
+except Exception as _gue:
+    # Constraint already exists — safe to ignore.
+    logger.info(f"[MIGRATE] gads_oauth_tokens UNIQUE(user_id) already present or skipped: {_gue}")
+
 
 # ── OAuth client config / flow ───────────────────────────────────────────────
 _GADS_OAUTH_SCOPES = ["https://www.googleapis.com/auth/adwords"]
