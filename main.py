@@ -421,11 +421,12 @@ def _migrate_user_keys():
     """
     Backfill existing rows so Krish's historical data is accessible after auth is enabled.
 
-    When KRISH_USER_ID env var is set, prefix every business_key in all memory tables
-    with "{KRISH_USER_ID}::" — this maps old unscoped keys to the new user-scoped format.
+    Two passes per table:
+      1. Prefix every business_key with "{KRISH_USER_ID}::" (memory tables — scoping via key).
+      2. Set user_id = KRISH_USER_ID on all rows that have a user_id column but no value yet
+         (activity_log, report_snapshot, smart_analysis_history, leads, analyses, reports).
 
-    Idempotent: rows already prefixed (containing "::") and matching the uid prefix
-    are skipped.  Runs at startup; safe to run multiple times.
+    Both passes are idempotent and safe to run multiple times.
     """
     _krish_uid = os.getenv("KRISH_USER_ID", "")
     if not _krish_uid:
@@ -439,12 +440,17 @@ def _migrate_user_keys():
         "creative_studio_memory",
         "activity_log", "report_snapshot", "smart_analysis_history",
     ]
+    # Tables that have an explicit user_id column (not just business_key prefix scoping)
+    _tables_with_uid_col = [
+        "activity_log", "report_snapshot", "smart_analysis_history",
+        "leads", "analyses", "reports",
+    ]
     _uid_prefix = _krish_uid + "::"
     logger.info(f"[MIGRATE] Running user key migration for uid={_krish_uid[:8]}...")
     with engine.begin() as _mc:
+        # Pass 1: prefix business_key on memory + activity tables
         for _tbl in _tables_with_bk:
             try:
-                # Check table/column exist before attempting update
                 if _is_sqlite:
                     _info = _mc.execute(text(f"PRAGMA table_info({_tbl})")).fetchall()
                     _cols = [r[1] for r in _info]
@@ -461,7 +467,17 @@ def _migrate_user_keys():
                     f"WHERE business_key NOT LIKE :like_pfx"
                 ), {"pfx": _uid_prefix, "like_pfx": _uid_prefix + "%"})
             except Exception as _me2:
-                logger.warning(f"[MIGRATE] Could not migrate {_tbl}: {_me2}")
+                logger.warning(f"[MIGRATE] Could not migrate business_key on {_tbl}: {_me2}")
+
+        # Pass 2: stamp user_id column on tables that have one
+        for _tbl in _tables_with_uid_col:
+            try:
+                _mc.execute(text(
+                    f"UPDATE {_tbl} SET user_id = :uid WHERE user_id IS NULL OR user_id = ''"
+                ), {"uid": _krish_uid})
+            except Exception as _me3:
+                logger.warning(f"[MIGRATE] Could not stamp user_id on {_tbl}: {_me3}")
+
     logger.info("[MIGRATE] User key migration complete")
 
 
@@ -730,7 +746,7 @@ async def activity_list(request: Request, limit: int = 50, type: str = "", busin
         params = {"lim": limit}
         _uid = getattr(request.state, "user_id", "")
         if _uid:
-            clauses.append("(user_id = :uid OR user_id IS NULL)")
+            clauses.append("user_id = :uid")
             params["uid"] = _uid
         if type.strip():
             clauses.append("activity_type = :at")
@@ -762,7 +778,7 @@ async def activity_for_business(request: Request, business_key: str):
         params = {"bk": business_key}
         extra = ""
         if _uid:
-            extra = " AND (user_id = :uid OR user_id IS NULL)"
+            extra = " AND user_id = :uid"
             params["uid"] = _uid
         with engine.connect() as conn:
             rows = conn.execute(
@@ -3827,14 +3843,21 @@ async def intelligence(request: IntelligenceRequest, db: Session = Depends(get_d
 
 
 @app.get("/analyses")
-def get_analyses(db: Session = Depends(get_db)):
-    analyses = db.query(AnalysisModel).order_by(AnalysisModel.id.desc()).all()
+def get_analyses(request: Request, db: Session = Depends(get_db)):
+    _uid = getattr(request.state, "user_id", "")
+    q = db.query(AnalysisModel).order_by(AnalysisModel.id.desc())
+    if _uid:
+        q = q.filter(AnalysisModel.user_id == _uid)
+    analyses = q.all()
     return {"analyses": [{"id": a.id, "url": a.url, "business_type": a.business_type, "created_at": a.created_at} for a in analyses]}
 
 @app.get("/reports")
-def get_reports(report_type: Optional[str] = None, db: Session = Depends(get_db)):
+def get_reports(request: Request, report_type: Optional[str] = None, db: Session = Depends(get_db)):
     try:
+        _uid = getattr(request.state, "user_id", "")
         q = db.query(ReportModel).order_by(ReportModel.id.desc())
+        if _uid:
+            q = q.filter(ReportModel.user_id == _uid)
         if report_type:
             q = q.filter(ReportModel.report_type == report_type)
         reports = q.all()
@@ -3844,9 +3867,13 @@ def get_reports(report_type: Optional[str] = None, db: Session = Depends(get_db)
         return {"reports": [], "error": "Reports table not yet available"}
 
 @app.get("/reports/{report_id}")
-def get_report(report_id: int, db: Session = Depends(get_db)):
+def get_report(request: Request, report_id: int, db: Session = Depends(get_db)):
     try:
-        report = db.query(ReportModel).filter(ReportModel.id == report_id).first()
+        _uid = getattr(request.state, "user_id", "")
+        q = db.query(ReportModel).filter(ReportModel.id == report_id)
+        if _uid:
+            q = q.filter(ReportModel.user_id == _uid)
+        report = q.first()
         if not report:
             return {"success": False, "message": "Report nahi mila"}
         return {"id": report.id, "report_type": report.report_type, "title": report.title, "input_data": json.loads(report.input_data or "{}"), "result_data": json.loads(report.result_data or "{}"), "created_at": report.created_at}
@@ -3855,21 +3882,30 @@ def get_report(report_id: int, db: Session = Depends(get_db)):
         return {"success": False, "message": "Reports table not yet available"}
 
 @app.post("/leads")
-def add_lead(lead: LeadCreate, db: Session = Depends(get_db)):
-    new_lead = LeadModel(name=lead.name, phone=lead.phone, email=lead.email, source=lead.source, message=lead.message, campaign=lead.campaign, status="New", created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
+def add_lead(request: Request, lead: LeadCreate, db: Session = Depends(get_db)):
+    _uid = getattr(request.state, "user_id", "")
+    new_lead = LeadModel(name=lead.name, phone=lead.phone, email=lead.email, source=lead.source, message=lead.message, campaign=lead.campaign, status="New", user_id=_uid or None, created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"))
     db.add(new_lead)
     db.commit()
     db.refresh(new_lead)
     return {"success": True, "lead": {"id": new_lead.id, "name": new_lead.name, "phone": new_lead.phone, "email": new_lead.email, "source": new_lead.source, "message": new_lead.message, "status": new_lead.status, "created_at": new_lead.created_at}}
 
 @app.get("/leads")
-def get_leads(db: Session = Depends(get_db)):
-    leads = db.query(LeadModel).order_by(LeadModel.id.desc()).all()
+def get_leads(request: Request, db: Session = Depends(get_db)):
+    _uid = getattr(request.state, "user_id", "")
+    q = db.query(LeadModel).order_by(LeadModel.id.desc())
+    if _uid:
+        q = q.filter(LeadModel.user_id == _uid)
+    leads = q.all()
     return {"leads": [{"id": l.id, "name": l.name, "phone": l.phone, "email": l.email, "source": l.source, "message": l.message, "status": l.status, "created_at": l.created_at} for l in leads], "total": len(leads)}
 
 @app.get("/leads/stats")
-def get_stats(db: Session = Depends(get_db)):
-    leads = db.query(LeadModel).all()
+def get_stats(request: Request, db: Session = Depends(get_db)):
+    _uid = getattr(request.state, "user_id", "")
+    q = db.query(LeadModel)
+    if _uid:
+        q = q.filter(LeadModel.user_id == _uid)
+    leads = q.all()
     return {"total": len(leads), "whatsapp": len([l for l in leads if l.source == "whatsapp"]), "website": len([l for l in leads if l.source == "website"]), "form": len([l for l in leads if l.source == "form"]), "new": len([l for l in leads if l.status == "New"]), "converted": len([l for l in leads if l.status == "Converted"])}
 
 @app.put("/leads/{lead_id}")
@@ -10208,7 +10244,7 @@ async def smart_analysis_history(request: Request, limit: int = 5):
         params = {"lim": limit}
         where = ""
         if _uid:
-            where = "WHERE (user_id = :uid OR user_id IS NULL) "
+            where = "WHERE user_id = :uid "
             params["uid"] = _uid
         with engine.connect() as conn:
             rows = conn.execute(text(
