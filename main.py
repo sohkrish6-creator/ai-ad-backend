@@ -6,6 +6,7 @@ from openai import OpenAI
 import httpx
 from datetime import datetime, date, timedelta
 from typing import Optional
+from contextvars import ContextVar
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 from google.oauth2.credentials import Credentials
@@ -29,6 +30,11 @@ import hashlib
 import base64
 import uuid
 
+try:
+    import jwt as _pyjwt
+except ImportError:
+    _pyjwt = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -49,21 +55,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Per-request user_id — set by auth middleware, consumed by derive_business_key
+# and any function that needs to scope data to the current user.
+_request_user_id: ContextVar[str] = ContextVar("request_user_id", default="")
+
+_PUBLIC_PATHS = {"/"}
+
 @app.middleware("http")
-async def verify_api_key(request: Request, call_next):
-    """Reject requests missing the correct X-API-Key header.
-    Skips: OPTIONS (CORS preflight) and GET / (uptime monitoring).
-    No-ops when ADSOH_API_KEY env var is not set (local dev without config)."""
+async def auth_middleware(request: Request, call_next):
+    """
+    Combined auth gate:
+      1. X-API-Key check (existing, only when ADSOH_API_KEY is set)
+      2. Supabase JWT verification (only when SUPABASE_JWT_SECRET is set)
+         — extracts sub (user_id) and stores in _request_user_id ContextVar
+         so derive_business_key + log_activity automatically scope to the user
+         with zero changes to individual endpoints.
+
+    When neither secret is set (local dev): passes through with user_id = "".
+    """
     if request.method == "OPTIONS":
         return await call_next(request)
-    if request.method == "GET" and request.url.path == "/":
-        return await call_next(request)
-    secret = os.getenv("ADSOH_API_KEY", "")
-    if secret:
+
+    _is_public = request.method == "GET" and request.url.path in _PUBLIC_PATHS
+
+    # 1. X-API-Key (existing gate, unchanged behaviour)
+    _api_secret = os.getenv("ADSOH_API_KEY", "")
+    if _api_secret and not _is_public:
         incoming = request.headers.get("X-API-Key", "")
-        if not incoming or not hmac.compare_digest(incoming.encode(), secret.encode()):
+        if not incoming or not hmac.compare_digest(incoming.encode(), _api_secret.encode()):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    return await call_next(request)
+
+    # 2. JWT → user_id
+    user_id = ""
+    _jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "")
+    if _jwt_secret and not _is_public:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            if not _pyjwt:
+                return JSONResponse({"error": "JWT library not installed on server"}, status_code=500)
+            try:
+                payload = _pyjwt.decode(
+                    token, _jwt_secret, algorithms=["HS256"],
+                    options={"verify_aud": False},
+                )
+                user_id = payload.get("sub", "")
+            except _pyjwt.ExpiredSignatureError:
+                return JSONResponse({"error": "Session expired — please log in again"}, status_code=401)
+            except Exception:
+                return JSONResponse({"error": "Invalid authentication token"}, status_code=401)
+        else:
+            return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+    request.state.user_id = user_id
+    _ctx_token = _request_user_id.set(user_id)
+    try:
+        response = await call_next(request)
+    finally:
+        _request_user_id.reset(_ctx_token)
+    return response
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
@@ -94,6 +144,7 @@ class LeadModel(Base):
     message = Column(Text)
     campaign = Column(String(255))
     status = Column(String(50), default="New")
+    user_id = Column(String(255))
     created_at = Column(String(100))
 
 class AnalysisModel(Base):
@@ -104,6 +155,7 @@ class AnalysisModel(Base):
     budget = Column(Integer)
     goal = Column(String(100))
     result = Column(Text)
+    user_id = Column(String(255))
     created_at = Column(String(100))
 
 class ReportModel(Base):
@@ -113,6 +165,7 @@ class ReportModel(Base):
     title = Column(String(500))
     input_data = Column(Text)
     result_data = Column(Text)
+    user_id = Column(String(255))
     created_at = Column(String(100))
 
 try:
@@ -126,6 +179,17 @@ except Exception as _e:
             logger.info(f"[DB] Created table: {_model.__tablename__}")
         except Exception as _te:
             logger.warning(f"[DB] Could not create table '{_model.__tablename__}': {_te}")
+
+# Add user_id column to ORM tables that predate multi-tenant migration
+try:
+    with engine.begin() as _orm_mc:
+        for _orm_tbl in ("leads", "analyses", "reports"):
+            try:
+                _orm_mc.execute(text(f"ALTER TABLE {_orm_tbl} ADD COLUMN user_id VARCHAR(255)"))
+            except Exception:
+                pass
+except Exception as _orm_me:
+    pass
 
 # ── Memory System Tables ─────────────────────────────────────────────────────
 # Use raw SQL so JSONB works on Postgres and TEXT works on SQLite identically.
@@ -352,6 +416,61 @@ try:
 except Exception as _me:
     logger.warning(f"[MEMORY] Could not create memory tables: {_me}")
 
+
+def _migrate_user_keys():
+    """
+    Backfill existing rows so Krish's historical data is accessible after auth is enabled.
+
+    When KRISH_USER_ID env var is set, prefix every business_key in all memory tables
+    with "{KRISH_USER_ID}::" — this maps old unscoped keys to the new user-scoped format.
+
+    Idempotent: rows already prefixed (containing "::") and matching the uid prefix
+    are skipped.  Runs at startup; safe to run multiple times.
+    """
+    _krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not _krish_uid:
+        return
+    _tables_with_bk = [
+        "business_memory", "market_memory", "competitor_memory", "audience_memory",
+        "campaign_memory", "opportunity_memory", "offer_memory", "website_memory",
+        "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory",
+        "optimizer_memory", "result_memory", "prospect_memory", "autonomous_plan_memory",
+        "social_intel_memory", "creative_director_memory", "ad_creative_memory",
+        "creative_studio_memory",
+        "activity_log", "report_snapshot", "smart_analysis_history",
+    ]
+    _uid_prefix = _krish_uid + "::"
+    logger.info(f"[MIGRATE] Running user key migration for uid={_krish_uid[:8]}...")
+    with engine.begin() as _mc:
+        for _tbl in _tables_with_bk:
+            try:
+                # Check table/column exist before attempting update
+                if _is_sqlite:
+                    _info = _mc.execute(text(f"PRAGMA table_info({_tbl})")).fetchall()
+                    _cols = [r[1] for r in _info]
+                else:
+                    _info = _mc.execute(text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name=:t AND column_name='business_key'"
+                    ), {"t": _tbl}).fetchall()
+                    _cols = [r[0] for r in _info]
+                if "business_key" not in _cols:
+                    continue
+                _mc.execute(text(
+                    f"UPDATE {_tbl} SET business_key = :pfx || business_key "
+                    f"WHERE business_key NOT LIKE :like_pfx"
+                ), {"pfx": _uid_prefix, "like_pfx": _uid_prefix + "%"})
+            except Exception as _me2:
+                logger.warning(f"[MIGRATE] Could not migrate {_tbl}: {_me2}")
+    logger.info("[MIGRATE] User key migration complete")
+
+
+try:
+    _migrate_user_keys()
+except Exception as _muke:
+    logger.warning(f"[MIGRATE] User key migration failed (non-fatal): {_muke}")
+
+
 # ── Memory helpers ───────────────────────────────────────────────────────────
 _MEMORY_TABLES = {
     "business":    "business_memory",
@@ -382,25 +501,9 @@ def _json_val(v):
         return json.dumps(v, ensure_ascii=False)
     return v
 
-def derive_business_key(url: str, industry: str = "", city: str = "") -> str:
-    """
-    Single shared key-derivation function used by ALL endpoints (save + lookup).
-
-    Non-B2B (url only, no industry):       "sohscape.com"
-    B2B (url + target industry + city):    "sohscape.com::hospitality::mumbai"
-    Industry-only mode (no url):           "hospitality::mumbai"
-
-    City always defaults to "india" (national scope) when blank — NEVER a
-    specific city — so keys are ALWAYS complete and consistent regardless of
-    whether the frontend sent city="" or a real city, without silently
-    assuming the business is in any one place.
-    """
-    # City default: ALWAYS "india" (national scope) when blank — never a
-    # specific city. This used to default to "jaipur", which silently
-    # assumed every business with no city was in Jaipur — that assumption
-    # is exactly what this tool must never make.
+def _derive_base_key(url: str, industry: str = "", city: str = "") -> str:
+    """Raw key without user scoping — used internally by derive_business_key."""
     _tc = (city or "").strip().lower() or "india"
-
     if url and url.strip():
         k = url.strip().rstrip("/").lower()
         k = re.sub(r'^https?://', '', k)
@@ -411,6 +514,29 @@ def derive_business_key(url: str, industry: str = "", city: str = "") -> str:
         return k
     _ind = (industry or "").strip().lower()
     return f"{_ind}::{_tc}"
+
+def derive_business_key(url: str, industry: str = "", city: str = "") -> str:
+    """
+    Single shared key-derivation function used by ALL endpoints (save + lookup).
+
+    Non-B2B (url only, no industry):       "sohscape.com"
+    B2B (url + target industry + city):    "sohscape.com::hospitality::mumbai"
+    Industry-only mode (no url):           "hospitality::mumbai"
+
+    City always defaults to "india" (national scope) when blank.
+
+    When SUPABASE_JWT_SECRET is active, a user_id prefix is prepended so each
+    tenant's data is stored under a distinct key namespace:
+        "{user_id}::sohscape.com::hospitality::india"
+
+    This happens transparently via the _request_user_id ContextVar set by the
+    auth middleware — no endpoint changes are required.
+    """
+    base = _derive_base_key(url, industry, city)
+    uid = _request_user_id.get()
+    if uid:
+        return f"{uid}::{base}"
+    return base
 
 # Keep old name as alias so any leftover calls don't break
 _normalize_biz_key = derive_business_key
@@ -546,6 +672,7 @@ CREATE TABLE IF NOT EXISTS activity_log (
     city          TEXT,
     summary       TEXT,
     reference_id  TEXT,
+    user_id       TEXT,
     created_at    TEXT
 );
 """
@@ -556,6 +683,11 @@ try:
         if _is_sqlite:
             _al_ddl = _al_ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
         _al_conn.execute(text(_al_ddl))
+        # Add user_id column to existing tables that predate this migration
+        try:
+            _al_conn.execute(text("ALTER TABLE activity_log ADD COLUMN user_id TEXT"))
+        except Exception:
+            pass
         _al_conn.commit()
     logger.info("[ACTIVITY] activity_log table created/verified")
 except Exception as _ale:
@@ -572,15 +704,16 @@ def log_activity(activity_type: str, business_key: str = "", business_name: str 
     is the Google/Meta campaign_id for campaign pushes, blank otherwise.
     """
     try:
+        _uid = _request_user_id.get()
         with engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO activity_log "
-                "(activity_type, business_key, business_name, url, industry, city, summary, reference_id, created_at) "
-                "VALUES (:at, :bk, :bn, :url, :ind, :cit, :sm, :rid, :ca)"
+                "(activity_type, business_key, business_name, url, industry, city, summary, reference_id, user_id, created_at) "
+                "VALUES (:at, :bk, :bn, :url, :ind, :cit, :sm, :rid, :uid, :ca)"
             ), {
                 "at": activity_type, "bk": business_key or "", "bn": business_name or "",
                 "url": url or "", "ind": industry or "", "cit": city or "",
-                "sm": summary or "", "rid": reference_id or "",
+                "sm": summary or "", "rid": reference_id or "", "uid": _uid,
                 "ca": datetime.utcnow().isoformat(),
             })
         logger.info(f"[ACTIVITY] logged type={activity_type!r} business={business_name or business_key!r} ref={reference_id!r}")
@@ -589,12 +722,16 @@ def log_activity(activity_type: str, business_key: str = "", business_name: str 
 
 
 @app.get("/activity/list")
-async def activity_list(limit: int = 50, type: str = "", business_key: str = ""):
+async def activity_list(request: Request, limit: int = 50, type: str = "", business_key: str = ""):
     """Recent activity across the whole tool, newest first — the History page's Activity tab."""
     try:
         limit = max(1, min(limit, 200))
         clauses = []
         params = {"lim": limit}
+        _uid = getattr(request.state, "user_id", "")
+        if _uid:
+            clauses.append("(user_id = :uid OR user_id IS NULL)")
+            params["uid"] = _uid
         if type.strip():
             clauses.append("activity_type = :at")
             params["at"] = type.strip()
@@ -618,17 +755,23 @@ async def activity_list(limit: int = 50, type: str = "", business_key: str = "")
 
 
 @app.get("/activity/business/{business_key}")
-async def activity_for_business(business_key: str):
+async def activity_for_business(request: Request, business_key: str):
     """Full activity history for one business — every report + campaign push ever logged against this key."""
     try:
+        _uid = getattr(request.state, "user_id", "")
+        params = {"bk": business_key}
+        extra = ""
+        if _uid:
+            extra = " AND (user_id = :uid OR user_id IS NULL)"
+            params["uid"] = _uid
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
                     "SELECT id, activity_type, business_key, business_name, url, industry, city, "
                     "summary, reference_id, created_at FROM activity_log "
-                    "WHERE business_key = :bk ORDER BY id DESC"
+                    f"WHERE business_key = :bk{extra} ORDER BY id DESC"
                 ),
-                {"bk": business_key},
+                params,
             ).mappings().all()
         return {"success": True, "business_key": business_key, "activity": [dict(r) for r in rows]}
     except Exception as _e:
@@ -648,6 +791,7 @@ CREATE TABLE IF NOT EXISTS report_snapshot (
     module        TEXT NOT NULL,
     business_key  TEXT NOT NULL,
     response_json TEXT,
+    user_id       TEXT,
     created_at    TEXT
 );
 """
@@ -662,6 +806,10 @@ try:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_report_snapshot_module_key "
             "ON report_snapshot (module, business_key)"
         ))
+        try:
+            _rs_conn.execute(text("ALTER TABLE report_snapshot ADD COLUMN user_id TEXT"))
+        except Exception:
+            pass
         _rs_conn.commit()
     logger.info("[SNAPSHOT] report_snapshot table created/verified")
 except Exception as _rse:
@@ -675,12 +823,13 @@ def save_report_snapshot(module: str, business_key: str, response: dict) -> None
     try:
         now = datetime.utcnow().isoformat()
         payload = json.dumps(response, ensure_ascii=False, default=str)
+        _uid = _request_user_id.get()
         with engine.begin() as conn:
             conn.execute(text(
-                "INSERT INTO report_snapshot (module, business_key, response_json, created_at) "
-                "VALUES (:m, :bk, :rj, :ca) "
-                "ON CONFLICT(module, business_key) DO UPDATE SET response_json=:rj, created_at=:ca"
-            ), {"m": module, "bk": business_key, "rj": payload, "ca": now})
+                "INSERT INTO report_snapshot (module, business_key, response_json, user_id, created_at) "
+                "VALUES (:m, :bk, :rj, :uid, :ca) "
+                "ON CONFLICT(module, business_key) DO UPDATE SET response_json=:rj, user_id=:uid, created_at=:ca"
+            ), {"m": module, "bk": business_key, "rj": payload, "uid": _uid, "ca": now})
     except Exception as _e:
         logger.warning(f"[SNAPSHOT] save_report_snapshot failed for module={module!r} key={business_key!r}: {_e}")
 
@@ -727,6 +876,15 @@ class LeadCreate(BaseModel):
 @app.get("/")
 def home():
     return {"message": "Adsoh Backend chal raha hai!"}
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    """Return the current user_id extracted from the JWT. Useful for frontend to confirm session."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return JSONResponse({"authenticated": False, "user_id": None}, status_code=401)
+    return {"authenticated": True, "user_id": uid}
 
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
@@ -9912,6 +10070,7 @@ CREATE TABLE IF NOT EXISTS smart_analysis_history (
     business_model TEXT,
     modules_run    TEXT,
     full_result    TEXT,
+    user_id        TEXT,
     created_at     TEXT
 );
 """
@@ -9922,6 +10081,10 @@ try:
         if _is_sqlite:
             _sah_ddl = _sah_ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
         _sah_conn.execute(text(_sah_ddl))
+        try:
+            _sah_conn.execute(text("ALTER TABLE smart_analysis_history ADD COLUMN user_id TEXT"))
+        except Exception:
+            pass
         _sah_conn.commit()
     logger.info("[SMART-ANALYSIS] History table created/verified")
 except Exception as _sahe:
@@ -9930,14 +10093,15 @@ except Exception as _sahe:
 
 def _save_smart_analysis_history(business_key: str, url: str, business_model: str, modules_run: list, full_result: dict) -> None:
     try:
+        _uid = _request_user_id.get()
         with engine.begin() as conn:
             conn.execute(text(
-                "INSERT INTO smart_analysis_history (business_key, url, business_model, modules_run, full_result, created_at) "
-                "VALUES (:bk, :url, :bm, :mr, :fr, :ca)"
+                "INSERT INTO smart_analysis_history (business_key, url, business_model, modules_run, full_result, user_id, created_at) "
+                "VALUES (:bk, :url, :bm, :mr, :fr, :uid, :ca)"
             ), {
                 "bk": business_key, "url": url, "bm": business_model,
                 "mr": json.dumps(modules_run), "fr": json.dumps(full_result),
-                "ca": datetime.utcnow().isoformat(),
+                "uid": _uid, "ca": datetime.utcnow().isoformat(),
             })
     except Exception as _e:
         logger.warning(f"[SMART-ANALYSIS] Could not save history: {_e}")
@@ -10038,13 +10202,19 @@ async def smart_analysis_execute(request: SmartAnalysisExecuteRequest):
 
 
 @app.get("/smart-analysis/history")
-async def smart_analysis_history(limit: int = 5):
+async def smart_analysis_history(request: Request, limit: int = 5):
     try:
+        _uid = getattr(request.state, "user_id", "")
+        params = {"lim": limit}
+        where = ""
+        if _uid:
+            where = "WHERE (user_id = :uid OR user_id IS NULL) "
+            params["uid"] = _uid
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT id, business_key, url, business_model, modules_run, created_at "
-                "FROM smart_analysis_history ORDER BY id DESC LIMIT :lim"
-            ), {"lim": limit}).mappings().all()
+                f"FROM smart_analysis_history {where}ORDER BY id DESC LIMIT :lim"
+            ), params).mappings().all()
         history = []
         for r in rows:
             d = dict(r)
