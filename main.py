@@ -85,6 +85,13 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# ── Per-platform "not connected" exceptions ──────────────────────────────────
+class GadsNotConnectedError(RuntimeError):
+    """Raised when the current user has no connected Google Ads account."""
+
+class MetaNotConnectedError(RuntimeError):
+    """Raised when the current user has no connected Meta Ads account."""
+
 app = FastAPI()
 
 # Per-request user_id — set by auth middleware, consumed by derive_business_key
@@ -4029,6 +4036,14 @@ def _genv(key: str) -> str:
     return val.strip().strip('"').strip("'")
 
 def get_google_ads_client():
+    # For non-Krish users route to per-user OAuth credentials automatically
+    # (ContextVar is propagated into asyncio.to_thread threads).
+    _uid = _request_user_id.get()
+    _krish = os.getenv("KRISH_USER_ID", "")
+    if _uid and _uid != _krish:
+        return get_google_ads_client_for_user(_uid)
+
+    # Krish / unauthenticated: MCC env-var client (existing behaviour unchanged)
     # login_customer_id MUST be the MCC/manager account (3879422819).
     # Strip dashes in case the env var was entered as 387-942-2819.
     _login_raw = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID").replace("-", "").replace(" ", "")
@@ -4232,20 +4247,11 @@ async def google_ads_list_accounts():
 
 @app.get("/google-ads/performance")
 async def google_ads_performance(days: int = 30, customer_id: Optional[str] = None):
-    customer_id = customer_id or _genv("GOOGLE_ADS_CUSTOMER_ID")
-    login_customer_id = _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
-    masked_cid   = customer_id[:-4]       + "XXXX" if customer_id       and len(customer_id)       > 4 else customer_id
-    masked_login = login_customer_id[:-4] + "XXXX" if login_customer_id and len(login_customer_id) > 4 else login_customer_id
-    logger.info(f"[GOOGLE ADS] Using customer_id={masked_cid} login_customer_id={masked_login}")
+    customer_id = customer_id or _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "error": "No Google Ads account selected. Connect at /account."}
     try:
-        client = GoogleAdsClient.load_from_dict({
-            "developer_token": _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-            "client_id": _genv("GOOGLE_ADS_CLIENT_ID"),
-            "client_secret": _genv("GOOGLE_ADS_CLIENT_SECRET"),
-            "refresh_token": _genv("GOOGLE_ADS_REFRESH_TOKEN"),
-            "login_customer_id": _genv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
-            "use_proto_plus": True,
-        })
+        client  = get_google_ads_client()
         service = client.get_service("GoogleAdsService")
 
         end   = date.today()
@@ -4293,6 +4299,8 @@ async def google_ads_performance(days: int = 30, customer_id: Optional[str] = No
             "avg_cpc_inr": round(avg_cpc, 2),
         }
 
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
     except GoogleAdsException as ex:
         errors = [e.message for e in ex.failure.errors]
         logger.error(f"[GOOGLE ADS] API error: {errors}")
@@ -4304,7 +4312,9 @@ async def google_ads_performance(days: int = 30, customer_id: Optional[str] = No
 @app.get("/google-ads/campaigns")
 async def google_ads_campaigns(days: int = 90):
     """Per-campaign breakdown sorted by cost descending."""
-    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    customer_id = _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "connect_required": True, "error": "No Google Ads account selected."}
     end   = date.today()
     start = end - timedelta(days=days)
     try:
@@ -4345,6 +4355,8 @@ async def google_ads_campaigns(days: int = 90):
             })
         logger.info(f"[GOOGLE ADS] campaigns: {len(campaigns)} rows for last {days} days")
         return {"success": True, "period_days": days, "start_date": str(start), "end_date": str(end), "campaigns": campaigns}
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
     except GoogleAdsException as ex:
         errors = [e.message for e in ex.failure.errors]
         logger.error(f"[GOOGLE ADS] campaigns error: {errors}")
@@ -4448,7 +4460,9 @@ async def google_ads_ad_policy_status(campaign_id: str = ""):
 @app.get("/google-ads/daily")
 async def google_ads_daily(days: int = 90):
     """Daily time-series: date, impressions, clicks, cost_inr."""
-    customer_id = _genv("GOOGLE_ADS_CUSTOMER_ID")
+    customer_id = _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "connect_required": True, "error": "No Google Ads account selected."}
     end   = date.today()
     start = end - timedelta(days=days)
     try:
@@ -4475,6 +4489,8 @@ async def google_ads_daily(days: int = 90):
             })
         logger.info(f"[GOOGLE ADS] daily: {len(daily)} data points for last {days} days")
         return {"success": True, "period_days": days, "start_date": str(start), "end_date": str(end), "daily": daily}
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
     except GoogleAdsException as ex:
         errors = [e.message for e in ex.failure.errors]
         logger.error(f"[GOOGLE ADS] daily error: {errors}")
@@ -8285,7 +8301,52 @@ class AddKeywordsRequest(BaseModel):
     keywords:       list = []              # [{"text": "...", "match_type": "EXACT/PHRASE/BROAD"}]
 
 
-def _gads_customer_id():
+def get_google_ads_client_for_user(uid: str) -> "GoogleAdsClient":
+    """Build a Google Ads client using the OAuth refresh_token stored for uid.
+
+    Falls back to the global MCC env-var client for Krish's own user_id so
+    his existing MCC-linked workflow remains unchanged.
+    """
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not uid or uid == krish_uid:
+        return get_google_ads_client()
+    with engine.connect() as _conn:
+        _row = _conn.execute(text(
+            "SELECT encrypted_refresh_token, login_customer_id_oauth, revoked "
+            "FROM gads_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not _row or _row[2]:
+        raise GadsNotConnectedError(
+            "Google Ads account not connected. Go to Account → Connected Accounts to connect."
+        )
+    refresh_token = decrypt_token(_row[0])
+    lci = (_row[1] or "").replace("-", "").replace(" ", "")
+    config = {
+        "developer_token": _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "client_id":       _genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
+        "client_secret":   _genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
+        "refresh_token":   refresh_token,
+        "use_proto_plus":  True,
+    }
+    if lci:
+        config["login_customer_id"] = lci
+    return GoogleAdsClient.load_from_dict(config)
+
+
+def _gads_customer_id() -> str:
+    """Return the effective Google Ads customer_id for the current request.
+
+    Non-Krish users: reads their selected customer_id from gads_oauth_tokens.
+    Krish / unauthenticated: reads GOOGLE_ADS_CUSTOMER_ID env var.
+    """
+    uid = _request_user_id.get()
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if uid and uid != krish_uid:
+        with engine.connect() as _conn:
+            _row = _conn.execute(text(
+                "SELECT customer_id FROM gads_oauth_tokens WHERE user_id=:uid AND revoked=FALSE"
+            ), {"uid": uid}).fetchone()
+        return (_row[0] or "") if _row else ""
     return _genv("GOOGLE_ADS_CUSTOMER_ID")
 
 
@@ -9104,6 +9165,8 @@ async def gads_create_campaign(request: CreateCampaignRequest):
 
         return {"success": True, "launch_readiness": _preflight, **result}
 
+    except GadsNotConnectedError as _e:
+        return {"success": False, "connect_required": True, "error": str(_e), "connect_url": "/account"}
     except GoogleAdsException as ex:
         error_details = []
         for error in ex.failure.errors:
@@ -14336,32 +14399,42 @@ def decrypt_token(enc: str) -> str:
 
 
 # ── OAuth state (CSRF) — stateless, HMAC-signed via ENCRYPTION_KEY ───────────
-def _make_oauth_state() -> str:
-    ts = str(int(datetime.utcnow().timestamp()))
-    key = _genv("ENCRYPTION_KEY").encode()
-    sig = hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()[:16]
-    return base64.urlsafe_b64encode(f"{ts}.{sig}".encode()).decode()
+def _make_oauth_state(user_id: str = "") -> str:
+    ts      = str(int(datetime.utcnow().timestamp()))
+    payload = f"{ts}:{user_id}"
+    key     = _genv("ENCRYPTION_KEY").encode()
+    sig     = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:16]
+    return base64.urlsafe_b64encode(f"{payload}.{sig}".encode()).decode()
 
 
-def _verify_oauth_state(state: str, max_age_seconds: int = 600) -> bool:
+def _verify_oauth_state(state: str, max_age_seconds: int = 600) -> tuple:
+    """Returns (valid: bool, user_id: str). user_id is '' for legacy states."""
     try:
-        raw = base64.urlsafe_b64decode(state.encode()).decode()
-        ts, sig = raw.split(".", 1)
-        key = _genv("ENCRYPTION_KEY").encode()
-        expected = hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()[:16]
+        raw      = base64.urlsafe_b64decode(state.encode()).decode()
+        last_dot = raw.rfind(".")
+        payload  = raw[:last_dot]
+        sig      = raw[last_dot + 1:]
+        key      = _genv("ENCRYPTION_KEY").encode()
+        expected = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:16]
         if not hmac.compare_digest(sig, expected):
-            return False
-        age = datetime.utcnow().timestamp() - int(ts)
-        return 0 <= age <= max_age_seconds
+            return False, ""
+        parts = payload.split(":", 1)
+        ts    = parts[0]
+        uid   = parts[1] if len(parts) > 1 else ""
+        age   = datetime.utcnow().timestamp() - int(ts)
+        return (0 <= age <= max_age_seconds), uid
     except Exception:
-        return False
+        return False, ""
 
 
 # ── DB tables ─────────────────────────────────────────────────────────────────
 _GADS_DDL = """
 CREATE TABLE IF NOT EXISTS gads_oauth_tokens (
-    id                       INTEGER PRIMARY KEY,
+    id                       BIGSERIAL PRIMARY KEY,
+    user_id                  TEXT UNIQUE,
     encrypted_refresh_token  TEXT NOT NULL,
+    customer_id              TEXT,
+    login_customer_id_oauth  TEXT,
     scope                    TEXT,
     connected_at             TEXT,
     updated_at               TEXT,
@@ -14537,6 +14610,31 @@ try:
     _create_gads_tables()
 except Exception as _ge:
     logger.warning(f"[GADS] Table create failed: {_ge}")
+
+# Add per-user columns to gads_oauth_tokens if this is an existing deployment.
+# Each ALTER is its own transaction so one "column already exists" error
+# doesn't abort the others.
+for _gcol, _gtype in [
+    ("user_id", "TEXT"),
+    ("customer_id", "TEXT"),
+    ("login_customer_id_oauth", "TEXT"),
+]:
+    try:
+        with engine.begin() as _gc:
+            _gc.execute(text(f"ALTER TABLE gads_oauth_tokens ADD COLUMN {_gcol} {_gtype}"))
+    except Exception:
+        pass  # column already exists
+
+# Stamp Krish's user_id on the existing id=1 row (pre-auth legacy token).
+_krish_for_gads = os.getenv("KRISH_USER_ID", "")
+if _krish_for_gads:
+    try:
+        with engine.begin() as _gc:
+            _gc.execute(text(
+                "UPDATE gads_oauth_tokens SET user_id=:uid WHERE id=1 AND (user_id IS NULL OR user_id='')"
+            ), {"uid": _krish_for_gads})
+    except Exception:
+        pass
 
 
 # ── OAuth client config / flow ───────────────────────────────────────────────
@@ -15228,14 +15326,15 @@ class GadsImportRequest(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/google/connect")
-async def google_connect():
+async def google_connect(request: Request):
+    uid = getattr(request.state, "user_id", "")
     try:
-        flow = _GoogleOAuthFlow.from_client_config(
+        flow  = _GoogleOAuthFlow.from_client_config(
             _gads_oauth_client_config(),
             scopes=_GADS_OAUTH_SCOPES,
             redirect_uri=_gads_oauth_redirect_uri(),
         )
-        state = _make_oauth_state()
+        state    = _make_oauth_state(uid)
         auth_url, _ = flow.authorization_url(
             access_type="offline",
             prompt="consent",
@@ -15252,9 +15351,10 @@ async def google_connect():
 async def google_callback(code: str = "", state: str = "", error: str = ""):
     frontend = _genv("FRONTEND_URL") or "http://localhost:5173"
     if error:
-        return RedirectResponse(f"{frontend}/google-ads?connected=false&error={error}")
-    if not _verify_oauth_state(state):
-        return RedirectResponse(f"{frontend}/google-ads?connected=false&error=invalid_state")
+        return RedirectResponse(f"{frontend}/account?gads_connected=false&error={error}")
+    valid, uid = _verify_oauth_state(state)
+    if not valid:
+        return RedirectResponse(f"{frontend}/account?gads_connected=false&error=invalid_state")
     try:
         flow = _GoogleOAuthFlow.from_client_config(
             _gads_oauth_client_config(),
@@ -15268,21 +15368,82 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         creds = await asyncio.to_thread(_fetch)
 
         if not creds.refresh_token:
-            return RedirectResponse(f"{frontend}/google-ads?connected=false&error=no_refresh_token")
+            return RedirectResponse(f"{frontend}/account?gads_connected=false&error=no_refresh_token")
 
         enc = encrypt_token(creds.refresh_token)
         now = datetime.utcnow().isoformat()
+
+        # Try to discover the user's first accessible ad account automatically.
+        customer_id_auto = ""
+        try:
+            def _discover():
+                tmp_config = {
+                    "developer_token": _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
+                    "client_id":       _genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
+                    "client_secret":   _genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
+                    "refresh_token":   creds.refresh_token,
+                    "use_proto_plus":  True,
+                }
+                c = GoogleAdsClient.load_from_dict(tmp_config)
+                names = c.get_service("CustomerService").list_accessible_customers().resource_names
+                # Prefer non-manager accounts; fall back to any account.
+                return names[0].split("/")[-1] if names else ""
+            customer_id_auto = await asyncio.to_thread(_discover)
+        except Exception as _de:
+            logger.warning(f"[GADS-OAUTH] auto-discover customer_id failed: {_de}")
+
         with engine.begin() as conn:
-            conn.execute(text(
-                "INSERT INTO gads_oauth_tokens (id, encrypted_refresh_token, scope, connected_at, updated_at, revoked) "
-                "VALUES (1, :enc, :scope, :ts, :ts, FALSE) "
-                "ON CONFLICT(id) DO UPDATE SET encrypted_refresh_token=:enc, scope=:scope, updated_at=:ts, revoked=FALSE"
-            ), {"enc": enc, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
-        logger.info("[GADS-OAUTH] Connected — encrypted refresh token stored")
-        return RedirectResponse(f"{frontend}/google-ads?connected=true")
+            if uid:
+                conn.execute(text(
+                    "INSERT INTO gads_oauth_tokens (user_id, encrypted_refresh_token, customer_id, scope, connected_at, updated_at, revoked) "
+                    "VALUES (:uid, :enc, :cid, :scope, :ts, :ts, FALSE) "
+                    "ON CONFLICT(user_id) DO UPDATE SET encrypted_refresh_token=:enc, customer_id=COALESCE(:cid, gads_oauth_tokens.customer_id), scope=:scope, updated_at=:ts, revoked=FALSE"
+                ), {"uid": uid, "enc": enc, "cid": customer_id_auto or None, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
+            else:
+                # Legacy path: no user_id — store at id=1 for backward compat
+                conn.execute(text(
+                    "INSERT INTO gads_oauth_tokens (id, encrypted_refresh_token, scope, connected_at, updated_at, revoked) "
+                    "VALUES (1, :enc, :scope, :ts, :ts, FALSE) "
+                    "ON CONFLICT(id) DO UPDATE SET encrypted_refresh_token=:enc, scope=:scope, updated_at=:ts, revoked=FALSE"
+                ), {"enc": enc, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
+        logger.info(f"[GADS-OAUTH] Connected uid={uid or 'anon'} customer_id={customer_id_auto or 'none'}")
+        return RedirectResponse(f"{frontend}/account?gads_connected=true")
     except Exception as _e:
         logger.error(f"[GADS-OAUTH] /google/callback error: {_e}")
-        return RedirectResponse(f"{frontend}/google-ads?connected=false&error=exchange_failed")
+        return RedirectResponse(f"{frontend}/account?gads_connected=false&error=exchange_failed")
+
+
+@app.get("/google/status")
+async def google_status(request: Request):
+    """Connection status for the current user's Google Ads OAuth token."""
+    uid       = getattr(request.state, "user_id", "")
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not uid or uid == krish_uid:
+        return {
+            "connected": bool(_genv("GOOGLE_ADS_REFRESH_TOKEN")),
+            "method":    "global",
+            "customer_id": _genv("GOOGLE_ADS_CUSTOMER_ID") or None,
+        }
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT customer_id, connected_at, revoked FROM gads_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[2]:
+        return {"connected": False}
+    return {"connected": True, "customer_id": row[0], "connected_at": row[1]}
+
+
+@app.delete("/google/disconnect")
+async def google_disconnect(request: Request):
+    """Revoke the current user's Google Ads OAuth token."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE gads_oauth_tokens SET revoked=TRUE WHERE user_id=:uid"
+        ), {"uid": uid})
+    return {"success": True}
 
 
 @app.get("/google/accounts")
