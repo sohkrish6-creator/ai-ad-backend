@@ -32,8 +32,53 @@ import uuid
 
 try:
     import jwt as _pyjwt
+    from jwt.algorithms import ECAlgorithm as _ECAlgorithm
 except ImportError:
     _pyjwt = None
+    _ECAlgorithm = None
+
+import urllib.request as _urllib_request
+
+# ES256 public key cache: kid → EC public key object.
+# Populated on first request that needs ES256 verification; avoids repeated JWKS fetches.
+_jwks_key_cache: dict = {}
+
+def _get_es256_public_key(token: str):
+    """Return the EC public key for verifying this ES256 token.
+
+    Derives the JWKS URL from the token's own 'iss' claim so no extra env var is needed.
+    Caches all keys from the JWKS response by kid; re-fetches only on cache miss.
+    Blocking (urllib) — callers in async context must use asyncio.to_thread.
+    """
+    header = _pyjwt.get_unverified_header(token)
+    kid = header.get("kid", "__default__")
+
+    if kid in _jwks_key_cache:
+        return _jwks_key_cache[kid]
+
+    # Derive JWKS URL from iss claim (no verification needed for this step)
+    unverified_payload = _pyjwt.decode(token, options={"verify_signature": False})
+    iss = (unverified_payload.get("iss") or "").rstrip("/")
+    if not iss:
+        raise ValueError("JWT missing 'iss' claim — cannot locate JWKS")
+
+    jwks_url = f"{iss}/.well-known/jwks.json"
+    logger.info(f"[AUTH] Fetching JWKS from {jwks_url}")
+    with _urllib_request.urlopen(jwks_url, timeout=8) as _resp:
+        jwks = json.loads(_resp.read())
+
+    for jwk in jwks.get("keys", []):
+        if jwk.get("alg") == "ES256" and jwk.get("kty") == "EC":
+            _k = jwk.get("kid", "__default__")
+            _jwks_key_cache[_k] = _ECAlgorithm.from_jwk(json.dumps(jwk))
+            logger.info(f"[AUTH] Cached ES256 public key kid={_k}")
+
+    if kid in _jwks_key_cache:
+        return _jwks_key_cache[kid]
+    if _jwks_key_cache:
+        # kid mismatch but we have a key — use the only one available
+        return next(iter(_jwks_key_cache.values()))
+    raise ValueError("No ES256 key found in JWKS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -79,10 +124,22 @@ async def auth_middleware(request: Request, call_next):
             if not _pyjwt:
                 return JSONResponse({"error": "JWT library not installed on server"}, status_code=500)
             try:
-                payload = _pyjwt.decode(
-                    token, _jwt_secret, algorithms=["HS256"],
-                    options={"verify_aud": False},
-                )
+                _hdr = _pyjwt.get_unverified_header(token)
+                _alg = _hdr.get("alg", "HS256")
+                if _alg == "ES256":
+                    # Modern Supabase projects use P-256 / ES256.
+                    # Verify with the project's public key fetched from JWKS.
+                    _pub = await asyncio.to_thread(_get_es256_public_key, token)
+                    payload = _pyjwt.decode(
+                        token, _pub, algorithms=["ES256"],
+                        options={"verify_aud": False},
+                    )
+                else:
+                    # Legacy HS256 — verify with the shared secret.
+                    payload = _pyjwt.decode(
+                        token, _jwt_secret, algorithms=["HS256"],
+                        options={"verify_aud": False},
+                    )
                 user_id = payload.get("sub", "")
             except _pyjwt.ExpiredSignatureError:
                 return JSONResponse({"error": "Session expired — please log in again"}, status_code=401)
