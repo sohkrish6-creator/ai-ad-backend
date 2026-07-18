@@ -9276,6 +9276,82 @@ async def gads_add_keywords(request: AddKeywordsRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  META ADS — PER-USER OAUTH  +  LEGACY GLOBAL TOKEN (Krish)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_META_OAUTH_SCOPES = "ads_management,ads_read,business_management,pages_show_list"
+_META_GRAPH = "https://graph.facebook.com/v21.0"
+
+
+def _meta_oauth_redirect_uri() -> str:
+    return _genv("META_OAUTH_REDIRECT_URI") or "http://localhost:8000/meta/callback"
+
+
+_META_OAUTH_DDL = """
+CREATE TABLE IF NOT EXISTS meta_oauth_tokens (
+    id                    BIGSERIAL PRIMARY KEY,
+    user_id               TEXT UNIQUE NOT NULL,
+    encrypted_access_token TEXT NOT NULL,
+    ad_account_id         TEXT,
+    page_id               TEXT,
+    connected_at          TEXT,
+    updated_at            TEXT,
+    revoked               BOOLEAN DEFAULT FALSE
+);
+"""
+
+
+def _create_meta_oauth_table():
+    ddl = _META_OAUTH_DDL
+    if _is_sqlite:
+        ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.connect() as conn:
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+        conn.commit()
+
+
+try:
+    _create_meta_oauth_table()
+    logger.info("[META-OAUTH] meta_oauth_tokens table ready")
+except Exception as _moe:
+    logger.warning(f"[META-OAUTH] Table create failed: {_moe}")
+
+
+def get_meta_ads_client_for_user(uid: str) -> tuple:
+    """Returns (api, ad_account_id) using the user's stored OAuth token.
+
+    Falls back to the global env-var token for Krish's user_id.
+    Raises MetaNotConnectedError if the user hasn't connected Meta Ads.
+    """
+    from facebook_business.api import FacebookAdsApi as _FBApi
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not uid or uid == krish_uid:
+        return get_meta_ads_client()
+    with engine.connect() as _conn:
+        row = _conn.execute(text(
+            "SELECT encrypted_access_token, ad_account_id, revoked "
+            "FROM meta_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[2]:
+        raise MetaNotConnectedError(
+            "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+        )
+    access_token   = decrypt_token(row[0])
+    ad_account_id  = row[1] or ""
+    if not ad_account_id:
+        raise MetaNotConnectedError(
+            "Meta Ads connected but no ad account selected. Visit Account → Connected Accounts."
+        )
+    if not ad_account_id.startswith("act_"):
+        ad_account_id = f"act_{ad_account_id}"
+    app_id     = _genv("META_APP_ID")
+    app_secret = _genv("META_APP_SECRET")
+    api = _FBApi.init(app_id, app_secret, access_token)
+    return api, ad_account_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  META ADS (Facebook/Instagram) — READ-ONLY INTEGRATION
 #  Same safe pattern as Google Ads: test-connection first, read-only endpoints
 #  only. No campaign creation yet. Isolated from Google Ads / Cricket code.
@@ -9283,10 +9359,17 @@ async def gads_add_keywords(request: AddKeywordsRequest):
 
 def get_meta_ads_client():
     """
-    Initialize the Meta Marketing API client from env vars.
-    Returns (api, ad_account_id) — ad_account_id normalized to the "act_<id>"
-    format the SDK expects. Raises RuntimeError if required env vars are missing.
+    Initialize the Meta Marketing API client.
+    For non-Krish users: uses their stored OAuth token (raises MetaNotConnectedError if none).
+    For Krish / unauthenticated: uses global env vars (existing System User flow).
+    Returns (api, ad_account_id).
     """
+    _uid = _request_user_id.get()
+    _krish = os.getenv("KRISH_USER_ID", "")
+    if _uid and _uid != _krish:
+        return get_meta_ads_client_for_user(_uid)
+
+    # Global env-var path (Krish's System User token)
     from facebook_business.api import FacebookAdsApi
 
     app_id       = _genv("META_APP_ID")
@@ -9420,6 +9503,8 @@ async def meta_ads_campaigns():
 
     try:
         _, account_id = get_meta_ads_client()
+    except MetaNotConnectedError as _e:
+        return {"success": False, "connect_required": True, "error": str(_e), "connect_url": "/account"}
     except RuntimeError as _e:
         return {"success": False, "error": str(_e)}
 
@@ -9538,6 +9623,8 @@ async def meta_ads_performance(date_range: str = "last_30d"):
 
     try:
         _, account_id = get_meta_ads_client()
+    except MetaNotConnectedError as _e:
+        return {"success": False, "connect_required": True, "error": str(_e), "connect_url": "/account"}
     except RuntimeError as _e:
         return {"success": False, "error": str(_e)}
 
@@ -9949,6 +10036,8 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
             "launch_readiness":        _meta_preflight,
         }
 
+    except MetaNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex), "connect_url": "/account"}
     except FacebookRequestError as ex:
         details = _log_meta_error("create-campaign", ex)
         return {"success": False, "partial": created, **details}
@@ -15444,6 +15533,254 @@ async def google_disconnect(request: Request):
             "UPDATE gads_oauth_tokens SET revoked=TRUE WHERE user_id=:uid"
         ), {"uid": uid})
     return {"success": True}
+
+
+# ── Google Ads: select a customer_id for the current user ────────────────────
+@app.post("/google/select-account")
+async def google_select_account(request: Request):
+    body = await request.json()
+    uid  = getattr(request.state, "user_id", "")
+    cid  = str(body.get("customer_id", "")).replace("-", "").strip()
+    if not uid or not cid:
+        return {"success": False, "error": "user_id and customer_id required"}
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE gads_oauth_tokens SET customer_id=:cid WHERE user_id=:uid"
+        ), {"cid": cid, "uid": uid})
+    return {"success": True, "customer_id": cid}
+
+
+# ── Google Ads: list accessible accounts for current user ────────────────────
+@app.get("/google/accessible-accounts")
+async def google_accessible_accounts(request: Request):
+    """List all Google Ads accounts accessible via the current user's OAuth token."""
+    uid = getattr(request.state, "user_id", "")
+    try:
+        def _list():
+            client = get_google_ads_client_for_user(uid) if uid else get_google_ads_client()
+            svc    = client.get_service("CustomerService")
+            names  = svc.list_accessible_customers().resource_names
+            return [{"customer_id": n.split("/")[-1]} for n in names]
+        accounts = await asyncio.to_thread(_list)
+        return {"success": True, "accounts": accounts}
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
+    except Exception as ex:
+        return {"success": False, "error": str(ex)}
+
+
+# ── Meta Ads OAuth ────────────────────────────────────────────────────────────
+@app.get("/meta/connect")
+async def meta_connect(request: Request):
+    """Return the Meta OAuth consent URL for the current user."""
+    uid = getattr(request.state, "user_id", "")
+    app_id       = _genv("META_APP_ID")
+    redirect_uri = _meta_oauth_redirect_uri()
+    if not app_id:
+        return {"success": False, "error": "META_APP_ID not configured on server"}
+    state    = _make_oauth_state(uid)
+    auth_url = (
+        f"https://www.facebook.com/v21.0/dialog/oauth"
+        f"?client_id={app_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&scope={_META_OAUTH_SCOPES}"
+        f"&state={state}"
+        f"&response_type=code"
+    )
+    return {"success": True, "auth_url": auth_url}
+
+
+@app.get("/meta/callback")
+async def meta_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    """Meta OAuth callback — exchanges code for long-lived token and stores it."""
+    frontend = _genv("FRONTEND_URL") or "http://localhost:5173"
+    if error:
+        return RedirectResponse(f"{frontend}/account?meta_connected=false&error={error}")
+    valid, uid = _verify_oauth_state(state)
+    if not valid:
+        return RedirectResponse(f"{frontend}/account?meta_connected=false&error=invalid_state")
+
+    app_id       = _genv("META_APP_ID")
+    app_secret   = _genv("META_APP_SECRET")
+    redirect_uri = _meta_oauth_redirect_uri()
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as hc:
+            # 1. Exchange code for short-lived user access token
+            r1 = await hc.get(f"{_META_GRAPH}/oauth/access_token", params={
+                "client_id":     app_id,
+                "redirect_uri":  redirect_uri,
+                "client_secret": app_secret,
+                "code":          code,
+            })
+            r1.raise_for_status()
+            short_token = r1.json().get("access_token", "")
+            if not short_token:
+                raise ValueError(f"No access_token in response: {r1.text}")
+
+            # 2. Exchange for long-lived token (~60 days)
+            r2 = await hc.get(f"{_META_GRAPH}/oauth/access_token", params={
+                "grant_type":        "fb_exchange_token",
+                "client_id":         app_id,
+                "client_secret":     app_secret,
+                "fb_exchange_token": short_token,
+            })
+            r2.raise_for_status()
+            long_token = r2.json().get("access_token", short_token)
+
+        enc = encrypt_token(long_token)
+        now = datetime.utcnow().isoformat()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO meta_oauth_tokens (user_id, encrypted_access_token, connected_at, updated_at, revoked) "
+                "VALUES (:uid, :enc, :ts, :ts, FALSE) "
+                "ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token=:enc, updated_at=:ts, revoked=FALSE"
+            ), {"uid": uid, "enc": enc, "ts": now})
+        logger.info(f"[META-OAUTH] Connected uid={uid or 'anon'}")
+        return RedirectResponse(f"{frontend}/account?meta_connected=true")
+    except Exception as _e:
+        logger.error(f"[META-OAUTH] callback error: {_e}")
+        return RedirectResponse(f"{frontend}/account?meta_connected=false&error=exchange_failed")
+
+
+@app.get("/meta/accounts")
+async def meta_accounts(request: Request):
+    """List ad accounts accessible via the current user's Meta token."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT encrypted_access_token, ad_account_id, page_id, revoked "
+            "FROM meta_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[3]:
+        return {"success": False, "connect_required": True, "error": "Meta not connected"}
+    access_token   = decrypt_token(row[0])
+    selected_acct  = row[1] or ""
+    selected_page  = row[2] or ""
+    try:
+        async with httpx.AsyncClient(timeout=15) as hc:
+            r1 = await hc.get(f"{_META_GRAPH}/me/adaccounts", params={
+                "fields":       "name,account_id,account_status",
+                "access_token": access_token,
+            })
+            r1.raise_for_status()
+            ad_accounts = r1.json().get("data", [])
+
+            r2 = await hc.get(f"{_META_GRAPH}/me/accounts", params={
+                "fields":       "name,id",
+                "access_token": access_token,
+            })
+            r2.raise_for_status()
+            pages = r2.json().get("data", [])
+
+        return {
+            "success":      True,
+            "ad_accounts":  ad_accounts,
+            "pages":        pages,
+            "selected_ad_account_id": selected_acct,
+            "selected_page_id":       selected_page,
+        }
+    except Exception as _e:
+        logger.error(f"[META-OAUTH] /meta/accounts error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+class MetaAccountSelectRequest(BaseModel):
+    ad_account_id: str
+    page_id: str = ""
+
+
+@app.post("/meta/accounts/select")
+async def meta_accounts_select(request: Request, body: MetaAccountSelectRequest):
+    """Store the user's chosen ad account and Page for Meta campaigns."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    acct = body.ad_account_id
+    if not acct.startswith("act_"):
+        acct = f"act_{acct}"
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE meta_oauth_tokens SET ad_account_id=:acct, page_id=:page WHERE user_id=:uid"
+        ), {"acct": acct, "page": body.page_id or None, "uid": uid})
+    return {"success": True, "ad_account_id": acct, "page_id": body.page_id}
+
+
+@app.get("/meta/status")
+async def meta_status(request: Request):
+    """Connection status for the current user's Meta Ads OAuth token."""
+    uid       = getattr(request.state, "user_id", "")
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not uid or uid == krish_uid:
+        return {
+            "connected":    bool(_genv("META_ACCESS_TOKEN")),
+            "method":       "global",
+            "ad_account_id": _genv("META_AD_ACCOUNT_ID") or None,
+        }
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT ad_account_id, page_id, connected_at, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[3]:
+        return {"connected": False}
+    return {
+        "connected":    True,
+        "ad_account_id": row[0],
+        "page_id":       row[1],
+        "connected_at":  row[2],
+    }
+
+
+@app.delete("/meta/disconnect")
+async def meta_disconnect(request: Request):
+    """Revoke the current user's Meta Ads OAuth token."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE meta_oauth_tokens SET revoked=TRUE WHERE user_id=:uid"
+        ), {"uid": uid})
+    return {"success": True}
+
+
+# ── Unified connected-accounts status ─────────────────────────────────────────
+@app.get("/connected-accounts")
+async def connected_accounts(request: Request):
+    """Returns Google Ads + Meta Ads connection status for the current user."""
+    uid       = getattr(request.state, "user_id", "")
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+
+    # Google Ads
+    if not uid or uid == krish_uid:
+        g_connected = bool(_genv("GOOGLE_ADS_REFRESH_TOKEN"))
+        g_info = {"method": "global", "customer_id": _genv("GOOGLE_ADS_CUSTOMER_ID") or None} if g_connected else {}
+    else:
+        with engine.connect() as conn:
+            g_row = conn.execute(text(
+                "SELECT customer_id, connected_at, revoked FROM gads_oauth_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+        g_connected = bool(g_row and not g_row[2])
+        g_info = {"customer_id": g_row[0], "connected_at": g_row[1]} if g_connected else {}
+
+    # Meta Ads
+    if not uid or uid == krish_uid:
+        m_connected = bool(_genv("META_ACCESS_TOKEN"))
+        m_info = {"method": "global", "ad_account_id": _genv("META_AD_ACCOUNT_ID") or None} if m_connected else {}
+    else:
+        with engine.connect() as conn:
+            m_row = conn.execute(text(
+                "SELECT ad_account_id, page_id, connected_at, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+        m_connected = bool(m_row and not m_row[3])
+        m_info = {"ad_account_id": m_row[0], "page_id": m_row[1], "connected_at": m_row[2]} if m_connected else {}
+
+    return {
+        "google_ads": {"connected": g_connected, **g_info},
+        "meta_ads":   {"connected": m_connected, **m_info},
+    }
 
 
 @app.get("/google/accounts")
