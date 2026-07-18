@@ -42,19 +42,6 @@ load_dotenv()
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://ai-ad-frontend.vercel.app",
-        "https://sohjustbe.com",
-        "https://www.sohjustbe.com",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Per-request user_id — set by auth middleware, consumed by derive_business_key
 # and any function that needs to scope data to the current user.
 _request_user_id: ContextVar[str] = ContextVar("request_user_id", default="")
@@ -73,9 +60,6 @@ async def auth_middleware(request: Request, call_next):
 
     When neither secret is set (local dev): passes through with user_id = "".
     """
-    if request.method == "OPTIONS":
-        return await call_next(request)
-
     _is_public = request.method == "GET" and request.url.path in _PUBLIC_PATHS
 
     # 1. X-API-Key (existing gate, unchanged behaviour)
@@ -114,6 +98,23 @@ async def auth_middleware(request: Request, call_next):
     finally:
         _request_user_id.reset(_ctx_token)
     return response
+
+# CORSMiddleware MUST be added AFTER @app.middleware("http") so it becomes the
+# outermost layer. FastAPI's add_middleware prepends to the stack, so the last
+# add_middleware call wraps everything — making CORS the first thing requests
+# hit, and ensuring CORS headers appear on 401/500 responses too.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://ai-ad-frontend.vercel.app",
+        "https://sohjustbe.com",
+        "https://www.sohjustbe.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
