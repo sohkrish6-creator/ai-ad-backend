@@ -98,7 +98,11 @@ app = FastAPI()
 # and any function that needs to scope data to the current user.
 _request_user_id: ContextVar[str] = ContextVar("request_user_id", default="")
 
-_PUBLIC_PATHS = {"/"}
+_PUBLIC_PATHS = {
+    "/",
+    "/google/callback",  # browser redirect from Google — no auth header; state HMAC is the security
+    "/meta/callback",    # browser redirect from Meta — same reason
+}
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
