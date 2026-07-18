@@ -116,7 +116,12 @@ async def auth_middleware(request: Request, call_next):
 
     When neither secret is set (local dev): passes through with user_id = "".
     """
-    _is_public = request.method == "GET" and request.url.path in _PUBLIC_PATHS
+    # Normalize path: strip trailing slash so "/google/callback/" and
+    # "/google/callback" both match; preserve bare "/" as-is.
+    _raw_path = request.url.path
+    _norm_path = _raw_path.rstrip("/") or "/"
+    _is_public = request.method == "GET" and _norm_path in _PUBLIC_PATHS
+    logger.info(f"[AUTH] method={request.method} raw_path={_raw_path!r} norm_path={_norm_path!r} is_public={_is_public} public_paths={_PUBLIC_PATHS}")
 
     # 1. X-API-Key (existing gate, unchanged behaviour)
     _api_secret = os.getenv("ADSOH_API_KEY", "")
