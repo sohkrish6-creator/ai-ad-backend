@@ -15608,12 +15608,19 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         except Exception as _de:
             logger.warning(f"[GADS-OAUTH] auto-discover customer_id failed: {_de}")
 
+        logger.info(f"[GADS-OAUTH] storing token uid={uid!r} cid={customer_id_auto!r}")
         with engine.begin() as conn:
             if uid:
+                # Explicitly call nextval() in VALUES — never rely on column DEFAULT so
+                # we cannot hit NotNullViolation regardless of how the table was created.
                 conn.execute(text(
-                    "INSERT INTO gads_oauth_tokens (user_id, encrypted_refresh_token, customer_id, scope, connected_at, updated_at, revoked) "
-                    "VALUES (:uid, :enc, :cid, :scope, :ts, :ts, FALSE) "
-                    "ON CONFLICT(user_id) DO UPDATE SET encrypted_refresh_token=:enc, customer_id=COALESCE(:cid, gads_oauth_tokens.customer_id), scope=:scope, updated_at=:ts, revoked=FALSE"
+                    "INSERT INTO gads_oauth_tokens "
+                    "(id, user_id, encrypted_refresh_token, customer_id, scope, connected_at, updated_at, revoked) "
+                    "VALUES (nextval('gads_oauth_tokens_id_seq'), :uid, :enc, :cid, :scope, :ts, :ts, FALSE) "
+                    "ON CONFLICT(user_id) DO UPDATE SET "
+                    "encrypted_refresh_token=:enc, "
+                    "customer_id=COALESCE(:cid, gads_oauth_tokens.customer_id), "
+                    "scope=:scope, updated_at=:ts, revoked=FALSE"
                 ), {"uid": uid, "enc": enc, "cid": customer_id_auto or None, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
             else:
                 # Legacy path: no user_id — store at id=1 for backward compat
@@ -15760,10 +15767,12 @@ async def meta_callback(code: str = "", state: str = "", error: str = "", error_
 
         enc = encrypt_token(long_token)
         now = datetime.utcnow().isoformat()
+        logger.info(f"[META-OAUTH] storing token uid={uid!r}")
         with engine.begin() as conn:
             conn.execute(text(
-                "INSERT INTO meta_oauth_tokens (user_id, encrypted_access_token, connected_at, updated_at, revoked) "
-                "VALUES (:uid, :enc, :ts, :ts, FALSE) "
+                "INSERT INTO meta_oauth_tokens "
+                "(id, user_id, encrypted_access_token, connected_at, updated_at, revoked) "
+                "VALUES (nextval('meta_oauth_tokens_id_seq'), :uid, :enc, :ts, :ts, FALSE) "
                 "ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token=:enc, updated_at=:ts, revoked=FALSE"
             ), {"uid": uid, "enc": enc, "ts": now})
         logger.info(f"[META-OAUTH] Connected uid={uid or 'anon'}")
