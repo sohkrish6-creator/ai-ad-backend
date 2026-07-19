@@ -8422,9 +8422,11 @@ async def gads_test_connection():
 
 
 def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type: str,
-                          start_date: str, end_date: str, customer_id: str):
+                          start_date: str, end_date: str, customer_id: str, client=None):
     """Synchronous: create CampaignBudget + Campaign + AdGroup. Returns dict."""
-    client = get_google_ads_client()
+    if client is None:
+        client = get_google_ads_client()
+    logger.info(f"[GADS-CREATE-SYNC] customer_id={customer_id!r} uid_contextvar={_request_user_id.get()!r}")
 
     # 1. CampaignBudget
     budget_service = client.get_service("CampaignBudgetService")
@@ -8471,6 +8473,7 @@ def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type
     campaign_resp = campaign_service.mutate_campaigns(customer_id=customer_id, operations=[campaign_op])
     campaign_rn   = campaign_resp.results[0].resource_name
     campaign_id   = campaign_rn.split("/")[-1]
+    logger.info(f"[GADS-CREATE-SYNC] campaign created resource_name={campaign_rn!r} id={campaign_id!r}")
 
     # 3. AdGroup
     ad_group_service = client.get_service("AdGroupService")
@@ -8504,7 +8507,7 @@ def _create_campaign_sync(campaign_name: str, budget_daily: float, campaign_type
 _INDIA_GEO_TARGET_CONSTANT = "geoTargetConstants/2356"
 
 
-def _resolve_geo_target_sync(city: str) -> tuple:
+def _resolve_geo_target_sync(city: str, client=None) -> tuple:
     """
     Synchronous: resolve a city name to a Google Ads geo target constant
     resource name via GeoTargetConstantService. Falls back to targeting
@@ -8517,7 +8520,8 @@ def _resolve_geo_target_sync(city: str) -> tuple:
         return _INDIA_GEO_TARGET_CONSTANT, "India"
 
     try:
-        client       = get_google_ads_client()
+        if client is None:
+            client = get_google_ads_client()
         gtc_service  = client.get_service("GeoTargetConstantService")
         gtc_request  = client.get_type("SuggestGeoTargetConstantsRequest")
         gtc_request.locale = "en"
@@ -8539,9 +8543,10 @@ def _resolve_geo_target_sync(city: str) -> tuple:
     return _INDIA_GEO_TARGET_CONSTANT, "India (fallback)"
 
 
-def _add_location_criterion_sync(campaign_rn: str, geo_target_resource_name: str, customer_id: str):
+def _add_location_criterion_sync(campaign_rn: str, geo_target_resource_name: str, customer_id: str, client=None):
     """Synchronous: add a CampaignCriterion pinning the campaign to a location (Presence targeting)."""
-    client = get_google_ads_client()
+    if client is None:
+        client = get_google_ads_client()
     svc    = client.get_service("CampaignCriterionService")
     op     = client.get_type("CampaignCriterionOperation")
     crit   = op.create
@@ -8551,9 +8556,10 @@ def _add_location_criterion_sync(campaign_rn: str, geo_target_resource_name: str
     return resp.results[0].resource_name
 
 
-def _add_keywords_sync(ad_group_rn: str, keywords: list, customer_id: str):
+def _add_keywords_sync(ad_group_rn: str, keywords: list, customer_id: str, client=None):
     """Synchronous: add keyword criteria to an ad group."""
-    client    = get_google_ads_client()
+    if client is None:
+        client = get_google_ads_client()
     svc       = client.get_service("AdGroupCriterionService")
     _match_map = {
         "EXACT":  client.enums.KeywordMatchTypeEnum.EXACT,
@@ -8807,7 +8813,7 @@ def _meta_policy_precheck_ad_copy(primary_text: str, headline: str) -> tuple:
 
 
 def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
-                    final_url: str, customer_id: str):
+                    final_url: str, customer_id: str, client=None):
     """
     Synchronous: create a ResponsiveSearchAd in an ad group.
     Runs the policy pre-flight cleaner first (strips common rejection triggers
@@ -8832,7 +8838,8 @@ def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
             f"(Google Ads requires 2+); original count was {len(descriptions)}"
         )
 
-    client  = get_google_ads_client()
+    if client is None:
+        client = get_google_ads_client()
     svc     = client.get_service("AdGroupAdService")
     op      = client.get_type("AdGroupAdOperation")
     aga     = op.create
@@ -8858,7 +8865,7 @@ def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
     # can end up reporting "ad created" for an ad that doesn't really exist
     # (e.g. this call raised nothing, but caller code elsewhere set the flag
     # optimistically before/without checking the actual mutate result).
-    if not _verify_ad_group_ad_exists(ad_rn, customer_id):
+    if not _verify_ad_group_ad_exists(ad_rn, customer_id, client=client):
         raise RuntimeError(
             f"Ad mutation returned {ad_rn!r} but the resource did not verify as "
             "persisted on read-back — treating this as a failed ad creation."
@@ -8866,7 +8873,7 @@ def _create_ad_sync(ad_group_rn: str, headlines: list, descriptions: list,
     return {"ad_id": ad_rn.split("/")[-1], "resource_name": ad_rn, "status": "ENABLED"}
 
 
-def _verify_ad_group_ad_exists(ad_rn: str, customer_id: str) -> bool:
+def _verify_ad_group_ad_exists(ad_rn: str, customer_id: str, client=None) -> bool:
     """
     Read a just-created ad_group_ad back via GAQL to confirm it genuinely
     exists and isn't REMOVED — the ground-truth check behind _create_ad_sync's
@@ -8874,7 +8881,8 @@ def _verify_ad_group_ad_exists(ad_rn: str, customer_id: str) -> bool:
     ad really is there, never just that a mutate call didn't raise.
     """
     try:
-        client  = get_google_ads_client()
+        if client is None:
+            client = get_google_ads_client()
         service = client.get_service("GoogleAdsService")
         query = f"SELECT ad_group_ad.status FROM ad_group_ad WHERE ad_group_ad.resource_name = '{ad_rn}'"
         rows = list(service.search(customer_id=customer_id, query=query))
@@ -8888,13 +8896,14 @@ def _verify_ad_group_ad_exists(ad_rn: str, customer_id: str) -> bool:
         return False
 
 
-def _create_sitelinks_sync(campaign_rn: str, sitelinks: list, customer_id: str):
+def _create_sitelinks_sync(campaign_rn: str, sitelinks: list, customer_id: str, client=None):
     """
     Synchronous: create up to 6 SitelinkAssets and link them to the campaign.
     Google Ads models sitelinks as standalone Assets linked via CampaignAsset —
     they are not a field on the ad itself. Returns the list of linked resource names.
     """
-    client = get_google_ads_client()
+    if client is None:
+        client = get_google_ads_client()
 
     # 1. Create the Asset objects (one mutate call, one operation per sitelink)
     asset_service = client.get_service("AssetService")
@@ -8991,6 +9000,14 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         if not customer_id:
             return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
 
+        # Build the Google Ads client in the async context where the ContextVar
+        # is definitely set — then pass it explicitly to every to_thread call so
+        # we never depend on ContextVar propagation inside threads.
+        _uid = _request_user_id.get()
+        _krish_uid = os.getenv("KRISH_USER_ID", "")
+        _ads_client = get_google_ads_client_for_user(_uid) if (_uid and _uid != _krish_uid) else get_google_ads_client()
+        logger.info(f"[GADS-CREATE] uid={_uid!r} customer_id={customer_id!r} per_user_client={bool(_uid and _uid != _krish_uid)}")
+
         # ── Zero-Waste pre-flight (safety net) ──────────────────────────────
         _preflight = await run_launch_preflight(
             customer_id=customer_id,
@@ -9017,6 +9034,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             request.start_date.replace("-", ""),  # accept both YYYY-MM-DD and YYYYMMDD
             request.end_date.replace("-", "") if request.end_date else "",
             customer_id,
+            _ads_client,
         )
 
         # Location targeting — without this the campaign defaults to
@@ -9028,7 +9046,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         location_applied       = False
         try:
             location_resource_name, location_matched_name = await asyncio.to_thread(
-                _resolve_geo_target_sync, request.city
+                _resolve_geo_target_sync, request.city, _ads_client
             )
         except Exception as _re:
             logger.warning(f"[GADS-CREATE] Geo target resolution failed: {_re}")
@@ -9037,7 +9055,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
         logger.info(f"[GADS LOCATION] Applying location target: {location_resource_name} for city: {request.city}")
         try:
             await asyncio.to_thread(
-                _add_location_criterion_sync, result["campaign_rn"], location_resource_name, customer_id
+                _add_location_criterion_sync, result["campaign_rn"], location_resource_name, customer_id, _ads_client
             )
             location_applied = True
         except Exception as _le:
@@ -9074,7 +9092,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
                         for k in kw_list[:30] if k
                     ]
                     keywords_added = await asyncio.to_thread(
-                        _add_keywords_sync, result["ad_group_rn"], kw_objs, customer_id
+                        _add_keywords_sync, result["ad_group_rn"], kw_objs, customer_id, _ads_client
                     )
                     logger.info(f"[GADS-CREATE] Added {len(keywords_added)} keywords from memory")
             except Exception as _ke:
@@ -9096,7 +9114,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             if len(headlines) >= 3 and len(descriptions) >= 2 and final_url:
                 try:
                     ad_created = await asyncio.to_thread(
-                        _create_ad_sync, result["ad_group_rn"], headlines, descriptions, final_url, customer_id
+                        _create_ad_sync, result["ad_group_rn"], headlines, descriptions, final_url, customer_id, _ads_client
                     )
                     logger.info(f"[GADS-CREATE] Ad created: {ad_created}")
                 except GoogleAdsException as _gae:
@@ -9123,7 +9141,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
                             )
                             try:
                                 ad_created = await asyncio.to_thread(
-                                    _create_ad_sync, result["ad_group_rn"], retry_headlines, retry_descriptions, final_url, customer_id
+                                    _create_ad_sync, result["ad_group_rn"], retry_headlines, retry_descriptions, final_url, customer_id, _ads_client
                                 )
                                 ad_creation_error = {
                                     **ad_creation_error,
@@ -9165,7 +9183,7 @@ async def gads_create_campaign(request: CreateCampaignRequest):
             if sitelinks_data:
                 try:
                     sitelinks_added = await asyncio.to_thread(
-                        _create_sitelinks_sync, result["campaign_rn"], sitelinks_data, customer_id
+                        _create_sitelinks_sync, result["campaign_rn"], sitelinks_data, customer_id, _ads_client
                     )
                     logger.info(f"[GADS-CREATE] Added {len(sitelinks_added)} sitelinks from memory")
                 except Exception as _se:
