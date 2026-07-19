@@ -8928,6 +8928,9 @@ def _create_sitelinks_sync(campaign_rn: str, sitelinks: list, customer_id: str):
 class GadsPreflightRequest(BaseModel):
     url:          str   = ""
     budget_daily: float = 500
+    business_key: str   = ""
+    industry:     str   = ""
+    city:         str   = ""
     headlines:    list  = []
     descriptions: list  = []
 
@@ -8937,11 +8940,34 @@ async def gads_preflight(request: GadsPreflightRequest):
     """Zero-Waste pre-flight check for the main Google Ads account."""
     final_url    = request.url.strip()
     budget_daily = request.budget_daily
-    headlines    = request.headlines
-    descriptions = request.descriptions
+    headlines    = list(request.headlines)
+    descriptions = list(request.descriptions)
     customer_id  = _gads_customer_id()
     if not customer_id:
         return {"success": False, "error": "GOOGLE_ADS_CUSTOMER_ID not configured"}
+
+    # Pull headlines/descriptions from campaign_memory when not passed directly,
+    # using the same key derivation as /campaign-launch-kit (with city-fallback).
+    if not headlines or not descriptions:
+        _lookup_src = request.business_key or request.url
+        if _lookup_src:
+            _pf_key = derive_business_key(_lookup_src, request.industry, request.city)
+            logger.info(f"[GADS-PREFLIGHT] LOOKUP key: '{_pf_key}' (business_key={request.business_key!r} url={request.url!r} industry={request.industry!r} city={request.city!r})")
+            try:
+                _pf_mem, _pf_resolved = get_memory_with_city_fallback(_lookup_src, request.industry, request.city)
+                _cd_raw = (_pf_mem or {}).get("campaign", {}).get("campaign_data", {})
+                if isinstance(_cd_raw, str):
+                    try: _cd_raw = json.loads(_cd_raw)
+                    except Exception: _cd_raw = {}
+                _cd = _cd_raw if isinstance(_cd_raw, dict) else {}
+                if not headlines:
+                    headlines = _cd.get("headlines") or []
+                if not descriptions:
+                    descriptions = _cd.get("descriptions") or []
+                logger.info(f"[GADS-PREFLIGHT] Memory resolved key={_pf_resolved!r} headlines={len(headlines)} descriptions={len(descriptions)}")
+            except Exception as _pfe:
+                logger.warning(f"[GADS-PREFLIGHT] Memory lookup failed (non-fatal): {_pfe}")
+
     try:
         preflight = await run_launch_preflight(
             customer_id=customer_id,
@@ -13102,10 +13128,27 @@ async def run_launch_preflight(
 
     # Check 2 — Landing page reachability
     if final_url:
+        _lp_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=10) as hc:
-                resp = await hc.get(final_url, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code >= 400:
+                resp = await hc.get(final_url, headers={"User-Agent": _lp_ua})
+            if resp.status_code == 403:
+                # 403 from a server-side request usually means bot/WAF protection
+                # (Cloudflare, Sucuri, etc.) blocking automated checks — not a real error.
+                warnings.append({
+                    "code": "LANDING_PAGE_403",
+                    "message": (
+                        f"Landing page returned HTTP 403 to our automated check. "
+                        "This is usually Cloudflare or WAF bot-protection — "
+                        "verify the page loads correctly in your browser before launching."
+                    ),
+                    "severity": "warning",
+                })
+            elif resp.status_code >= 400:
                 blocking_issues.append({
                     "code": "LANDING_PAGE_ERROR",
                     "message": (
