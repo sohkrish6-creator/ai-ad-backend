@@ -9326,6 +9326,17 @@ try:
 except Exception as _moe:
     logger.warning(f"[META-OAUTH] Table create failed: {_moe}")
 
+# Ensure meta_oauth_tokens.id has an auto-increment sequence (table may have
+# been created before BIGSERIAL was enforced, leaving id without a default).
+try:
+    with engine.begin() as _mc:
+        _mc.execute(text("CREATE SEQUENCE IF NOT EXISTS meta_oauth_tokens_id_seq OWNED BY meta_oauth_tokens.id"))
+        _mc.execute(text("ALTER TABLE meta_oauth_tokens ALTER COLUMN id SET DEFAULT nextval('meta_oauth_tokens_id_seq')"))
+        _mc.execute(text("SELECT setval('meta_oauth_tokens_id_seq', COALESCE((SELECT MAX(id) FROM meta_oauth_tokens), 0) + 1, false)"))
+    logger.info("[MIGRATE] meta_oauth_tokens: id sequence ensured")
+except Exception as _mse:
+    logger.info(f"[MIGRATE] meta_oauth_tokens id sequence already set or skipped: {_mse}")
+
 
 def get_meta_ads_client_for_user(uid: str) -> tuple:
     """Returns (api, ad_account_id) using the user's stored OAuth token.
@@ -14761,6 +14772,17 @@ try:
 except Exception as _gue:
     # Constraint already exists — safe to ignore.
     logger.info(f"[MIGRATE] gads_oauth_tokens UNIQUE(user_id) already present or skipped: {_gue}")
+
+# Ensure gads_oauth_tokens.id has an auto-increment sequence (table may have
+# been created before BIGSERIAL was enforced, leaving id without a default).
+try:
+    with engine.begin() as _gc:
+        _gc.execute(text("CREATE SEQUENCE IF NOT EXISTS gads_oauth_tokens_id_seq OWNED BY gads_oauth_tokens.id"))
+        _gc.execute(text("ALTER TABLE gads_oauth_tokens ALTER COLUMN id SET DEFAULT nextval('gads_oauth_tokens_id_seq')"))
+        _gc.execute(text("SELECT setval('gads_oauth_tokens_id_seq', COALESCE((SELECT MAX(id) FROM gads_oauth_tokens), 0) + 1, false)"))
+    logger.info("[MIGRATE] gads_oauth_tokens: id sequence ensured")
+except Exception as _gse:
+    logger.info(f"[MIGRATE] gads_oauth_tokens id sequence already set or skipped: {_gse}")
 
 
 # ── OAuth client config / flow ───────────────────────────────────────────────
