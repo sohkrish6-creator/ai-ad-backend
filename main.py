@@ -15481,11 +15481,13 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
     valid, uid = _verify_oauth_state(state)
     if not valid:
         return RedirectResponse(f"{frontend}/account?gads_connected=false&error=invalid_state")
+    _redirect_uri_used = _gads_oauth_redirect_uri()
+    logger.info(f"[GADS-OAUTH] callback uid={uid!r} redirect_uri={_redirect_uri_used!r}")
     try:
         flow = _GoogleOAuthFlow.from_client_config(
             _gads_oauth_client_config(),
             scopes=_GADS_OAUTH_SCOPES,
-            redirect_uri=_gads_oauth_redirect_uri(),
+            redirect_uri=_redirect_uri_used,
         )
 
         def _fetch():
@@ -15535,8 +15537,11 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         logger.info(f"[GADS-OAUTH] Connected uid={uid or 'anon'} customer_id={customer_id_auto or 'none'}")
         return RedirectResponse(f"{frontend}/account?gads_connected=true")
     except Exception as _e:
-        logger.error(f"[GADS-OAUTH] /google/callback error: {_e}")
-        return RedirectResponse(f"{frontend}/account?gads_connected=false&error=exchange_failed")
+        import traceback as _tb
+        _detail = str(_e)[:200]
+        logger.error(f"[GADS-OAUTH] /google/callback FAILED redirect_uri={_redirect_uri_used!r} error={_detail}\n{_tb.format_exc()}")
+        import urllib.parse as _up
+        return RedirectResponse(f"{frontend}/account?gads_connected=false&error={_up.quote(_detail)}")
 
 
 @app.get("/google/status")
