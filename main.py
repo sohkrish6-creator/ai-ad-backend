@@ -9326,16 +9326,47 @@ try:
 except Exception as _moe:
     logger.warning(f"[META-OAUTH] Table create failed: {_moe}")
 
-# Ensure meta_oauth_tokens.id has an auto-increment sequence (table may have
-# been created before BIGSERIAL was enforced, leaving id without a default).
+# Ensure meta_oauth_tokens.id has an auto-increment default.
 try:
-    with engine.begin() as _mc:
-        _mc.execute(text("CREATE SEQUENCE IF NOT EXISTS meta_oauth_tokens_id_seq OWNED BY meta_oauth_tokens.id"))
-        _mc.execute(text("ALTER TABLE meta_oauth_tokens ALTER COLUMN id SET DEFAULT nextval('meta_oauth_tokens_id_seq')"))
-        _mc.execute(text("SELECT setval('meta_oauth_tokens_id_seq', COALESCE((SELECT MAX(id) FROM meta_oauth_tokens), 0) + 1, false)"))
-    logger.info("[MIGRATE] meta_oauth_tokens: id sequence ensured")
-except Exception as _mse:
-    logger.info(f"[MIGRATE] meta_oauth_tokens id sequence already set or skipped: {_mse}")
+    with engine.connect() as _mc:
+        _meta_id_default = (_mc.execute(text(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name='meta_oauth_tokens' AND column_name='id'"
+        )).fetchone() or [None])[0]
+    logger.info(f"[MIGRATE] meta_oauth_tokens id column_default={_meta_id_default!r}")
+except Exception as _mse0:
+    logger.error(f"[MIGRATE] meta_oauth_tokens id default CHECK failed: {_mse0}")
+    _meta_id_default = None
+
+if not _meta_id_default or "nextval" not in str(_meta_id_default):
+    logger.warning("[MIGRATE] meta_oauth_tokens id has no sequence default — adding now")
+    try:
+        with engine.begin() as _mc:
+            _mc.execute(text("CREATE SEQUENCE IF NOT EXISTS meta_oauth_tokens_id_seq"))
+        logger.info("[MIGRATE] meta_oauth_tokens: sequence created or already exists")
+    except Exception as _mse1:
+        logger.error(f"[MIGRATE] meta_oauth_tokens CREATE SEQUENCE failed: {_mse1}")
+
+    try:
+        with engine.begin() as _mc:
+            _mc.execute(text(
+                "ALTER TABLE meta_oauth_tokens ALTER COLUMN id SET DEFAULT nextval('meta_oauth_tokens_id_seq')"
+            ))
+        logger.info("[MIGRATE] meta_oauth_tokens: id DEFAULT nextval set")
+    except Exception as _mse2:
+        logger.error(f"[MIGRATE] meta_oauth_tokens ALTER COLUMN id SET DEFAULT failed: {_mse2}")
+
+    try:
+        with engine.begin() as _mc:
+            _mc.execute(text(
+                "SELECT setval('meta_oauth_tokens_id_seq', "
+                "COALESCE((SELECT MAX(id) FROM meta_oauth_tokens), 0) + 1, false)"
+            ))
+        logger.info("[MIGRATE] meta_oauth_tokens: sequence value initialised")
+    except Exception as _mse3:
+        logger.error(f"[MIGRATE] meta_oauth_tokens setval failed: {_mse3}")
+else:
+    logger.info("[MIGRATE] meta_oauth_tokens id sequence default already present — no action needed")
 
 
 def get_meta_ads_client_for_user(uid: str) -> tuple:
@@ -14773,16 +14804,51 @@ except Exception as _gue:
     # Constraint already exists — safe to ignore.
     logger.info(f"[MIGRATE] gads_oauth_tokens UNIQUE(user_id) already present or skipped: {_gue}")
 
-# Ensure gads_oauth_tokens.id has an auto-increment sequence (table may have
-# been created before BIGSERIAL was enforced, leaving id without a default).
+# Ensure gads_oauth_tokens.id has an auto-increment default.
+# Query current state first so we can log exactly what we find and only act when needed.
 try:
-    with engine.begin() as _gc:
-        _gc.execute(text("CREATE SEQUENCE IF NOT EXISTS gads_oauth_tokens_id_seq OWNED BY gads_oauth_tokens.id"))
-        _gc.execute(text("ALTER TABLE gads_oauth_tokens ALTER COLUMN id SET DEFAULT nextval('gads_oauth_tokens_id_seq')"))
-        _gc.execute(text("SELECT setval('gads_oauth_tokens_id_seq', COALESCE((SELECT MAX(id) FROM gads_oauth_tokens), 0) + 1, false)"))
-    logger.info("[MIGRATE] gads_oauth_tokens: id sequence ensured")
-except Exception as _gse:
-    logger.info(f"[MIGRATE] gads_oauth_tokens id sequence already set or skipped: {_gse}")
+    with engine.connect() as _gc:
+        _id_default = (_gc.execute(text(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name='gads_oauth_tokens' AND column_name='id'"
+        )).fetchone() or [None])[0]
+    logger.info(f"[MIGRATE] gads_oauth_tokens id column_default={_id_default!r}")
+except Exception as _gse0:
+    logger.error(f"[MIGRATE] gads_oauth_tokens id default CHECK failed: {_gse0}")
+    _id_default = None
+
+if not _id_default or "nextval" not in str(_id_default):
+    logger.warning("[MIGRATE] gads_oauth_tokens id has no sequence default — adding now")
+    # Step 1: create sequence (own transaction so failure doesn't cascade)
+    try:
+        with engine.begin() as _gc:
+            _gc.execute(text("CREATE SEQUENCE IF NOT EXISTS gads_oauth_tokens_id_seq"))
+        logger.info("[MIGRATE] gads_oauth_tokens: sequence created or already exists")
+    except Exception as _gse1:
+        logger.error(f"[MIGRATE] gads_oauth_tokens CREATE SEQUENCE failed: {_gse1}")
+
+    # Step 2: set column default (own transaction)
+    try:
+        with engine.begin() as _gc:
+            _gc.execute(text(
+                "ALTER TABLE gads_oauth_tokens ALTER COLUMN id SET DEFAULT nextval('gads_oauth_tokens_id_seq')"
+            ))
+        logger.info("[MIGRATE] gads_oauth_tokens: id DEFAULT nextval set")
+    except Exception as _gse2:
+        logger.error(f"[MIGRATE] gads_oauth_tokens ALTER COLUMN id SET DEFAULT failed: {_gse2}")
+
+    # Step 3: advance sequence past existing rows (own transaction)
+    try:
+        with engine.begin() as _gc:
+            _gc.execute(text(
+                "SELECT setval('gads_oauth_tokens_id_seq', "
+                "COALESCE((SELECT MAX(id) FROM gads_oauth_tokens), 0) + 1, false)"
+            ))
+        logger.info("[MIGRATE] gads_oauth_tokens: sequence value initialised")
+    except Exception as _gse3:
+        logger.error(f"[MIGRATE] gads_oauth_tokens setval failed: {_gse3}")
+else:
+    logger.info("[MIGRATE] gads_oauth_tokens id sequence default already present — no action needed")
 
 
 # ── OAuth client config / flow ───────────────────────────────────────────────
