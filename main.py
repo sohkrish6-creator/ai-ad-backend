@@ -15650,39 +15650,26 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
         enc = encrypt_token(creds.refresh_token)
         now = datetime.utcnow().isoformat()
 
-        # Try to discover the user's first accessible ad account automatically.
-        customer_id_auto = ""
-        try:
-            def _discover():
-                tmp_config = {
-                    "developer_token": _genv("GOOGLE_ADS_DEVELOPER_TOKEN"),
-                    "client_id":       _genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
-                    "client_secret":   _genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
-                    "refresh_token":   creds.refresh_token,
-                    "use_proto_plus":  True,
-                }
-                c = GoogleAdsClient.load_from_dict(tmp_config)
-                names = c.get_service("CustomerService").list_accessible_customers().resource_names
-                # Prefer non-manager accounts; fall back to any account.
-                return names[0].split("/")[-1] if names else ""
-            customer_id_auto = await asyncio.to_thread(_discover)
-        except Exception as _de:
-            logger.warning(f"[GADS-OAUTH] auto-discover customer_id failed: {_de}")
-
-        logger.info(f"[GADS-OAUTH] storing token uid={uid!r} cid={customer_id_auto!r}")
+        # Store the refresh token WITHOUT auto-selecting a customer_id.
+        # Auto-picking "the first accessible account" caused cross-account contamination
+        # (e.g. webchoice0's token returning Krish's account because their Google login
+        # had access to it).  The user MUST explicitly pick their own account in the UI
+        # after the OAuth completes — see /google/accessible-accounts + /google/select-account.
+        logger.info(f"[GADS-OAUTH] storing token uid={uid!r} (customer_id will be selected by user)")
         with engine.begin() as conn:
             if uid:
                 # Explicitly call nextval() in VALUES — never rely on column DEFAULT so
                 # we cannot hit NotNullViolation regardless of how the table was created.
+                # customer_id=NULL here — the user will pick it in the Account page.
                 conn.execute(text(
                     "INSERT INTO gads_oauth_tokens "
                     "(id, user_id, encrypted_refresh_token, customer_id, scope, connected_at, updated_at, revoked) "
-                    "VALUES (nextval('gads_oauth_tokens_id_seq'), :uid, :enc, :cid, :scope, :ts, :ts, FALSE) "
+                    "VALUES (nextval('gads_oauth_tokens_id_seq'), :uid, :enc, NULL, :scope, :ts, :ts, FALSE) "
                     "ON CONFLICT(user_id) DO UPDATE SET "
                     "encrypted_refresh_token=:enc, "
-                    "customer_id=COALESCE(:cid, gads_oauth_tokens.customer_id), "
+                    "customer_id=NULL, "
                     "scope=:scope, updated_at=:ts, revoked=FALSE"
-                ), {"uid": uid, "enc": enc, "cid": customer_id_auto or None, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
+                ), {"uid": uid, "enc": enc, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
             else:
                 # Legacy path: no user_id — store at id=1 for backward compat
                 conn.execute(text(
@@ -15690,8 +15677,9 @@ async def google_callback(code: str = "", state: str = "", error: str = ""):
                     "VALUES (1, :enc, :scope, :ts, :ts, FALSE) "
                     "ON CONFLICT(id) DO UPDATE SET encrypted_refresh_token=:enc, scope=:scope, updated_at=:ts, revoked=FALSE"
                 ), {"enc": enc, "scope": " ".join(_GADS_OAUTH_SCOPES), "ts": now})
-        logger.info(f"[GADS-OAUTH] Connected uid={uid or 'anon'} customer_id={customer_id_auto or 'none'}")
-        return RedirectResponse(f"{frontend}/account?gads_connected=true")
+        logger.info(f"[GADS-OAUTH] Token stored uid={uid or 'anon'} — redirecting to account picker")
+        # pending = token stored but user still needs to select their ad account
+        return RedirectResponse(f"{frontend}/account?gads_connected=pending")
     except Exception as _e:
         import traceback as _tb
         _detail = str(_e)[:200]
@@ -15751,14 +15739,34 @@ async def google_select_account(request: Request):
 # ── Google Ads: list accessible accounts for current user ────────────────────
 @app.get("/google/accessible-accounts")
 async def google_accessible_accounts(request: Request):
-    """List all Google Ads accounts accessible via the current user's OAuth token."""
+    """List all Google Ads accounts accessible via the current user's OAuth token.
+    Includes account names so the user can identify which one is theirs.
+    """
     uid = getattr(request.state, "user_id", "")
     try:
         def _list():
             client = get_google_ads_client_for_user(uid) if uid else get_google_ads_client()
             svc    = client.get_service("CustomerService")
             names  = svc.list_accessible_customers().resource_names
-            return [{"customer_id": n.split("/")[-1]} for n in names]
+            results = []
+            ga_svc = client.get_service("GoogleAdsService")
+            for rn in names:
+                cid = rn.split("/")[-1]
+                entry = {"customer_id": cid, "name": "", "is_manager": False, "is_test": False}
+                try:
+                    rows = list(ga_svc.search(
+                        customer_id=cid,
+                        query="SELECT customer.id, customer.descriptive_name, customer.manager, customer.test_account FROM customer LIMIT 1"
+                    ))
+                    if rows:
+                        c = rows[0].customer
+                        entry["name"]       = c.descriptive_name or ""
+                        entry["is_manager"] = bool(c.manager)
+                        entry["is_test"]    = bool(c.test_account)
+                except Exception:
+                    pass
+                results.append(entry)
+            return results
         accounts = await asyncio.to_thread(_list)
         return {"success": True, "accounts": accounts}
     except GadsNotConnectedError as ex:
@@ -15963,7 +15971,11 @@ async def connected_accounts(request: Request):
                 "SELECT customer_id, connected_at, revoked FROM gads_oauth_tokens WHERE user_id=:uid"
             ), {"uid": uid}).fetchone()
         g_connected = bool(g_row and not g_row[2])
-        g_info = {"customer_id": g_row[0], "connected_at": g_row[1]} if g_connected else {}
+        g_info = {
+            "customer_id": g_row[0],
+            "connected_at": g_row[1],
+            "pending_account_selection": g_connected and not g_row[0],
+        } if g_connected else {}
 
     # Meta Ads
     if not uid or uid == krish_uid:
