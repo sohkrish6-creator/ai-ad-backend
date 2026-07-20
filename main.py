@@ -237,6 +237,8 @@ app.add_middleware(
         "https://ai-ad-frontend.vercel.app",
         "https://sohjustbe.com",
         "https://www.sohjustbe.com",
+        "https://sohscape.com",
+        "https://www.sohscape.com",
         "http://localhost:5173",
         "http://localhost:3000",
     ],
