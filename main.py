@@ -105,6 +105,13 @@ _PUBLIC_PATHS = {
     "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
 }
 
+# Service/automation endpoints (e.g. n8n) that authenticate with X-API-Key only —
+# they have no Supabase user session to attach a JWT to, so once ADSOH_API_KEY
+# has verified the caller, the JWT gate below is skipped for these paths.
+_API_KEY_ONLY_PATHS = {
+    "/admin/weekly-market-insight/create",
+}
+
 # Simple in-memory per-IP rate limiter for public, unauthenticated endpoints.
 # Not distributed (fine for a single Render instance) — resets on deploy/restart.
 _rate_limit_buckets: dict = {}
@@ -148,15 +155,18 @@ async def auth_middleware(request: Request, call_next):
 
     # 1. X-API-Key (existing gate, unchanged behaviour)
     _api_secret = os.getenv("ADSOH_API_KEY", "")
+    _api_key_verified = False
     if _api_secret and not _is_public:
         incoming = request.headers.get("X-API-Key", "")
         if not incoming or not hmac.compare_digest(incoming.encode(), _api_secret.encode()):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        _api_key_verified = True
 
     # 2. JWT → user_id
     user_id = ""
     _jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "")
-    if _jwt_secret and not _is_public:
+    _skip_jwt = _api_key_verified and _norm_path in _API_KEY_ONLY_PATHS
+    if _jwt_secret and not _is_public and not _skip_jwt:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
