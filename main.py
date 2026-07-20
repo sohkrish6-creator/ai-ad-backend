@@ -106,6 +106,7 @@ _PUBLIC_PATHS = {
     "/meta/callback",    # browser redirect from Meta — same reason
     "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
     "/public/portfolio",              # public website widget — no auth, rate-limited instead
+    "/public/testimonials",           # public website widget — no auth, rate-limited instead
     "/admin-panel/website-admin.html",  # static admin UI shell — no secrets embedded, page itself needs no auth
 }
 
@@ -17786,6 +17787,28 @@ async def public_portfolio(request: Request):
                 .all())
         items = [{"title": r.title, "category": r.category,
                   "description": r.description, "image_url": r.image_url} for r in rows]
+    finally:
+        db.close()
+    return JSONResponse({"items": items}, headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN})
+
+
+@app.get("/public/testimonials")
+async def public_testimonials(request: Request):
+    """Public, unauthenticated, rate-limited — powers the testimonials slider on sohscape.com. Only approved rows."""
+    ip = _client_ip(request)
+    if not _rate_limit_allow(f"public-testimonials:{ip}", 30):
+        return JSONResponse(
+            {"error": "Too many requests"}, status_code=429,
+            headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+        )
+    db = SessionLocal()
+    try:
+        rows = (db.query(TestimonialModel)
+                .filter(TestimonialModel.approved == True)  # noqa: E712
+                .order_by(TestimonialModel.id.desc())
+                .all())
+        items = [{"client_name": r.client_name, "position": r.position,
+                  "text": r.text, "image_url": r.image_url} for r in rows]
     finally:
         db.close()
     return JSONResponse({"items": items}, headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN})
