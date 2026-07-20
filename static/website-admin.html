@@ -115,6 +115,7 @@
   <div class="tabs">
     <button class="tab-btn active" data-tab="portfolio" onclick="switchTab('portfolio')">Portfolio</button>
     <button class="tab-btn" data-tab="testimonials" onclick="switchTab('testimonials')">Testimonials</button>
+    <button class="tab-btn" data-tab="blog" onclick="switchTab('blog')">Blog</button>
   </div>
 
   <!-- PORTFOLIO TAB -->
@@ -193,11 +194,57 @@
 
     <div class="grid" id="testimonialsGrid"></div>
   </section>
+
+  <!-- BLOG TAB -->
+  <section id="tab-blog" class="hidden">
+    <div class="card">
+      <h3 id="blogFormTitle">Add Blog Post</h3>
+      <input type="hidden" id="bg_id">
+      <label>Title</label>
+      <input type="text" id="bg_title" placeholder="e.g. 5 Local SEO Tips for Jaipur Businesses">
+      <label>Excerpt (short summary)</label>
+      <textarea id="bg_excerpt" placeholder="One or two sentences shown in the blog list"></textarea>
+      <label>Content</label>
+      <textarea id="bg_content" style="min-height:160px;" placeholder="Full post — plain paragraphs, one blank line between each"></textarea>
+      <label>Author</label>
+      <input type="text" id="bg_author" placeholder="e.g. Sohscape Team">
+      <label>Published date</label>
+      <input type="date" id="bg_published_date">
+      <label>Display order</label>
+      <input type="number" id="bg_sort_order" value="0">
+
+      <label>Cover image</label>
+      <div class="upload-row">
+        <div class="thumb-preview" id="bg_thumb"></div>
+        <div style="flex:1; min-width:200px;">
+          <input type="file" id="bg_file" accept="image/*" onchange="onFilePicked('bg')">
+          <div class="upload-row" style="margin-top:8px;">
+            <div class="progress-track"><div class="progress-fill" id="bg_progress"></div></div>
+            <button class="secondary small" id="bg_uploadBtn" onclick="doUpload('bg')" disabled>Upload</button>
+          </div>
+          <div class="upload-status" id="bg_status"></div>
+        </div>
+      </div>
+      <input type="hidden" id="bg_image_url">
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="bg_active" checked>
+        <label style="margin:0;">Active (visible on site)</label>
+      </div>
+
+      <div class="form-actions">
+        <button class="primary" onclick="saveBlogPost()">Save</button>
+        <button class="secondary" onclick="resetBlogForm()">Clear</button>
+      </div>
+    </div>
+
+    <div class="grid" id="blogGrid"></div>
+  </section>
 </main>
 
 <script>
 const KEY_STORAGE = 'sohscape_admin_api_key';
-let selectedFile = { pf: null, tm: null };
+let selectedFile = { pf: null, tm: null, bg: null };
 
 function apiKey() { return localStorage.getItem(KEY_STORAGE) || ''; }
 
@@ -226,6 +273,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.getElementById('tab-portfolio').classList.toggle('hidden', name !== 'portfolio');
   document.getElementById('tab-testimonials').classList.toggle('hidden', name !== 'testimonials');
+  document.getElementById('tab-blog').classList.toggle('hidden', name !== 'blog');
 }
 
 async function apiFetch(path, options = {}) {
@@ -492,9 +540,110 @@ function editTestimonialById(id) {
   if (item) editTestimonial(item);
 }
 
+// ---- Blog ----
+
+function resetBlogForm() {
+  document.getElementById('bg_id').value = '';
+  document.getElementById('bg_title').value = '';
+  document.getElementById('bg_excerpt').value = '';
+  document.getElementById('bg_content').value = '';
+  document.getElementById('bg_author').value = '';
+  document.getElementById('bg_published_date').value = '';
+  document.getElementById('bg_sort_order').value = 0;
+  document.getElementById('bg_image_url').value = '';
+  document.getElementById('bg_thumb').style.backgroundImage = '';
+  document.getElementById('bg_file').value = '';
+  document.getElementById('bg_status').textContent = '';
+  document.getElementById('bg_uploadBtn').disabled = true;
+  document.getElementById('bg_progress').style.width = '0%';
+  document.getElementById('bg_active').checked = true;
+  document.getElementById('blogFormTitle').textContent = 'Add Blog Post';
+  selectedFile.bg = null;
+}
+
+function editBlogPost(item) {
+  document.getElementById('bg_id').value = item.id;
+  document.getElementById('bg_title').value = item.title || '';
+  document.getElementById('bg_excerpt').value = item.excerpt || '';
+  document.getElementById('bg_content').value = item.content || '';
+  document.getElementById('bg_author').value = item.author || '';
+  document.getElementById('bg_published_date').value = item.published_date || '';
+  document.getElementById('bg_sort_order').value = item.sort_order || 0;
+  document.getElementById('bg_image_url').value = item.cover_image_url || '';
+  document.getElementById('bg_thumb').style.backgroundImage = item.cover_image_url ? `url(${item.cover_image_url})` : '';
+  document.getElementById('bg_active').checked = !!item.active;
+  document.getElementById('blogFormTitle').textContent = 'Edit Blog Post — replace cover image below if needed';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function saveBlogPost() {
+  const id = document.getElementById('bg_id').value;
+  const payload = {
+    title: document.getElementById('bg_title').value,
+    excerpt: document.getElementById('bg_excerpt').value,
+    content: document.getElementById('bg_content').value,
+    cover_image_url: document.getElementById('bg_image_url').value,
+    author: document.getElementById('bg_author').value,
+    published_date: document.getElementById('bg_published_date').value,
+    sort_order: parseInt(document.getElementById('bg_sort_order').value || '0', 10),
+    active: document.getElementById('bg_active').checked,
+  };
+  const res = await apiFetch(id ? `/admin/website/blog/${id}` : '/admin/website/blog', {
+    method: id ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.success) {
+    resetBlogForm();
+    loadBlog();
+  } else {
+    alert(data.error || 'Save failed');
+  }
+}
+
+async function deleteBlogPost(id) {
+  if (!confirm('Delete this blog post?')) return;
+  const res = await apiFetch(`/admin/website/blog/${id}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (data.success) loadBlog();
+  else alert(data.error || 'Delete failed');
+}
+
+let blogPosts = [];
+
+async function loadBlog() {
+  const res = await apiFetch('/admin/website/blog');
+  const data = await res.json();
+  blogPosts = data.items || [];
+  const grid = document.getElementById('blogGrid');
+  grid.innerHTML = '';
+  blogPosts.forEach(item => {
+    const el = document.createElement('div');
+    el.className = 'item-card';
+    el.innerHTML = `
+      <img src="${escapeHtml(item.cover_image_url)}" onerror="this.style.opacity=0.3" alt="${escapeHtml(item.title)}">
+      <div class="item-body">
+        <div class="item-title">${escapeHtml(item.title) || '(untitled)'}</div>
+        <div class="item-meta">${escapeHtml(item.author)} ${item.published_date ? '&middot; ' + escapeHtml(item.published_date) : ''} ${item.active ? '' : '&middot; inactive'}</div>
+        <div class="item-actions">
+          <button class="secondary small" onclick="editBlogPostById(${item.id})">Edit</button>
+          <button class="danger small" onclick="deleteBlogPost(${item.id})">Delete</button>
+        </div>
+      </div>`;
+    grid.appendChild(el);
+  });
+}
+
+function editBlogPostById(id) {
+  const item = blogPosts.find(i => i.id === id);
+  if (item) editBlogPost(item);
+}
+
 function loadAll() {
   loadPortfolio();
   loadTestimonials();
+  loadBlog();
 }
 
 // ---- init ----

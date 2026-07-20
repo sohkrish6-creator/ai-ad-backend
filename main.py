@@ -107,8 +107,14 @@ _PUBLIC_PATHS = {
     "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
     "/public/portfolio",              # public website widget — no auth, rate-limited instead
     "/public/testimonials",           # public website widget — no auth, rate-limited instead
+    "/public/blog",                   # public website widget — no auth, rate-limited instead
     "/admin-panel/website-admin.html",  # static admin UI shell — no secrets embedded, page itself needs no auth
 }
+# Public GET path families with dynamic /{id} segments (exact-match _PUBLIC_PATHS
+# can't express these) — e.g. /public/blog/42 for a single post detail page.
+_PUBLIC_PATH_PREFIXES = (
+    "/public/blog/",
+)
 
 # Service/automation endpoints (e.g. n8n) that authenticate with X-API-Key only —
 # they have no Supabase user session to attach a JWT to, so once ADSOH_API_KEY
@@ -161,7 +167,9 @@ async def auth_middleware(request: Request, call_next):
     # "/google/callback" both match; preserve bare "/" as-is.
     _raw_path = request.url.path
     _norm_path = _raw_path.rstrip("/") or "/"
-    _is_public = request.method == "GET" and _norm_path in _PUBLIC_PATHS
+    _is_public = request.method == "GET" and (
+        _norm_path in _PUBLIC_PATHS or _norm_path.startswith(_PUBLIC_PATH_PREFIXES)
+    )
     logger.info(f"[AUTH] method={request.method} raw_path={_raw_path!r} norm_path={_norm_path!r} is_public={_is_public} public_paths={_PUBLIC_PATHS}")
 
     # 1. X-API-Key (existing gate, unchanged behaviour)
@@ -328,12 +336,26 @@ class TestimonialModel(Base):
     created_at = Column(String(100))
     updated_at = Column(String(100))
 
+class WebsiteBlogPostModel(Base):
+    __tablename__ = "website_blog_posts"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255))
+    excerpt = Column(Text)
+    content = Column(Text)
+    cover_image_url = Column(Text)
+    author = Column(String(255))
+    published_date = Column(String(50))
+    sort_order = Column(Integer, default=0)
+    active = Column(Boolean, default=True)
+    created_at = Column(String(100))
+    updated_at = Column(String(100))
+
 try:
     Base.metadata.create_all(bind=engine)
     logger.info("[DB] create_all succeeded")
 except Exception as _e:
     logger.error(f"[DB] create_all failed ({_e}). Falling back to per-table creation.")
-    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel]:
+    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel, WebsiteBlogPostModel]:
         try:
             _model.__table__.create(bind=engine, checkfirst=True)
             logger.info(f"[DB] Created table: {_model.__tablename__}")
@@ -17885,6 +17907,156 @@ async def delete_testimonial(item_id: int):
     finally:
         db.close()
     return {"success": True}
+
+
+class BlogPostCreate(BaseModel):
+    title: str
+    excerpt: str = ""
+    content: str = ""
+    cover_image_url: str = ""
+    author: str = ""
+    published_date: str = ""
+    sort_order: int = 0
+    active: bool = True
+
+
+class BlogPostUpdate(BaseModel):
+    title: Optional[str] = None
+    excerpt: Optional[str] = None
+    content: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    author: Optional[str] = None
+    published_date: Optional[str] = None
+    sort_order: Optional[int] = None
+    active: Optional[bool] = None
+
+
+def _blog_post_dict(r: WebsiteBlogPostModel) -> dict:
+    return {
+        "id": r.id, "title": r.title, "excerpt": r.excerpt, "content": r.content,
+        "cover_image_url": r.cover_image_url, "author": r.author,
+        "published_date": r.published_date, "sort_order": r.sort_order, "active": r.active,
+    }
+
+
+@app.get("/admin/website/blog")
+async def list_blog_posts():
+    db = SessionLocal()
+    try:
+        rows = (db.query(WebsiteBlogPostModel)
+                .order_by(WebsiteBlogPostModel.sort_order.asc(), WebsiteBlogPostModel.id.desc())
+                .all())
+        items = [_blog_post_dict(r) for r in rows]
+    finally:
+        db.close()
+    return {"success": True, "items": items}
+
+
+@app.post("/admin/website/blog")
+async def create_blog_post(request: BlogPostCreate):
+    db = SessionLocal()
+    try:
+        now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        row = WebsiteBlogPostModel(
+            title=request.title.strip(),
+            excerpt=request.excerpt.strip(),
+            content=request.content.strip(),
+            cover_image_url=request.cover_image_url.strip(),
+            author=request.author.strip(),
+            published_date=request.published_date.strip() or date.today().isoformat(),
+            sort_order=request.sort_order,
+            active=request.active,
+            created_at=now, updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        item = _blog_post_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.put("/admin/website/blog/{post_id}")
+async def update_blog_post(post_id: int, request: BlogPostUpdate):
+    db = SessionLocal()
+    try:
+        row = db.query(WebsiteBlogPostModel).filter(WebsiteBlogPostModel.id == post_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        updates = request.model_dump(exclude_unset=True)
+        for field, val in updates.items():
+            setattr(row, field, val.strip() if isinstance(val, str) else val)
+        row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        db.commit()
+        db.refresh(row)
+        item = _blog_post_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.delete("/admin/website/blog/{post_id}")
+async def delete_blog_post(post_id: int):
+    db = SessionLocal()
+    try:
+        row = db.query(WebsiteBlogPostModel).filter(WebsiteBlogPostModel.id == post_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        db.delete(row)
+        db.commit()
+    finally:
+        db.close()
+    return {"success": True}
+
+
+@app.get("/public/blog")
+async def public_blog(request: Request):
+    """Public, unauthenticated, rate-limited — powers the blog list page on sohscape.com. Only active=true posts."""
+    ip = _client_ip(request)
+    if not _rate_limit_allow(f"public-blog:{ip}", 30):
+        return JSONResponse(
+            {"error": "Too many requests"}, status_code=429,
+            headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+        )
+    db = SessionLocal()
+    try:
+        rows = (db.query(WebsiteBlogPostModel)
+                .filter(WebsiteBlogPostModel.active == True)  # noqa: E712
+                .order_by(WebsiteBlogPostModel.published_date.desc(), WebsiteBlogPostModel.id.desc())
+                .all())
+        items = [{"id": r.id, "title": r.title, "excerpt": r.excerpt,
+                  "cover_image_url": r.cover_image_url, "author": r.author,
+                  "published_date": r.published_date} for r in rows]
+    finally:
+        db.close()
+    return JSONResponse({"items": items}, headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN})
+
+
+@app.get("/public/blog/{post_id}")
+async def public_blog_detail(post_id: int, request: Request):
+    """Public, unauthenticated, rate-limited — single post detail (includes full content), for a blog detail page."""
+    ip = _client_ip(request)
+    if not _rate_limit_allow(f"public-blog-detail:{ip}", 30):
+        return JSONResponse(
+            {"error": "Too many requests"}, status_code=429,
+            headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+        )
+    db = SessionLocal()
+    try:
+        row = (db.query(WebsiteBlogPostModel)
+               .filter(WebsiteBlogPostModel.id == post_id, WebsiteBlogPostModel.active == True)  # noqa: E712
+               .first())
+    finally:
+        db.close()
+    if not row:
+        return JSONResponse(
+            {"error": "Not found"}, status_code=404,
+            headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+        )
+    item = {"id": row.id, "title": row.title, "excerpt": row.excerpt, "content": row.content,
+            "cover_image_url": row.cover_image_url, "author": row.author, "published_date": row.published_date}
+    return JSONResponse({"item": item}, headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN})
 
 
 @app.get("/admin-panel/website-admin.html")
