@@ -9540,7 +9540,10 @@ def _build_deep_audit_result(raw: dict, start: str, end: str) -> dict:
         dev_list     = sorted(dev_by_camp.get(cid, []), key=lambda x: x["impressions"], reverse=True)
 
         hour_list    = sorted(hour_by_camp.get(cid, {}).values(), key=lambda x: x["hour"])
-        dow_list     = [dow_by_camp.get(cid, {})[d] for d in _DOW_ORDER]
+        # Use dow_by_camp[cid] (not .get) so the defaultdict factory runs for
+        # campaigns that have no dow_rows — it pre-fills all 7 days with zeros.
+        # dow_by_camp.get(cid, {}) would return {}, making {}["MONDAY"] → KeyError.
+        dow_list     = [dow_by_camp[cid][d] for d in _DOW_ORDER]
 
         search_list  = list(search_agg.get(cid, {}).values())
         top_search   = sorted(search_list, key=lambda x: x["clicks"], reverse=True)[:20]
