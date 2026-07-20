@@ -9330,14 +9330,18 @@ def _deep_audit_fetch_sync(client_, customer_id: str, start: str, end: str,
         {cid_clause}
     """)
 
+    # location_view gives per-targeted-location rows (city/region level when
+    # campaign targets specific cities), whereas geographic_view only gives
+    # country-level data via country_criterion_id.
     geo_rows    = _q(f"""
         SELECT campaign.id,
-               geographic_view.country_criterion_id,
-               geographic_view.location_type,
+               campaign_criterion.criterion_id,
+               campaign_criterion.negative,
                metrics.impressions, metrics.clicks,
                metrics.cost_micros, metrics.conversions
-        FROM geographic_view
+        FROM location_view
         WHERE segments.date BETWEEN '{start}' AND '{end}'
+        AND campaign_criterion.negative = FALSE
         {cid_clause}
     """)
 
@@ -9376,24 +9380,28 @@ def _deep_audit_fetch_sync(client_, customer_id: str, start: str, end: str,
         {cid_clause}
     """)
 
+    # age_range_view / gender_view return actual demographic delivery data
+    # for Display/Demand-Gen campaigns. FROM campaign + segments.age_range
+    # only returns rows when explicit bid adjustments exist, so it misses
+    # Display campaigns that don't have manual age range bids set.
     age_rows    = _q(f"""
-        SELECT campaign.id, segments.age_range,
+        SELECT campaign.id, ad_group_criterion.age_range.type,
                metrics.impressions, metrics.clicks, metrics.cost_micros
-        FROM campaign
+        FROM age_range_view
         WHERE segments.date BETWEEN '{start}' AND '{end}'
         {cid_clause}
     """)
 
     gender_rows = _q(f"""
-        SELECT campaign.id, segments.gender,
+        SELECT campaign.id, ad_group_criterion.gender.type,
                metrics.impressions, metrics.clicks, metrics.cost_micros
-        FROM campaign
+        FROM gender_view
         WHERE segments.date BETWEEN '{start}' AND '{end}'
         {cid_clause}
     """)
 
     # Resolve geo-target-constant IDs → human names in one batch lookup
-    geo_ids = sorted({str(r.geographic_view.country_criterion_id)
+    geo_ids = sorted({str(r.campaign_criterion.criterion_id)
                       for r in geo_rows if r.metrics.impressions > 0})
     geo_names: dict = {}
     if geo_ids:
@@ -9442,8 +9450,10 @@ def _build_deep_audit_result(raw: dict, start: str, end: str) -> dict:
     for r in raw["geo_rows"]:
         if r.metrics.impressions == 0 and r.metrics.clicks == 0:
             continue
+        if r.campaign_criterion.negative:  # skip exclusions (belt-and-suspenders)
+            continue
         cid    = str(r.campaign.id)
-        geo_id = str(r.geographic_view.country_criterion_id)
+        geo_id = str(r.campaign_criterion.criterion_id)
         info   = raw["geo_names"].get(geo_id, {"name": geo_id, "type": ""})
         geo_by_camp[cid].append({
             "location_name": info.get("name", geo_id),
@@ -9505,7 +9515,7 @@ def _build_deep_audit_result(raw: dict, start: str, end: str) -> dict:
     age_agg: dict = defaultdict(lambda: defaultdict(lambda: {"age_range": "", "impressions": 0, "clicks": 0, "cost": 0.0}))
     for r in raw["age_rows"]:
         cid = str(r.campaign.id)
-        age = r.segments.age_range.name
+        age = r.ad_group_criterion.age_range.type.name
         age_agg[cid][age]["age_range"]   = age
         age_agg[cid][age]["impressions"] += r.metrics.impressions
         age_agg[cid][age]["clicks"]      += r.metrics.clicks
@@ -9515,8 +9525,8 @@ def _build_deep_audit_result(raw: dict, start: str, end: str) -> dict:
     gender_agg: dict = defaultdict(lambda: defaultdict(lambda: {"gender": "", "impressions": 0, "clicks": 0, "cost": 0.0}))
     for r in raw["gender_rows"]:
         cid = str(r.campaign.id)
-        gen = r.segments.gender.name
-        gender_agg[cid][gen]["gender"]     = gen
+        gen = r.ad_group_criterion.gender.type.name
+        gender_agg[cid][gen]["gender"]      = gen
         gender_agg[cid][gen]["impressions"] += r.metrics.impressions
         gender_agg[cid][gen]["clicks"]      += r.metrics.clicks
         gender_agg[cid][gen]["cost"]        += r.metrics.cost_micros / 1_000_000
