@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sohscape Website Admin</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #FAFAFA;
+    color: #171717;
+    font-family: "Geist", -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+  }
+  header {
+    padding: 20px 28px;
+    background: #fff;
+    border-bottom: 1px solid #EAEAEA;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header h1 span { color: #D4AF37; }
+  #keyStatus { font-size: 12px; color: #666; }
+  #keyStatus button { margin-left: 10px; background: none; border: none; color: #999; text-decoration: underline; cursor: pointer; font-size: 12px; }
+
+  main { max-width: 1040px; margin: 0 auto; padding: 28px; }
+
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+  .tab-btn {
+    padding: 8px 18px; border-radius: 8px; border: 1px solid #E5E5E5;
+    background: transparent; color: #666; font-size: 14px; cursor: pointer;
+  }
+  .tab-btn.active { background: #171717; color: #fff; border-color: #171717; }
+
+  .card {
+    background: #fff; border: 1px solid #EAEAEA; border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06); padding: 20px; margin-bottom: 16px;
+  }
+  .card h3 { margin: 0 0 4px 0; font-size: 15px; color: #D4AF37; text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; margin-top: 16px; }
+  .item-card { background: #F9F9F9; border: 1px solid #E5E5E5; border-radius: 8px; overflow: hidden; }
+  .item-card img { width: 100%; height: 140px; object-fit: cover; display: block; background: #EAEAEA; }
+  .item-card .item-body { padding: 12px; }
+  .item-card .item-title { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+  .item-card .item-meta { font-size: 12px; color: #999; margin-bottom: 10px; }
+  .item-card .item-actions { display: flex; gap: 8px; }
+
+  button.primary {
+    background: #171717; color: #fff; border: none; border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; cursor: pointer;
+  }
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary {
+    background: transparent; color: #666; border: 1px solid #E5E5E5; border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; cursor: pointer;
+  }
+  button.danger { color: #BE123C; border-color: #FECDD3; background: #FFF1F2; }
+  button.small { padding: 5px 10px; font-size: 12px; }
+
+  label { display: block; font-size: 12px; color: #999; margin: 12px 0 4px; }
+  input[type=text], input[type=number], textarea {
+    width: 100%; background: #FAFAFA; border: 1px solid #E5E5E5; border-radius: 6px;
+    padding: 9px 12px; font-size: 14px; color: #171717; font-family: inherit;
+  }
+  textarea { min-height: 70px; resize: vertical; }
+
+  .upload-row { display: flex; align-items: center; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
+  .thumb-preview {
+    width: 88px; height: 88px; border-radius: 6px; background: #F2F2F2 center/cover no-repeat;
+    border: 1px solid #E5E5E5; flex-shrink: 0;
+  }
+  .progress-track { flex: 1; min-width: 140px; height: 8px; background: #EAEAEA; border-radius: 4px; overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: #D4AF37; transition: width 0.15s ease; }
+  .upload-status { font-size: 12px; color: #666; }
+  .upload-status.error { color: #BE123C; }
+  .upload-status.ok { color: #22C55E; }
+
+  .form-actions { display: flex; gap: 10px; margin-top: 18px; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  .checkbox-row input { width: auto; }
+
+  #keyGate {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+    display: flex; align-items: center; justify-content: center; z-index: 50;
+  }
+  #keyGate .box { background: #fff; border-radius: 10px; padding: 28px; width: 340px; box-shadow: 0 8px 30px rgba(0,0,0,0.15); }
+  #keyGate .box h2 { margin: 0 0 6px; font-size: 16px; }
+  #keyGate .box p { margin: 0 0 16px; font-size: 13px; color: #666; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="keyGate">
+  <div class="box">
+    <h2>Sohscape Website Admin</h2>
+    <p>Enter the admin API key to continue. It's stored only in this browser.</p>
+    <input type="text" id="keyInput" placeholder="ADSOH_API_KEY">
+    <div class="form-actions">
+      <button class="primary" onclick="saveKey()">Continue</button>
+    </div>
+  </div>
+</div>
+
+<header>
+  <h1>Sohscape <span>Website Admin</span></h1>
+  <div id="keyStatus"></div>
+</header>
+
+<main>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="portfolio" onclick="switchTab('portfolio')">Portfolio</button>
+    <button class="tab-btn" data-tab="testimonials" onclick="switchTab('testimonials')">Testimonials</button>
+  </div>
+
+  <!-- PORTFOLIO TAB -->
+  <section id="tab-portfolio">
+    <div class="card">
+      <h3 id="portfolioFormTitle">Add Portfolio Item</h3>
+      <input type="hidden" id="pf_id">
+      <label>Title</label>
+      <input type="text" id="pf_title" placeholder="e.g. Nanu Di Haveli">
+      <label>Category</label>
+      <input type="text" id="pf_category" placeholder="e.g. Hospitality">
+      <label>Description (real work performed)</label>
+      <textarea id="pf_description" placeholder="e.g. Social media management, content creation, and ad campaigns"></textarea>
+      <label>Display order</label>
+      <input type="number" id="pf_display_order" value="0">
+
+      <label>Image</label>
+      <div class="upload-row">
+        <div class="thumb-preview" id="pf_thumb"></div>
+        <div style="flex:1; min-width:200px;">
+          <input type="file" id="pf_file" accept="image/*" onchange="onFilePicked('pf')">
+          <div class="upload-row" style="margin-top:8px;">
+            <div class="progress-track"><div class="progress-fill" id="pf_progress"></div></div>
+            <button class="secondary small" id="pf_uploadBtn" onclick="doUpload('pf')" disabled>Upload</button>
+          </div>
+          <div class="upload-status" id="pf_status"></div>
+        </div>
+      </div>
+      <input type="hidden" id="pf_image_url">
+
+      <div class="form-actions">
+        <button class="primary" onclick="savePortfolioItem()">Save</button>
+        <button class="secondary" onclick="resetPortfolioForm()">Clear</button>
+      </div>
+    </div>
+
+    <div class="grid" id="portfolioGrid"></div>
+  </section>
+
+  <!-- TESTIMONIALS TAB -->
+  <section id="tab-testimonials" class="hidden">
+    <div class="card">
+      <h3 id="tmFormTitle">Add Testimonial</h3>
+      <input type="hidden" id="tm_id">
+      <label>Client name</label>
+      <input type="text" id="tm_client_name" placeholder="e.g. Real client name">
+      <label>Position / business</label>
+      <input type="text" id="tm_position" placeholder="e.g. Owner, Nanu Di Haveli">
+      <label>Testimonial text</label>
+      <textarea id="tm_text" placeholder="Real client feedback (WhatsApp/email)"></textarea>
+
+      <label>Photo (optional)</label>
+      <div class="upload-row">
+        <div class="thumb-preview" id="tm_thumb"></div>
+        <div style="flex:1; min-width:200px;">
+          <input type="file" id="tm_file" accept="image/*" onchange="onFilePicked('tm')">
+          <div class="upload-row" style="margin-top:8px;">
+            <div class="progress-track"><div class="progress-fill" id="tm_progress"></div></div>
+            <button class="secondary small" id="tm_uploadBtn" onclick="doUpload('tm')" disabled>Upload</button>
+          </div>
+          <div class="upload-status" id="tm_status"></div>
+        </div>
+      </div>
+      <input type="hidden" id="tm_image_url">
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="tm_approved" checked>
+        <label style="margin:0;">Approved (visible on site)</label>
+      </div>
+
+      <div class="form-actions">
+        <button class="primary" onclick="saveTestimonial()">Save</button>
+        <button class="secondary" onclick="resetTestimonialForm()">Clear</button>
+      </div>
+    </div>
+
+    <div class="grid" id="testimonialsGrid"></div>
+  </section>
+</main>
+
+<script>
+const KEY_STORAGE = 'sohscape_admin_api_key';
+let selectedFile = { pf: null, tm: null };
+
+function apiKey() { return localStorage.getItem(KEY_STORAGE) || ''; }
+
+function saveKey() {
+  const v = document.getElementById('keyInput').value.trim();
+  if (!v) return;
+  localStorage.setItem(KEY_STORAGE, v);
+  document.getElementById('keyGate').classList.add('hidden');
+  renderKeyStatus();
+  loadAll();
+}
+
+function clearKey() {
+  localStorage.removeItem(KEY_STORAGE);
+  document.getElementById('keyGate').classList.remove('hidden');
+}
+
+function renderKeyStatus() {
+  const has = !!apiKey();
+  document.getElementById('keyStatus').innerHTML = has
+    ? 'Key set <button onclick="clearKey()">change</button>'
+    : '';
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.getElementById('tab-portfolio').classList.toggle('hidden', name !== 'portfolio');
+  document.getElementById('tab-testimonials').classList.toggle('hidden', name !== 'testimonials');
+}
+
+async function apiFetch(path, options = {}) {
+  options.headers = Object.assign({}, options.headers, { 'X-API-Key': apiKey() });
+  const res = await fetch(path, options);
+  if (res.status === 401) {
+    alert('Unauthorized — check your API key.');
+    clearKey();
+    throw new Error('unauthorized');
+  }
+  return res;
+}
+
+function onFilePicked(prefix) {
+  const fileInput = document.getElementById(prefix + '_file');
+  const file = fileInput.files[0];
+  selectedFile[prefix] = file || null;
+  document.getElementById(prefix + '_uploadBtn').disabled = !file;
+  const status = document.getElementById(prefix + '_status');
+  status.textContent = '';
+  status.className = 'upload-status';
+  if (file) {
+    const url = URL.createObjectURL(file);
+    document.getElementById(prefix + '_thumb').style.backgroundImage = `url(${url})`;
+  }
+}
+
+function doUpload(prefix) {
+  const file = selectedFile[prefix];
+  if (!file) return;
+  const progressFill = document.getElementById(prefix + '_progress');
+  const status = document.getElementById(prefix + '_status');
+  const uploadBtn = document.getElementById(prefix + '_uploadBtn');
+  uploadBtn.disabled = true;
+  status.className = 'upload-status';
+  status.textContent = 'Uploading...';
+  progressFill.style.width = '0%';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/admin/website/upload-image');
+  xhr.setRequestHeader('X-API-Key', apiKey());
+
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      progressFill.style.width = Math.round((e.loaded / e.total) * 100) + '%';
+    }
+  };
+
+  xhr.onload = () => {
+    uploadBtn.disabled = false;
+    let data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+    if (xhr.status >= 200 && xhr.status < 300 && data && data.success) {
+      document.getElementById(prefix + '_image_url').value = data.image_url;
+      document.getElementById(prefix + '_thumb').style.backgroundImage = `url(${data.image_url})`;
+      status.className = 'upload-status ok';
+      status.textContent = 'Uploaded — image_url filled in';
+      progressFill.style.width = '100%';
+    } else {
+      status.className = 'upload-status error';
+      status.textContent = (data && data.error) ? data.error : `Upload failed (${xhr.status})`;
+      progressFill.style.width = '0%';
+    }
+  };
+
+  xhr.onerror = () => {
+    uploadBtn.disabled = false;
+    status.className = 'upload-status error';
+    status.textContent = 'Network error during upload';
+    progressFill.style.width = '0%';
+  };
+
+  xhr.send(form);
+}
+
+// ---- Portfolio ----
+
+function resetPortfolioForm() {
+  document.getElementById('pf_id').value = '';
+  document.getElementById('pf_title').value = '';
+  document.getElementById('pf_category').value = '';
+  document.getElementById('pf_description').value = '';
+  document.getElementById('pf_display_order').value = 0;
+  document.getElementById('pf_image_url').value = '';
+  document.getElementById('pf_thumb').style.backgroundImage = '';
+  document.getElementById('pf_file').value = '';
+  document.getElementById('pf_status').textContent = '';
+  document.getElementById('pf_uploadBtn').disabled = true;
+  document.getElementById('pf_progress').style.width = '0%';
+  document.getElementById('portfolioFormTitle').textContent = 'Add Portfolio Item';
+  selectedFile.pf = null;
+}
+
+function editPortfolioItem(item) {
+  document.getElementById('pf_id').value = item.id;
+  document.getElementById('pf_title').value = item.title || '';
+  document.getElementById('pf_category').value = item.category || '';
+  document.getElementById('pf_description').value = item.description || '';
+  document.getElementById('pf_display_order').value = item.display_order || 0;
+  document.getElementById('pf_image_url').value = item.image_url || '';
+  document.getElementById('pf_thumb').style.backgroundImage = item.image_url ? `url(${item.image_url})` : '';
+  document.getElementById('portfolioFormTitle').textContent = 'Edit Portfolio Item — replace image below if needed';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function savePortfolioItem() {
+  const id = document.getElementById('pf_id').value;
+  const payload = {
+    title: document.getElementById('pf_title').value,
+    category: document.getElementById('pf_category').value,
+    description: document.getElementById('pf_description').value,
+    image_url: document.getElementById('pf_image_url').value,
+    display_order: parseInt(document.getElementById('pf_display_order').value || '0', 10),
+  };
+  const res = await apiFetch(id ? `/admin/website/portfolio/${id}` : '/admin/website/portfolio', {
+    method: id ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.success) {
+    resetPortfolioForm();
+    loadPortfolio();
+  } else {
+    alert(data.error || 'Save failed');
+  }
+}
+
+async function deletePortfolioItem(id) {
+  if (!confirm('Delete this portfolio item?')) return;
+  const res = await apiFetch(`/admin/website/portfolio/${id}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (data.success) loadPortfolio();
+  else alert(data.error || 'Delete failed');
+}
+
+let portfolioItems = [];
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+async function loadPortfolio() {
+  const res = await apiFetch('/admin/website/portfolio');
+  const data = await res.json();
+  portfolioItems = data.items || [];
+  const grid = document.getElementById('portfolioGrid');
+  grid.innerHTML = '';
+  portfolioItems.forEach(item => {
+    const el = document.createElement('div');
+    el.className = 'item-card';
+    el.innerHTML = `
+      <img src="${escapeHtml(item.image_url)}" onerror="this.style.opacity=0.3" alt="${escapeHtml(item.title)}">
+      <div class="item-body">
+        <div class="item-title">${escapeHtml(item.title) || '(untitled)'}</div>
+        <div class="item-meta">${escapeHtml(item.category)}</div>
+        <div class="item-actions">
+          <button class="secondary small" onclick="editPortfolioItemById(${item.id})">Edit</button>
+          <button class="danger small" onclick="deletePortfolioItem(${item.id})">Delete</button>
+        </div>
+      </div>`;
+    grid.appendChild(el);
+  });
+}
+
+function editPortfolioItemById(id) {
+  const item = portfolioItems.find(i => i.id === id);
+  if (item) editPortfolioItem(item);
+}
+
+// ---- Testimonials ----
+
+function resetTestimonialForm() {
+  document.getElementById('tm_id').value = '';
+  document.getElementById('tm_client_name').value = '';
+  document.getElementById('tm_position').value = '';
+  document.getElementById('tm_text').value = '';
+  document.getElementById('tm_image_url').value = '';
+  document.getElementById('tm_thumb').style.backgroundImage = '';
+  document.getElementById('tm_file').value = '';
+  document.getElementById('tm_status').textContent = '';
+  document.getElementById('tm_uploadBtn').disabled = true;
+  document.getElementById('tm_progress').style.width = '0%';
+  document.getElementById('tm_approved').checked = true;
+  document.getElementById('tmFormTitle').textContent = 'Add Testimonial';
+  selectedFile.tm = null;
+}
+
+function editTestimonial(item) {
+  document.getElementById('tm_id').value = item.id;
+  document.getElementById('tm_client_name').value = item.client_name || '';
+  document.getElementById('tm_position').value = item.position || '';
+  document.getElementById('tm_text').value = item.text || '';
+  document.getElementById('tm_image_url').value = item.image_url || '';
+  document.getElementById('tm_thumb').style.backgroundImage = item.image_url ? `url(${item.image_url})` : '';
+  document.getElementById('tm_approved').checked = !!item.approved;
+  document.getElementById('tmFormTitle').textContent = 'Edit Testimonial — replace photo below if needed';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function saveTestimonial() {
+  const id = document.getElementById('tm_id').value;
+  const payload = {
+    client_name: document.getElementById('tm_client_name').value,
+    position: document.getElementById('tm_position').value,
+    text: document.getElementById('tm_text').value,
+    image_url: document.getElementById('tm_image_url').value,
+    approved: document.getElementById('tm_approved').checked,
+  };
+  const res = await apiFetch(id ? `/admin/website/testimonials/${id}` : '/admin/website/testimonials', {
+    method: id ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.success) {
+    resetTestimonialForm();
+    loadTestimonials();
+  } else {
+    alert(data.error || 'Save failed');
+  }
+}
+
+async function deleteTestimonial(id) {
+  if (!confirm('Delete this testimonial?')) return;
+  const res = await apiFetch(`/admin/website/testimonials/${id}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (data.success) loadTestimonials();
+  else alert(data.error || 'Delete failed');
+}
+
+let testimonialItems = [];
+
+async function loadTestimonials() {
+  const res = await apiFetch('/admin/website/testimonials');
+  const data = await res.json();
+  testimonialItems = data.items || [];
+  const grid = document.getElementById('testimonialsGrid');
+  grid.innerHTML = '';
+  testimonialItems.forEach(item => {
+    const el = document.createElement('div');
+    el.className = 'item-card';
+    el.innerHTML = `
+      <img src="${escapeHtml(item.image_url)}" onerror="this.style.opacity=0.3" alt="${escapeHtml(item.client_name)}">
+      <div class="item-body">
+        <div class="item-title">${escapeHtml(item.client_name) || '(unnamed)'}</div>
+        <div class="item-meta">${escapeHtml(item.position)} ${item.approved ? '' : '&middot; not approved'}</div>
+        <div class="item-actions">
+          <button class="secondary small" onclick="editTestimonialById(${item.id})">Edit</button>
+          <button class="danger small" onclick="deleteTestimonial(${item.id})">Delete</button>
+        </div>
+      </div>`;
+    grid.appendChild(el);
+  });
+}
+
+function editTestimonialById(id) {
+  const item = testimonialItems.find(i => i.id === id);
+  if (item) editTestimonial(item);
+}
+
+function loadAll() {
+  loadPortfolio();
+  loadTestimonials();
+}
+
+// ---- init ----
+renderKeyStatus();
+if (apiKey()) {
+  document.getElementById('keyGate').classList.add('hidden');
+  loadAll();
+}
+</script>
+</body>
+</html>

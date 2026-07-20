@@ -1,7 +1,9 @@
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Depends, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
+from PIL import Image
+import io
 from openai import OpenAI
 import httpx
 from datetime import datetime, date, timedelta
@@ -103,6 +105,8 @@ _PUBLIC_PATHS = {
     "/google/callback",  # browser redirect from Google — no auth header; state HMAC is the security
     "/meta/callback",    # browser redirect from Meta — same reason
     "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
+    "/public/portfolio",              # public website widget — no auth, rate-limited instead
+    "/admin-panel/website-admin.html",  # static admin UI shell — no secrets embedded, page itself needs no auth
 }
 
 # Service/automation endpoints (e.g. n8n) that authenticate with X-API-Key only —
@@ -111,6 +115,12 @@ _PUBLIC_PATHS = {
 _API_KEY_ONLY_PATHS = {
     "/admin/weekly-market-insight/create",
 }
+# Same idea, but for a whole path family (dynamic /{id} segments) — the
+# website-admin.html panel authenticates with X-API-Key only, entered once
+# by Krish and stored in the browser, never a Supabase user session.
+_API_KEY_ONLY_PREFIXES = (
+    "/admin/website/",
+)
 
 # Simple in-memory per-IP rate limiter for public, unauthenticated endpoints.
 # Not distributed (fine for a single Render instance) — resets on deploy/restart.
@@ -165,7 +175,10 @@ async def auth_middleware(request: Request, call_next):
     # 2. JWT → user_id
     user_id = ""
     _jwt_secret = os.getenv("SUPABASE_JWT_SECRET", "")
-    _skip_jwt = _api_key_verified and _norm_path in _API_KEY_ONLY_PATHS
+    _skip_jwt = _api_key_verified and (
+        _norm_path in _API_KEY_ONLY_PATHS
+        or _norm_path.startswith(_API_KEY_ONLY_PREFIXES)
+    )
     if _jwt_secret and not _is_public and not _skip_jwt:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -227,6 +240,14 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+
+# Supabase Storage (website image uploads). Both must be set for uploads to work —
+# SUPABASE_URL is the project URL (https://xxxx.supabase.co), the key must be the
+# service_role key (not anon) since uploads bypass RLS via the Storage REST API.
+SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_STORAGE_BUCKET = "website-images"
+
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1)
@@ -284,17 +305,104 @@ class WeeklyMarketInsightModel(Base):
     approved = Column(Boolean, default=False)
     created_at = Column(String(100))
 
+class PortfolioItemModel(Base):
+    __tablename__ = "portfolio_items"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255))
+    category = Column(String(255))
+    description = Column(Text)
+    image_url = Column(Text)
+    display_order = Column(Integer, default=0)
+    created_at = Column(String(100))
+    updated_at = Column(String(100))
+
+class TestimonialModel(Base):
+    __tablename__ = "testimonials"
+    id = Column(Integer, primary_key=True, index=True)
+    client_name = Column(String(255))
+    position = Column(String(255))
+    text = Column(Text)
+    image_url = Column(Text)
+    approved = Column(Boolean, default=True)
+    created_at = Column(String(100))
+    updated_at = Column(String(100))
+
 try:
     Base.metadata.create_all(bind=engine)
     logger.info("[DB] create_all succeeded")
 except Exception as _e:
     logger.error(f"[DB] create_all failed ({_e}). Falling back to per-table creation.")
-    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel]:
+    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel]:
         try:
             _model.__table__.create(bind=engine, checkfirst=True)
             logger.info(f"[DB] Created table: {_model.__tablename__}")
         except Exception as _te:
             logger.warning(f"[DB] Could not create table '{_model.__tablename__}': {_te}")
+
+# ── Supabase Storage (website image uploads) ─────────────────────────────────
+_ALLOWED_IMAGE_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5MB
+
+def _supabase_storage_configured() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+def _supabase_storage_headers(content_type: str = "application/json") -> dict:
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": content_type,
+    }
+
+def _ensure_supabase_bucket_sync():
+    """Create the storage bucket if it doesn't exist yet. Idempotent, blocking."""
+    with httpx.Client(timeout=15) as _c:
+        resp = _c.post(
+            f"{SUPABASE_URL}/storage/v1/bucket",
+            headers=_supabase_storage_headers(),
+            json={"id": SUPABASE_STORAGE_BUCKET, "name": SUPABASE_STORAGE_BUCKET, "public": True},
+        )
+    if resp.status_code in (200, 201):
+        logger.info(f"[STORAGE] Created bucket '{SUPABASE_STORAGE_BUCKET}'")
+    elif resp.status_code in (400, 409) and "exists" in resp.text.lower():
+        pass  # already exists — fine
+    else:
+        raise RuntimeError(f"Could not create bucket '{SUPABASE_STORAGE_BUCKET}' ({resp.status_code}): {resp.text[:300]}")
+
+def _supabase_storage_upload_sync(storage_path: str, content: bytes, content_type: str) -> str:
+    """Upload bytes to Supabase Storage and return the public URL. Blocking — call via asyncio.to_thread."""
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
+    headers = _supabase_storage_headers(content_type)
+    headers["x-upsert"] = "true"
+    with httpx.Client(timeout=30) as _c:
+        resp = _c.post(upload_url, headers=headers, content=content)
+    if resp.status_code not in (200, 201) and "bucket not found" in resp.text.lower():
+        # Supabase reports a missing bucket as HTTP 400 with statusCode "404"
+        # in the JSON body, not an actual HTTP 404 — check the body, not the status.
+        _ensure_supabase_bucket_sync()
+        with httpx.Client(timeout=30) as _c:
+            resp = _c.post(upload_url, headers=headers, content=content)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Supabase Storage upload failed ({resp.status_code}): {resp.text[:300]}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
+
+def _validate_and_normalize_image_sync(data: bytes) -> tuple[str, str]:
+    """
+    Verify `data` is a genuine JPEG/PNG/WEBP image (not just a spoofed
+    content-type). Returns (file_extension, mime_type). Raises ValueError
+    with a user-facing message on anything else. Blocking — call via
+    asyncio.to_thread.
+    """
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.verify()  # raises on corrupt/non-image data
+        fmt = img.format  # only reliable after verify(); re-open for further use if needed
+    except Exception:
+        raise ValueError("File is not a valid image")
+    if fmt not in _ALLOWED_IMAGE_FORMATS:
+        raise ValueError(f"Unsupported image format '{fmt}' — only JPG, PNG, WEBP are allowed")
+    ext = _ALLOWED_IMAGE_FORMATS[fmt]
+    mime = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}[fmt]
+    return ext, mime
 
 # Add user_id column to ORM tables that predate multi-tenant migration
 try:
@@ -17512,3 +17620,250 @@ async def create_weekly_market_insight(request: WeeklyMarketInsightCreateRequest
         db.close()
 
     return {"success": True, "id": new_id}
+
+
+# ── Website CMS: portfolio + testimonials image upload ───────────────────────
+class PortfolioItemCreate(BaseModel):
+    title: str
+    category: str = ""
+    description: str = ""
+    image_url: str = ""
+    display_order: int = 0
+
+
+class PortfolioItemUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    display_order: Optional[int] = None
+
+
+class TestimonialCreate(BaseModel):
+    client_name: str
+    position: str = ""
+    text: str
+    image_url: str = ""
+    approved: bool = True
+
+
+class TestimonialUpdate(BaseModel):
+    client_name: Optional[str] = None
+    position: Optional[str] = None
+    text: Optional[str] = None
+    image_url: Optional[str] = None
+    approved: Optional[bool] = None
+
+
+@app.post("/admin/website/upload-image")
+async def upload_website_image(file: UploadFile = File(...)):
+    """
+    Generic image upload for the website-admin.html CMS — used for both
+    portfolio items and testimonials. Returns a public URL; the frontend
+    decides which entity's image_url field to attach it to.
+    """
+    if not _supabase_storage_configured():
+        return JSONResponse(
+            {"success": False, "error": "Supabase Storage not configured — set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the server"},
+            status_code=503,
+        )
+
+    data = await file.read()
+    if not data:
+        return JSONResponse({"success": False, "error": "Empty file"}, status_code=400)
+    if len(data) > _MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {"success": False, "error": f"File too large — max {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB"},
+            status_code=400,
+        )
+
+    try:
+        ext, mime = await asyncio.to_thread(_validate_and_normalize_image_sync, data)
+    except ValueError as ve:
+        return JSONResponse({"success": False, "error": str(ve)}, status_code=400)
+
+    # Filename is fully server-generated (uuid) — the original filename is
+    # never used for the storage path, so there's nothing to sanitize/escape.
+    storage_path = f"uploads/{uuid.uuid4().hex}{ext}"
+    try:
+        image_url = await asyncio.to_thread(_supabase_storage_upload_sync, storage_path, data, mime)
+    except Exception as e:
+        logger.error(f"[UPLOAD] Supabase Storage upload failed: {e}")
+        return JSONResponse({"success": False, "error": "Upload to storage failed"}, status_code=502)
+
+    return {"success": True, "image_url": image_url}
+
+
+def _portfolio_item_dict(r: PortfolioItemModel) -> dict:
+    return {
+        "id": r.id, "title": r.title, "category": r.category,
+        "description": r.description, "image_url": r.image_url,
+        "display_order": r.display_order,
+    }
+
+
+@app.get("/admin/website/portfolio")
+async def list_portfolio_items():
+    db = SessionLocal()
+    try:
+        rows = (db.query(PortfolioItemModel)
+                .order_by(PortfolioItemModel.display_order.asc(), PortfolioItemModel.id.desc())
+                .all())
+        items = [_portfolio_item_dict(r) for r in rows]
+    finally:
+        db.close()
+    return {"success": True, "items": items}
+
+
+@app.post("/admin/website/portfolio")
+async def create_portfolio_item(request: PortfolioItemCreate):
+    db = SessionLocal()
+    try:
+        now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        row = PortfolioItemModel(
+            title=request.title.strip(),
+            category=request.category.strip(),
+            description=request.description.strip(),
+            image_url=request.image_url.strip(),
+            display_order=request.display_order,
+            created_at=now, updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        item = _portfolio_item_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.put("/admin/website/portfolio/{item_id}")
+async def update_portfolio_item(item_id: int, request: PortfolioItemUpdate):
+    db = SessionLocal()
+    try:
+        row = db.query(PortfolioItemModel).filter(PortfolioItemModel.id == item_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        updates = request.model_dump(exclude_unset=True)
+        for field, val in updates.items():
+            setattr(row, field, val.strip() if isinstance(val, str) else val)
+        row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        db.commit()
+        db.refresh(row)
+        item = _portfolio_item_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.delete("/admin/website/portfolio/{item_id}")
+async def delete_portfolio_item(item_id: int):
+    db = SessionLocal()
+    try:
+        row = db.query(PortfolioItemModel).filter(PortfolioItemModel.id == item_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        db.delete(row)
+        db.commit()
+    finally:
+        db.close()
+    return {"success": True}
+
+
+@app.get("/public/portfolio")
+async def public_portfolio(request: Request):
+    """Public, unauthenticated, rate-limited — powers the live portfolio page on sohscape.com."""
+    ip = _client_ip(request)
+    if not _rate_limit_allow(f"public-portfolio:{ip}", 30):
+        return JSONResponse(
+            {"error": "Too many requests"}, status_code=429,
+            headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+        )
+    db = SessionLocal()
+    try:
+        rows = (db.query(PortfolioItemModel)
+                .order_by(PortfolioItemModel.display_order.asc(), PortfolioItemModel.id.desc())
+                .all())
+        items = [{"title": r.title, "category": r.category,
+                  "description": r.description, "image_url": r.image_url} for r in rows]
+    finally:
+        db.close()
+    return JSONResponse({"items": items}, headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN})
+
+
+def _testimonial_dict(r: TestimonialModel) -> dict:
+    return {
+        "id": r.id, "client_name": r.client_name, "position": r.position,
+        "text": r.text, "image_url": r.image_url, "approved": r.approved,
+    }
+
+
+@app.get("/admin/website/testimonials")
+async def list_testimonials():
+    db = SessionLocal()
+    try:
+        rows = db.query(TestimonialModel).order_by(TestimonialModel.id.desc()).all()
+        items = [_testimonial_dict(r) for r in rows]
+    finally:
+        db.close()
+    return {"success": True, "items": items}
+
+
+@app.post("/admin/website/testimonials")
+async def create_testimonial(request: TestimonialCreate):
+    db = SessionLocal()
+    try:
+        now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        row = TestimonialModel(
+            client_name=request.client_name.strip(),
+            position=request.position.strip(),
+            text=request.text.strip(),
+            image_url=request.image_url.strip(),
+            approved=request.approved,
+            created_at=now, updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        item = _testimonial_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.put("/admin/website/testimonials/{item_id}")
+async def update_testimonial(item_id: int, request: TestimonialUpdate):
+    db = SessionLocal()
+    try:
+        row = db.query(TestimonialModel).filter(TestimonialModel.id == item_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        updates = request.model_dump(exclude_unset=True)
+        for field, val in updates.items():
+            setattr(row, field, val.strip() if isinstance(val, str) else val)
+        row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        db.commit()
+        db.refresh(row)
+        item = _testimonial_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.delete("/admin/website/testimonials/{item_id}")
+async def delete_testimonial(item_id: int):
+    db = SessionLocal()
+    try:
+        row = db.query(TestimonialModel).filter(TestimonialModel.id == item_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        db.delete(row)
+        db.commit()
+    finally:
+        db.close()
+    return {"success": True}
+
+
+@app.get("/admin-panel/website-admin.html")
+async def serve_website_admin_panel():
+    return FileResponse("static/website-admin.html")

@@ -27,3 +27,5 @@ cryptography==43.0.3
 google-auth-oauthlib==1.2.1
 facebook-business==25.0.2
 PyJWT==2.10.1
+python-multipart==0.0.32
+Pillow==12.3.0
