@@ -9296,6 +9296,401 @@ async def gads_create_ad(request: CreateAdRequest):
         return {"success": False, "error": str(_e), "traceback": tb}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DEEP AUDIT — per-campaign geographic / device / time / search-term / audience
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DeepAuditRequest(BaseModel):
+    date_range_days: int = 30
+    campaign_id:     str = ""   # empty = all campaigns in account
+
+
+def _deep_audit_fetch_sync(client_, customer_id: str, start: str, end: str,
+                            campaign_id_filter: str = "") -> dict:
+    """Run 8 GAQL queries and return raw proto lists. All queries fetch every
+    campaign at once; filtering by campaign_id is done client-side so we can
+    support both single-campaign and all-campaigns modes with one code path."""
+    svc = client_.get_service("GoogleAdsService")
+    cid_clause = f"AND campaign.id = {campaign_id_filter}" if campaign_id_filter.strip() else ""
+
+    def _q(query: str) -> list:
+        try:
+            return list(svc.search(customer_id=customer_id, query=query))
+        except Exception as _qe:
+            logger.warning(f"[DEEP-AUDIT] Query failed: {_qe} | {query[:120]}")
+            return []
+
+    camp_rows   = _q(f"""
+        SELECT campaign.id, campaign.name, campaign.status,
+               campaign.advertising_channel_type,
+               metrics.impressions, metrics.clicks,
+               metrics.cost_micros, metrics.conversions
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    geo_rows    = _q(f"""
+        SELECT campaign.id,
+               geographic_view.country_criterion_id,
+               geographic_view.location_type,
+               metrics.impressions, metrics.clicks,
+               metrics.cost_micros, metrics.conversions
+        FROM geographic_view
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    dev_rows    = _q(f"""
+        SELECT campaign.id, segments.device,
+               metrics.impressions, metrics.clicks,
+               metrics.cost_micros, metrics.conversions
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    hour_rows   = _q(f"""
+        SELECT campaign.id, segments.hour_of_day,
+               metrics.impressions, metrics.clicks, metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    dow_rows    = _q(f"""
+        SELECT campaign.id, segments.day_of_week,
+               metrics.impressions, metrics.clicks, metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    search_rows = _q(f"""
+        SELECT campaign.id,
+               search_term_view.search_term,
+               metrics.impressions, metrics.clicks,
+               metrics.cost_micros, metrics.conversions
+        FROM search_term_view
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    age_rows    = _q(f"""
+        SELECT campaign.id, segments.age_range,
+               metrics.impressions, metrics.clicks, metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    gender_rows = _q(f"""
+        SELECT campaign.id, segments.gender,
+               metrics.impressions, metrics.clicks, metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{start}' AND '{end}'
+        {cid_clause}
+    """)
+
+    # Resolve geo-target-constant IDs → human names in one batch lookup
+    geo_ids = sorted({str(r.geographic_view.country_criterion_id)
+                      for r in geo_rows if r.metrics.impressions > 0})
+    geo_names: dict = {}
+    if geo_ids:
+        try:
+            for r in svc.search(customer_id=customer_id, query=(
+                "SELECT geo_target_constant.id, geo_target_constant.name, "
+                "geo_target_constant.target_type "
+                f"FROM geo_target_constant "
+                f"WHERE geo_target_constant.id IN ({', '.join(geo_ids)})"
+            )):
+                geo_names[str(r.geo_target_constant.id)] = {
+                    "name": r.geo_target_constant.name,
+                    "type": r.geo_target_constant.target_type,
+                }
+        except Exception as _gne:
+            logger.warning(f"[DEEP-AUDIT] Geo name lookup failed: {_gne}")
+
+    return dict(camp_rows=camp_rows, geo_rows=geo_rows, dev_rows=dev_rows,
+                hour_rows=hour_rows, dow_rows=dow_rows, search_rows=search_rows,
+                age_rows=age_rows, gender_rows=gender_rows, geo_names=geo_names)
+
+
+def _build_deep_audit_result(raw: dict, start: str, end: str) -> dict:
+    from collections import defaultdict
+
+    # ── Campaign summaries ────────────────────────────────────────────────────
+    camps: dict = {}
+    for r in raw["camp_rows"]:
+        cid = str(r.campaign.id)
+        if cid not in camps:
+            camps[cid] = {
+                "campaign_id":     cid,
+                "campaign_name":   r.campaign.name,
+                "campaign_status": r.campaign.status.name,
+                "campaign_type":   r.campaign.advertising_channel_type.name,
+                "total_impressions": 0, "total_clicks": 0,
+                "total_cost": 0.0,     "total_conversions": 0.0,
+            }
+        camps[cid]["total_impressions"] += r.metrics.impressions
+        camps[cid]["total_clicks"]      += r.metrics.clicks
+        camps[cid]["total_cost"]        += r.metrics.cost_micros / 1_000_000
+        camps[cid]["total_conversions"] += r.metrics.conversions
+
+    # ── Geographic ────────────────────────────────────────────────────────────
+    geo_by_camp: dict = defaultdict(list)
+    for r in raw["geo_rows"]:
+        if r.metrics.impressions == 0 and r.metrics.clicks == 0:
+            continue
+        cid    = str(r.campaign.id)
+        geo_id = str(r.geographic_view.country_criterion_id)
+        info   = raw["geo_names"].get(geo_id, {"name": geo_id, "type": ""})
+        geo_by_camp[cid].append({
+            "location_name": info.get("name", geo_id),
+            "location_type": info.get("type", ""),
+            "impressions":   r.metrics.impressions,
+            "clicks":        r.metrics.clicks,
+            "cost":          round(r.metrics.cost_micros / 1_000_000, 2),
+            "conversions":   r.metrics.conversions,
+            "ctr":           round(r.metrics.clicks / r.metrics.impressions * 100, 2) if r.metrics.impressions else 0,
+        })
+
+    # ── Device ────────────────────────────────────────────────────────────────
+    dev_by_camp: dict = defaultdict(list)
+    for r in raw["dev_rows"]:
+        if r.metrics.impressions == 0 and r.metrics.clicks == 0:
+            continue
+        dev_by_camp[str(r.campaign.id)].append({
+            "device":      r.segments.device.name,
+            "impressions": r.metrics.impressions,
+            "clicks":      r.metrics.clicks,
+            "cost":        round(r.metrics.cost_micros / 1_000_000, 2),
+            "conversions": r.metrics.conversions,
+            "ctr":         round(r.metrics.clicks / r.metrics.impressions * 100, 2) if r.metrics.impressions else 0,
+        })
+
+    # ── Hour of day ───────────────────────────────────────────────────────────
+    hour_by_camp: dict = defaultdict(lambda: defaultdict(lambda: {"hour": 0, "impressions": 0, "clicks": 0, "cost": 0.0}))
+    for r in raw["hour_rows"]:
+        h   = r.segments.hour_of_day
+        cid = str(r.campaign.id)
+        hour_by_camp[cid][h]["hour"]        = h
+        hour_by_camp[cid][h]["impressions"] += r.metrics.impressions
+        hour_by_camp[cid][h]["clicks"]      += r.metrics.clicks
+        hour_by_camp[cid][h]["cost"]        += r.metrics.cost_micros / 1_000_000
+
+    # ── Day of week ───────────────────────────────────────────────────────────
+    _DOW_ORDER = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+    dow_by_camp: dict = defaultdict(lambda: {d: {"day": d, "impressions": 0, "clicks": 0, "cost": 0.0} for d in _DOW_ORDER})
+    for r in raw["dow_rows"]:
+        cid = str(r.campaign.id)
+        d   = r.segments.day_of_week.name
+        if d in dow_by_camp[cid]:
+            dow_by_camp[cid][d]["impressions"] += r.metrics.impressions
+            dow_by_camp[cid][d]["clicks"]      += r.metrics.clicks
+            dow_by_camp[cid][d]["cost"]        += r.metrics.cost_micros / 1_000_000
+
+    # ── Search terms ──────────────────────────────────────────────────────────
+    search_agg: dict = defaultdict(lambda: defaultdict(lambda: {"term": "", "impressions": 0, "clicks": 0, "cost": 0.0, "conversions": 0.0}))
+    for r in raw["search_rows"]:
+        cid  = str(r.campaign.id)
+        term = r.search_term_view.search_term
+        search_agg[cid][term]["term"]        = term
+        search_agg[cid][term]["impressions"] += r.metrics.impressions
+        search_agg[cid][term]["clicks"]      += r.metrics.clicks
+        search_agg[cid][term]["cost"]        += r.metrics.cost_micros / 1_000_000
+        search_agg[cid][term]["conversions"] += r.metrics.conversions
+
+    # ── Age range ─────────────────────────────────────────────────────────────
+    age_agg: dict = defaultdict(lambda: defaultdict(lambda: {"age_range": "", "impressions": 0, "clicks": 0, "cost": 0.0}))
+    for r in raw["age_rows"]:
+        cid = str(r.campaign.id)
+        age = r.segments.age_range.name
+        age_agg[cid][age]["age_range"]   = age
+        age_agg[cid][age]["impressions"] += r.metrics.impressions
+        age_agg[cid][age]["clicks"]      += r.metrics.clicks
+        age_agg[cid][age]["cost"]        += r.metrics.cost_micros / 1_000_000
+
+    # ── Gender ────────────────────────────────────────────────────────────────
+    gender_agg: dict = defaultdict(lambda: defaultdict(lambda: {"gender": "", "impressions": 0, "clicks": 0, "cost": 0.0}))
+    for r in raw["gender_rows"]:
+        cid = str(r.campaign.id)
+        gen = r.segments.gender.name
+        gender_agg[cid][gen]["gender"]     = gen
+        gender_agg[cid][gen]["impressions"] += r.metrics.impressions
+        gender_agg[cid][gen]["clicks"]      += r.metrics.clicks
+        gender_agg[cid][gen]["cost"]        += r.metrics.cost_micros / 1_000_000
+
+    # ── Assemble per-campaign result ──────────────────────────────────────────
+    result: list = []
+    for cid, camp in camps.items():
+        imp   = camp["total_impressions"]
+        clks  = camp["total_clicks"]
+        cost  = camp["total_cost"]
+        convs = camp["total_conversions"]
+        sufficient = imp >= 100 or clks >= 10 or cost >= 100
+        warnings   = [] if sufficient else [
+            f"Only {imp} impressions / {clks} clicks / ₹{cost:.0f} spend in this period — insufficient data for reliable insights."
+        ]
+
+        geo_list     = sorted(geo_by_camp.get(cid, []), key=lambda x: x["impressions"], reverse=True)
+        top_geo      = geo_list[:10]
+        worst_geo    = sorted([g for g in geo_list if g["impressions"] >= 10], key=lambda x: x["ctr"])[:5]
+
+        dev_list     = sorted(dev_by_camp.get(cid, []), key=lambda x: x["impressions"], reverse=True)
+
+        hour_list    = sorted(hour_by_camp.get(cid, {}).values(), key=lambda x: x["hour"])
+        dow_list     = [dow_by_camp.get(cid, {})[d] for d in _DOW_ORDER]
+
+        search_list  = list(search_agg.get(cid, {}).values())
+        top_search   = sorted(search_list, key=lambda x: x["clicks"], reverse=True)[:20]
+        wasted_search= sorted([s for s in search_list if s["conversions"] == 0 and s["clicks"] >= 3],
+                               key=lambda x: x["cost"], reverse=True)[:10]
+
+        age_list     = sorted(age_agg.get(cid, {}).values(),    key=lambda x: x["impressions"], reverse=True)
+        gender_list  = sorted(gender_agg.get(cid, {}).values(), key=lambda x: x["impressions"], reverse=True)
+
+        result.append({
+            **camp,
+            "total_cost":        round(cost, 2),
+            "total_conversions": round(convs, 2),
+            "ctr":  round(clks / imp * 100, 2) if imp else 0,
+            "cpa":  round(cost / convs, 2) if convs else None,
+            "data_sufficient":        sufficient,
+            "data_sufficiency_warnings": warnings,
+            "geographic":   {"top": top_geo, "worst": worst_geo},
+            "device":       dev_list,
+            "time_patterns": {
+                "by_hour": [dict(h, cost=round(h["cost"], 2)) for h in hour_list],
+                "by_day":  [dict(d, cost=round(d["cost"], 2)) for d in dow_list],
+            },
+            "search_terms": {
+                "top":       [dict(s, cost=round(s["cost"], 2)) for s in top_search],
+                "wasted":    [dict(s, cost=round(s["cost"], 2)) for s in wasted_search],
+                "available": bool(search_list),
+            },
+            "audience": {
+                "by_age":    [dict(a, cost=round(a["cost"], 2)) for a in age_list],
+                "by_gender": [dict(g, cost=round(g["cost"], 2)) for g in gender_list],
+            },
+            "summary":        "",
+            "recommendation": "",
+        })
+
+    result.sort(key=lambda x: x["total_cost"], reverse=True)
+    sufficient_count = sum(1 for c in result if c["data_sufficient"])
+    days = (date.fromisoformat(end) - date.fromisoformat(start)).days
+
+    return {
+        "campaigns": result,
+        "period":    {"start": start, "end": end, "days": days},
+        "account_level_overview": {
+            "total_campaigns_audited":      len(result),
+            "campaigns_with_sufficient_data": sufficient_count,
+            "overall_note": (
+                f"Audited {len(result)} campaign(s) over {days} days. "
+                f"{sufficient_count} have enough data for reliable insights."
+            ),
+        },
+    }
+
+
+def _deep_audit_ai_summaries_sync(campaigns: list) -> dict:
+    """Single batched GPT call that returns per-campaign summary+recommendation."""
+    to_summarize = [c for c in campaigns if c["data_sufficient"]][:10]
+    if not to_summarize:
+        return {}
+
+    compact = []
+    for c in to_summarize:
+        compact.append({
+            "id":           c["campaign_id"],
+            "name":         c["campaign_name"],
+            "type":         c["campaign_type"],
+            "spend":        c["total_cost"],
+            "clicks":       c["total_clicks"],
+            "impressions":  c["total_impressions"],
+            "conversions":  c["total_conversions"],
+            "ctr":          c["ctr"],
+            "cpa":          c["cpa"],
+            "top_locations": [g["location_name"] for g in (c["geographic"]["top"] or [])[:4]],
+            "devices":       [{d["device"]: d["impressions"]} for d in (c["device"] or [])[:3]],
+            "top_searches":  [s["term"] for s in (c["search_terms"]["top"] or [])[:6]],
+            "wasted_terms":  [s["term"] for s in (c["search_terms"]["wasted"] or [])[:3]],
+        })
+
+    prompt = (
+        "You are a Google Ads analyst. Write a 1-sentence data-backed summary and 1 specific, actionable "
+        "recommendation for each campaign below. Cite real numbers (spend, CTR, location, search term).\n\n"
+        f"CAMPAIGNS:\n{json.dumps(compact, indent=2)}\n\n"
+        "Rules:\n"
+        "- Summary: what the campaign is doing, in one sentence with a real number.\n"
+        "- Recommendation: one concrete next action (pause a term, bid up a location, fix headlines, etc.).\n"
+        "- Never give generic advice like 'review your keywords' — name the specific keyword/location.\n"
+        "- currency is INR (₹).\n\n"
+        "Return ONLY valid JSON:\n"
+        '{"summaries": {"<campaign_id>": {"summary": "...", "recommendation": "..."}}}'
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=1500,
+            temperature=0.3,
+        )
+        return json.loads(resp.choices[0].message.content).get("summaries", {})
+    except Exception as _ae:
+        logger.warning(f"[DEEP-AUDIT] AI summary failed: {_ae}")
+        return {}
+
+
+@app.post("/google-ads/deep-audit")
+async def gads_deep_audit(request: DeepAuditRequest):
+    try:
+        customer_id = _gads_customer_id()
+        if not customer_id:
+            return {"success": False, "connect_required": True,
+                    "error": "Google Ads not connected. Go to Account → Connected Accounts."}
+
+        uid        = _request_user_id.get()
+        krish_uid  = os.getenv("KRISH_USER_ID", "")
+        ads_client = (get_google_ads_client_for_user(uid)
+                      if (uid and uid != krish_uid)
+                      else get_google_ads_client())
+
+        end_dt  = date.today()
+        start_dt = end_dt - timedelta(days=max(1, min(request.date_range_days, 180)))
+        start   = start_dt.strftime("%Y-%m-%d")
+        end     = end_dt.strftime("%Y-%m-%d")
+
+        logger.info(f"[DEEP-AUDIT] uid={uid!r} cid={customer_id!r} period={start}→{end} "
+                    f"campaign_filter={request.campaign_id!r}")
+
+        raw    = await asyncio.to_thread(
+            _deep_audit_fetch_sync, ads_client, customer_id, start, end, request.campaign_id
+        )
+        result = _build_deep_audit_result(raw, start, end)
+
+        summaries = await asyncio.to_thread(
+            _deep_audit_ai_summaries_sync, result["campaigns"]
+        )
+        for camp in result["campaigns"]:
+            s = summaries.get(camp["campaign_id"], {})
+            camp["summary"]        = s.get("summary", "")
+            camp["recommendation"] = s.get("recommendation", "")
+
+        logger.info(f"[DEEP-AUDIT] Done: {len(result['campaigns'])} campaigns")
+        return {"success": True, **result}
+
+    except GadsNotConnectedError as _e:
+        return {"success": False, "connect_required": True, "error": str(_e)}
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[DEEP-AUDIT] Error: {_e}\n{tb}")
+        return {"success": False, "error": str(_e)}
+
+
 @app.post("/google-ads/add-keywords")
 async def gads_add_keywords(request: AddKeywordsRequest):
     try:
