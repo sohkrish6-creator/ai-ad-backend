@@ -12,7 +12,7 @@ from google.ads.googleads.errors import GoogleAdsException
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow as _GoogleOAuthFlow
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
@@ -102,7 +102,30 @@ _PUBLIC_PATHS = {
     "/",
     "/google/callback",  # browser redirect from Google — no auth header; state HMAC is the security
     "/meta/callback",    # browser redirect from Meta — same reason
+    "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
 }
+
+# Simple in-memory per-IP rate limiter for public, unauthenticated endpoints.
+# Not distributed (fine for a single Render instance) — resets on deploy/restart.
+_rate_limit_buckets: dict = {}
+_RATE_LIMIT_WINDOW_SECONDS = 60
+
+def _rate_limit_allow(bucket_key: str, max_requests: int, window_seconds: float = _RATE_LIMIT_WINDOW_SECONDS) -> bool:
+    now = time.time()
+    cutoff = now - window_seconds
+    timestamps = [t for t in _rate_limit_buckets.get(bucket_key, []) if t > cutoff]
+    if len(timestamps) >= max_requests:
+        _rate_limit_buckets[bucket_key] = timestamps
+        return False
+    timestamps.append(now)
+    _rate_limit_buckets[bucket_key] = timestamps
+    return True
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -242,12 +265,21 @@ class ReportModel(Base):
     user_id = Column(String(255))
     created_at = Column(String(100))
 
+class WeeklyMarketInsightModel(Base):
+    __tablename__ = "weekly_market_insights"
+    id = Column(Integer, primary_key=True, index=True)
+    industry = Column(String(255))
+    text = Column(Text)
+    week_date = Column(String(50))
+    approved = Column(Boolean, default=False)
+    created_at = Column(String(100))
+
 try:
     Base.metadata.create_all(bind=engine)
     logger.info("[DB] create_all succeeded")
 except Exception as _e:
     logger.error(f"[DB] create_all failed ({_e}). Falling back to per-table creation.")
-    for _model in [LeadModel, AnalysisModel, ReportModel]:
+    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel]:
         try:
             _model.__table__.create(bind=engine, checkfirst=True)
             logger.info(f"[DB] Created table: {_model.__tablename__}")
@@ -17397,3 +17429,76 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
         "company_input": company_input,
         "sections":      sections,
     }
+
+
+# ── Weekly Market Insight widget (public website) ────────────────────────────
+_SOHSCAPE_ORIGIN = "https://sohscape.com"
+_WEEKLY_INSIGHT_RATE_LIMIT = 30  # requests per minute per IP
+
+
+@app.get("/public/weekly-market-insight")
+async def public_weekly_market_insight(request: Request):
+    """
+    Public, unauthenticated endpoint powering the "Aaj ka Market" widget on
+    sohscape.com. Rate-limited per IP since every website visitor's browser
+    hits this directly. CORS is handled here (not the global CORSMiddleware)
+    so sohscape.com isn't granted access to every other route.
+    """
+    ip = _client_ip(request)
+    if not _rate_limit_allow(f"weekly-market-insight:{ip}", _WEEKLY_INSIGHT_RATE_LIMIT):
+        return JSONResponse(
+            {"error": "Too many requests"},
+            status_code=429,
+            headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+        )
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(WeeklyMarketInsightModel)
+            .filter(WeeklyMarketInsightModel.approved == True)  # noqa: E712
+            .order_by(WeeklyMarketInsightModel.id.desc())
+            .limit(3)
+            .all()
+        )
+        insights = [{"industry": r.industry or "", "text": r.text or ""} for r in rows]
+    finally:
+        db.close()
+
+    return JSONResponse(
+        {"insights": insights},
+        headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN},
+    )
+
+
+class WeeklyMarketInsightCreateRequest(BaseModel):
+    industry: str
+    text: str
+    week_date: Optional[str] = None
+
+
+@app.post("/admin/weekly-market-insight/create")
+async def create_weekly_market_insight(request: WeeklyMarketInsightCreateRequest):
+    """
+    Called by n8n only after Krish approves an insight over WhatsApp/email.
+    Protected by the existing X-API-Key gate in auth_middleware (ADSOH_API_KEY).
+    Always creates with approved=true — there is no draft/unapproved state here,
+    approval already happened before n8n calls this.
+    """
+    db = SessionLocal()
+    try:
+        row = WeeklyMarketInsightModel(
+            industry=request.industry.strip(),
+            text=request.text.strip(),
+            week_date=request.week_date or date.today().isoformat(),
+            approved=True,
+            created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        new_id = row.id
+    finally:
+        db.close()
+
+    return {"success": True, "id": new_id}
