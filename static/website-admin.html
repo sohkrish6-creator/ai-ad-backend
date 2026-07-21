@@ -98,10 +98,14 @@
 <div id="keyGate">
   <div class="box">
     <h2>Sohscape Website Admin</h2>
-    <p>Enter the admin API key to continue. It's stored only in this browser.</p>
-    <input type="text" id="keyInput" placeholder="ADSOH_API_KEY">
+    <p>Log in to manage the website content.</p>
+    <label style="margin-top:0;">Username</label>
+    <input type="text" id="loginUsername" autocomplete="username">
+    <label>Password</label>
+    <input type="password" id="loginPassword" autocomplete="current-password" onkeydown="if(event.key==='Enter') doLogin()">
+    <div id="loginError" class="hidden" style="margin-top:12px; padding:10px 12px; background:#FFF1F2; border:1px solid #FECDD3; color:#BE123C; border-radius:6px; font-size:13px;"></div>
     <div class="form-actions">
-      <button class="primary" onclick="saveKey()">Continue</button>
+      <button class="primary" id="loginBtn" onclick="doLogin()">Log In</button>
     </div>
   </div>
 </div>
@@ -244,30 +248,70 @@
 
 <script>
 const API_BASE = 'https://ai-ad-backend-zhpj.onrender.com';
-const KEY_STORAGE = 'sohscape_admin_api_key';
+const TOKEN_STORAGE = 'sohscape_admin_session_token';
+const USERNAME_STORAGE = 'sohscape_admin_username';
 let selectedFile = { pf: null, tm: null, bg: null };
 
-function apiKey() { return localStorage.getItem(KEY_STORAGE) || ''; }
+function apiKey() { return localStorage.getItem(TOKEN_STORAGE) || ''; }
 
-function saveKey() {
-  const v = document.getElementById('keyInput').value.trim();
-  if (!v) return;
-  localStorage.setItem(KEY_STORAGE, v);
-  document.getElementById('keyGate').classList.add('hidden');
-  renderKeyStatus();
-  loadAll();
+async function doLogin() {
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const errorBox = document.getElementById('loginError');
+  const loginBtn = document.getElementById('loginBtn');
+  errorBox.classList.add('hidden');
+  errorBox.textContent = '';
+  if (!username || !password) {
+    errorBox.textContent = 'Enter both username and password.';
+    errorBox.classList.remove('hidden');
+    return;
+  }
+  loginBtn.disabled = true;
+  try {
+    const res = await fetch(API_BASE + '/admin/website/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (res.ok && data.success && data.token) {
+      localStorage.setItem(TOKEN_STORAGE, data.token);
+      localStorage.setItem(USERNAME_STORAGE, username);
+      document.getElementById('loginPassword').value = '';
+      document.getElementById('keyGate').classList.add('hidden');
+      renderKeyStatus();
+      loadAll();
+    } else {
+      errorBox.textContent = (data && data.error) ? data.error : 'Login failed.';
+      errorBox.classList.remove('hidden');
+    }
+  } catch (e) {
+    errorBox.textContent = 'Network error — please try again.';
+    errorBox.classList.remove('hidden');
+  } finally {
+    loginBtn.disabled = false;
+  }
 }
 
 function clearKey() {
-  localStorage.removeItem(KEY_STORAGE);
+  localStorage.removeItem(TOKEN_STORAGE);
+  localStorage.removeItem(USERNAME_STORAGE);
+  document.getElementById('loginUsername').value = '';
+  document.getElementById('loginPassword').value = '';
   document.getElementById('keyGate').classList.remove('hidden');
+  renderKeyStatus();
 }
 
 function renderKeyStatus() {
   const has = !!apiKey();
-  document.getElementById('keyStatus').innerHTML = has
-    ? 'Key set <button onclick="clearKey()">change</button>'
-    : '';
+  if (!has) {
+    document.getElementById('keyStatus').innerHTML = '';
+    return;
+  }
+  const username = localStorage.getItem(USERNAME_STORAGE) || '';
+  const label = username ? `Logged in as ${escapeHtml(username)}` : 'Logged in';
+  document.getElementById('keyStatus').innerHTML =
+    `${label} <button onclick="clearKey()">Log Out</button>`;
 }
 
 function switchTab(name) {

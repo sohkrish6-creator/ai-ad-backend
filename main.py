@@ -4,6 +4,7 @@ from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 from PIL import Image
 import io
+import bcrypt
 from openai import OpenAI
 import httpx
 from datetime import datetime, date, timedelta
@@ -116,6 +117,11 @@ _PUBLIC_PATH_PREFIXES = (
     "/public/blog/",
 )
 
+# The website-admin login endpoint authenticates the request itself
+# (username + password in the body) rather than via the X-API-Key/JWT gate,
+# so it must bypass both regardless of HTTP method (it's a POST).
+_LOGIN_PATH = "/admin/website/login"
+
 # Service/automation endpoints (e.g. n8n) that authenticate with X-API-Key only —
 # they have no Supabase user session to attach a JWT to, so once ADSOH_API_KEY
 # has verified the caller, the JWT gate below is skipped for these paths.
@@ -151,6 +157,35 @@ def _client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
+# ── website-admin.html session tokens ────────────────────────────────────────
+# Stateless, HMAC-signed — no server-side session store needed, so a Render
+# restart doesn't silently invalidate everyone's login (unlike an in-memory
+# session dict would). Signing key is derived from ADSOH_API_KEY so no new
+# secret/env var is required just for this.
+_WEBSITE_ADMIN_SESSION_TTL_SECONDS = 24 * 60 * 60  # 24h, per spec
+
+def _website_admin_session_secret() -> str:
+    base = os.getenv("ADSOH_API_KEY", "") or "insecure-dev-fallback"
+    return hashlib.sha256((base + "::website-admin-session").encode()).hexdigest()
+
+def _issue_website_admin_session_token(username: str) -> str:
+    payload = {"u": username, "exp": int(time.time()) + _WEBSITE_ADMIN_SESSION_TTL_SECONDS}
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac.new(_website_admin_session_secret().encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+def _verify_website_admin_session_token(token: str) -> bool:
+    try:
+        payload_b64, sig = token.split(".", 1)
+        expected_sig = hmac.new(_website_admin_session_secret().encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return False
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+        return float(payload.get("exp", 0)) > time.time()
+    except Exception:
+        return False
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """
@@ -167,19 +202,28 @@ async def auth_middleware(request: Request, call_next):
     # "/google/callback" both match; preserve bare "/" as-is.
     _raw_path = request.url.path
     _norm_path = _raw_path.rstrip("/") or "/"
-    _is_public = request.method == "GET" and (
-        _norm_path in _PUBLIC_PATHS or _norm_path.startswith(_PUBLIC_PATH_PREFIXES)
-    )
+    _is_public = (
+        request.method == "GET" and (
+            _norm_path in _PUBLIC_PATHS or _norm_path.startswith(_PUBLIC_PATH_PREFIXES)
+        )
+    ) or _norm_path == _LOGIN_PATH
     logger.info(f"[AUTH] method={request.method} raw_path={_raw_path!r} norm_path={_norm_path!r} is_public={_is_public} public_paths={_PUBLIC_PATHS}")
 
-    # 1. X-API-Key (existing gate, unchanged behaviour)
+    # 1. X-API-Key (existing gate, unchanged behaviour) — for /admin/website/*
+    # paths specifically, a website-admin session token (issued by /admin/website/login)
+    # is also accepted in the same header, so the login flow doesn't require
+    # knowing the raw ADSOH_API_KEY at all.
     _api_secret = os.getenv("ADSOH_API_KEY", "")
     _api_key_verified = False
     if _api_secret and not _is_public:
         incoming = request.headers.get("X-API-Key", "")
-        if not incoming or not hmac.compare_digest(incoming.encode(), _api_secret.encode()):
+        if incoming and hmac.compare_digest(incoming.encode(), _api_secret.encode()):
+            _api_key_verified = True
+        elif (incoming and _norm_path.startswith("/admin/website/")
+              and _verify_website_admin_session_token(incoming)):
+            _api_key_verified = True
+        else:
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        _api_key_verified = True
 
     # 2. JWT → user_id
     user_id = ""
@@ -17648,6 +17692,40 @@ async def create_weekly_market_insight(request: WeeklyMarketInsightCreateRequest
 
 
 # ── Website CMS: portfolio + testimonials image upload ───────────────────────
+class WebsiteAdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/admin/website/login")
+async def website_admin_login(request: WebsiteAdminLoginRequest):
+    """
+    Username/password login for the website-admin.html CMS panel. Returns a
+    24h session token accepted in the X-API-Key header on all /admin/website/*
+    routes (see auth_middleware). Deliberately generic error message on any
+    failure — never reveals whether the username or password was wrong.
+    """
+    configured_username = os.getenv("WEBSITE_ADMIN_USERNAME", "")
+    configured_password_hash = os.getenv("WEBSITE_ADMIN_PASSWORD", "")
+    if not configured_username or not configured_password_hash:
+        return JSONResponse(
+            {"success": False, "error": "Website admin login is not configured on the server"},
+            status_code=503,
+        )
+
+    username_ok = hmac.compare_digest(request.username.encode(), configured_username.encode())
+    try:
+        password_ok = bcrypt.checkpw(request.password.encode(), configured_password_hash.encode())
+    except Exception:
+        password_ok = False
+
+    if not (username_ok and password_ok):
+        return JSONResponse({"success": False, "error": "Invalid username or password"}, status_code=401)
+
+    token = _issue_website_admin_session_token(request.username)
+    return {"success": True, "token": token}
+
+
 class PortfolioItemCreate(BaseModel):
     title: str
     category: str = ""

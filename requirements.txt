@@ -29,3 +29,4 @@ facebook-business==25.0.2
 PyJWT==2.10.1
 python-multipart==0.0.32
 Pillow==12.3.0
+bcrypt==5.0.0
