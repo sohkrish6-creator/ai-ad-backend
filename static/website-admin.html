@@ -120,6 +120,7 @@
     <button class="tab-btn active" data-tab="portfolio" onclick="switchTab('portfolio')">Portfolio</button>
     <button class="tab-btn" data-tab="testimonials" onclick="switchTab('testimonials')">Testimonials</button>
     <button class="tab-btn" data-tab="blog" onclick="switchTab('blog')">Blog</button>
+    <button class="tab-btn hidden" data-tab="team" id="teamTabBtn" onclick="switchTab('team')">Team</button>
   </div>
 
   <!-- PORTFOLIO TAB -->
@@ -244,13 +245,48 @@
 
     <div class="grid" id="blogGrid"></div>
   </section>
+
+  <!-- TEAM TAB (admin role only) -->
+  <section id="tab-team" class="hidden">
+    <div class="card">
+      <h3 id="teamFormTitle">Add Team Member</h3>
+      <input type="hidden" id="tu_id">
+      <label>Username</label>
+      <input type="text" id="tu_username" placeholder="e.g. deepti" autocomplete="off">
+      <label>Display name</label>
+      <input type="text" id="tu_display_name" placeholder="e.g. Deepti">
+      <label>Password <span id="tu_password_hint" style="color:#999;"></span></label>
+      <input type="text" id="tu_password" placeholder="Set a password" autocomplete="new-password">
+      <label>Role</label>
+      <select id="tu_role" style="width:100%; background:#FAFAFA; border:1px solid #E5E5E5; border-radius:6px; padding:9px 12px; font-size:14px; color:#171717; font-family:inherit;">
+        <option value="editor">Editor — manage content only</option>
+        <option value="admin">Admin — manage content + team</option>
+      </select>
+      <div class="checkbox-row">
+        <input type="checkbox" id="tu_active" checked>
+        <label style="margin:0;">Active</label>
+      </div>
+
+      <div class="form-actions">
+        <button class="primary" onclick="saveTeamMember()">Save</button>
+        <button class="secondary" onclick="resetTeamForm()">Clear</button>
+      </div>
+    </div>
+
+    <div class="grid" id="teamGrid"></div>
+  </section>
 </main>
 
 <script>
 const API_BASE = 'https://ai-ad-backend-zhpj.onrender.com';
 const TOKEN_STORAGE = 'sohscape_admin_session_token';
 const USERNAME_STORAGE = 'sohscape_admin_username';
+const DISPLAY_NAME_STORAGE = 'sohscape_admin_display_name';
+const ROLE_STORAGE = 'sohscape_admin_role';
 let selectedFile = { pf: null, tm: null, bg: null };
+
+function currentRole() { return localStorage.getItem(ROLE_STORAGE) || ''; }
+function isAdmin() { return currentRole() === 'admin'; }
 
 function apiKey() { return localStorage.getItem(TOKEN_STORAGE) || ''; }
 
@@ -277,9 +313,12 @@ async function doLogin() {
     if (res.ok && data.success && data.token) {
       localStorage.setItem(TOKEN_STORAGE, data.token);
       localStorage.setItem(USERNAME_STORAGE, username);
+      localStorage.setItem(DISPLAY_NAME_STORAGE, data.display_name || username);
+      localStorage.setItem(ROLE_STORAGE, data.role || 'editor');
       document.getElementById('loginPassword').value = '';
       document.getElementById('keyGate').classList.add('hidden');
       renderKeyStatus();
+      document.getElementById('teamTabBtn').classList.toggle('hidden', !isAdmin());
       loadAll();
     } else {
       errorBox.textContent = (data && data.error) ? data.error : 'Login failed.';
@@ -296,9 +335,12 @@ async function doLogin() {
 function clearKey() {
   localStorage.removeItem(TOKEN_STORAGE);
   localStorage.removeItem(USERNAME_STORAGE);
+  localStorage.removeItem(DISPLAY_NAME_STORAGE);
+  localStorage.removeItem(ROLE_STORAGE);
   document.getElementById('loginUsername').value = '';
   document.getElementById('loginPassword').value = '';
   document.getElementById('keyGate').classList.remove('hidden');
+  document.getElementById('teamTabBtn').classList.add('hidden');
   renderKeyStatus();
 }
 
@@ -308,17 +350,19 @@ function renderKeyStatus() {
     document.getElementById('keyStatus').innerHTML = '';
     return;
   }
-  const username = localStorage.getItem(USERNAME_STORAGE) || '';
-  const label = username ? `Logged in as ${escapeHtml(username)}` : 'Logged in';
+  const displayName = localStorage.getItem(DISPLAY_NAME_STORAGE) || localStorage.getItem(USERNAME_STORAGE) || '';
+  const label = displayName ? `Logged in as ${escapeHtml(displayName)}` : 'Logged in';
   document.getElementById('keyStatus').innerHTML =
     `${label} <button onclick="clearKey()">Log Out</button>`;
 }
 
 function switchTab(name) {
+  if (name === 'team' && !isAdmin()) return;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.getElementById('tab-portfolio').classList.toggle('hidden', name !== 'portfolio');
   document.getElementById('tab-testimonials').classList.toggle('hidden', name !== 'testimonials');
   document.getElementById('tab-blog').classList.toggle('hidden', name !== 'blog');
+  document.getElementById('tab-team').classList.toggle('hidden', name !== 'team');
 }
 
 async function apiFetch(path, options = {}) {
@@ -466,6 +510,10 @@ function escapeHtml(s) {
   }[c]));
 }
 
+function addedByTag(item) {
+  return item.created_by ? `<span>added by ${escapeHtml(item.created_by)}</span>` : '';
+}
+
 async function loadPortfolio() {
   const res = await apiFetch('/admin/website/portfolio');
   const data = await res.json();
@@ -480,6 +528,7 @@ async function loadPortfolio() {
       <div class="item-body">
         <div class="item-title">${escapeHtml(item.title) || '(untitled)'}</div>
         <div class="item-meta">${escapeHtml(item.category)}</div>
+        <div class="item-meta">${addedByTag(item)}</div>
         <div class="item-actions">
           <button class="secondary small" onclick="editPortfolioItemById(${item.id})">Edit</button>
           <button class="danger small" onclick="deletePortfolioItem(${item.id})">Delete</button>
@@ -571,6 +620,7 @@ async function loadTestimonials() {
       <div class="item-body">
         <div class="item-title">${escapeHtml(item.client_name) || '(unnamed)'}</div>
         <div class="item-meta">${escapeHtml(item.position)} ${item.approved ? '' : '&middot; not approved'}</div>
+        <div class="item-meta">${addedByTag(item)}</div>
         <div class="item-actions">
           <button class="secondary small" onclick="editTestimonialById(${item.id})">Edit</button>
           <button class="danger small" onclick="deleteTestimonial(${item.id})">Delete</button>
@@ -671,6 +721,7 @@ async function loadBlog() {
       <div class="item-body">
         <div class="item-title">${escapeHtml(item.title) || '(untitled)'}</div>
         <div class="item-meta">${escapeHtml(item.author)} ${item.published_date ? '&middot; ' + escapeHtml(item.published_date) : ''} ${item.active ? '' : '&middot; inactive'}</div>
+        <div class="item-meta">${addedByTag(item)}</div>
         <div class="item-actions">
           <button class="secondary small" onclick="editBlogPostById(${item.id})">Edit</button>
           <button class="danger small" onclick="deleteBlogPost(${item.id})">Delete</button>
@@ -685,14 +736,117 @@ function editBlogPostById(id) {
   if (item) editBlogPost(item);
 }
 
+// ---- Team (admin only) ----
+
+function resetTeamForm() {
+  document.getElementById('tu_id').value = '';
+  document.getElementById('tu_username').value = '';
+  document.getElementById('tu_display_name').value = '';
+  document.getElementById('tu_password').value = '';
+  document.getElementById('tu_password_hint').textContent = '';
+  document.getElementById('tu_role').value = 'editor';
+  document.getElementById('tu_active').checked = true;
+  document.getElementById('teamFormTitle').textContent = 'Add Team Member';
+}
+
+function editTeamMember(item) {
+  document.getElementById('tu_id').value = item.id;
+  document.getElementById('tu_username').value = item.username || '';
+  document.getElementById('tu_display_name').value = item.display_name || '';
+  document.getElementById('tu_password').value = '';
+  document.getElementById('tu_password_hint').textContent = '(leave blank to keep current password)';
+  document.getElementById('tu_role').value = item.role || 'editor';
+  document.getElementById('tu_active').checked = !!item.active;
+  document.getElementById('teamFormTitle').textContent = `Edit ${item.username}`;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function saveTeamMember() {
+  const id = document.getElementById('tu_id').value;
+  const username = document.getElementById('tu_username').value.trim();
+  const password = document.getElementById('tu_password').value;
+  const display_name = document.getElementById('tu_display_name').value.trim();
+  const role = document.getElementById('tu_role').value;
+  const active = document.getElementById('tu_active').checked;
+
+  let res;
+  if (id) {
+    const payload = { display_name, role, active };
+    if (password) payload.password = password;
+    res = await apiFetch(`/admin/website/users/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } else {
+    if (!username || !password) {
+      alert('Username and password are required for a new team member.');
+      return;
+    }
+    res = await apiFetch('/admin/website/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, display_name, role }),
+    });
+  }
+  const data = await res.json();
+  if (data.success) {
+    resetTeamForm();
+    loadTeam();
+  } else {
+    alert(data.error || 'Save failed');
+  }
+}
+
+async function deleteTeamMember(id) {
+  if (!confirm('Remove this team member? This cannot be undone.')) return;
+  const res = await apiFetch(`/admin/website/users/${id}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (data.success) loadTeam();
+  else alert(data.error || 'Delete failed');
+}
+
+let teamMembers = [];
+
+async function loadTeam() {
+  if (!isAdmin()) return;
+  const res = await apiFetch('/admin/website/users');
+  const data = await res.json();
+  teamMembers = data.items || [];
+  const grid = document.getElementById('teamGrid');
+  grid.innerHTML = '';
+  teamMembers.forEach(item => {
+    const el = document.createElement('div');
+    el.className = 'item-card';
+    el.innerHTML = `
+      <div class="item-body">
+        <div class="item-title">${escapeHtml(item.display_name) || escapeHtml(item.username)}</div>
+        <div class="item-meta">@${escapeHtml(item.username)} &middot; ${item.role === 'admin' ? 'Admin' : 'Editor'} ${item.active ? '' : '&middot; inactive'}</div>
+        <div class="item-meta">Added ${escapeHtml(item.created_at)}</div>
+        <div class="item-actions">
+          <button class="secondary small" onclick="editTeamMemberById(${item.id})">Edit</button>
+          <button class="danger small" onclick="deleteTeamMember(${item.id})">Remove</button>
+        </div>
+      </div>`;
+    grid.appendChild(el);
+  });
+}
+
+function editTeamMemberById(id) {
+  const item = teamMembers.find(i => i.id === id);
+  if (item) editTeamMember(item);
+}
+
 function loadAll() {
   loadPortfolio();
   loadTestimonials();
   loadBlog();
+  if (isAdmin()) loadTeam();
 }
 
 // ---- init ----
 renderKeyStatus();
+document.getElementById('teamTabBtn').classList.toggle('hidden', !isAdmin());
 if (apiKey()) {
   document.getElementById('keyGate').classList.add('hidden');
   loadAll();

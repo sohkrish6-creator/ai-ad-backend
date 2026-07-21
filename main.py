@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, Request, UploadFile, File
+from fastapi import FastAPI, Depends, Request, UploadFile, File, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -168,23 +168,64 @@ def _website_admin_session_secret() -> str:
     base = os.getenv("ADSOH_API_KEY", "") or "insecure-dev-fallback"
     return hashlib.sha256((base + "::website-admin-session").encode()).hexdigest()
 
-def _issue_website_admin_session_token(username: str) -> str:
-    payload = {"u": username, "exp": int(time.time()) + _WEBSITE_ADMIN_SESSION_TTL_SECONDS}
+def _issue_website_admin_session_token(user_id: int, username: str) -> str:
+    payload = {"uid": user_id, "u": username, "exp": int(time.time()) + _WEBSITE_ADMIN_SESSION_TTL_SECONDS}
     payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     sig = hmac.new(_website_admin_session_secret().encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{sig}"
 
-def _verify_website_admin_session_token(token: str) -> bool:
+def _decode_website_admin_session_token(token: str) -> Optional[dict]:
+    """Verify signature + expiry only (stateless). Returns the payload dict, or None if invalid/expired."""
     try:
         payload_b64, sig = token.split(".", 1)
         expected_sig = hmac.new(_website_admin_session_secret().encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
-            return False
+            return None
         padding = "=" * (-len(payload_b64) % 4)
         payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
-        return float(payload.get("exp", 0)) > time.time()
+        if float(payload.get("exp", 0)) <= time.time():
+            return None
+        return payload
     except Exception:
-        return False
+        return None
+
+def _verify_website_admin_session_token(token: str) -> bool:
+    return _decode_website_admin_session_token(token) is not None
+
+def _resolve_website_caller(x_api_key: str = Header(None, alias="X-API-Key")) -> dict:
+    """
+    Resolves the caller of a /admin/website/* request into an identity dict:
+      {"system": True,  "username": "system", "display_name": "System / Automation", "role": "admin"}
+      {"system": False, "id": <int>, "username": ..., "display_name": ..., "role": "admin"|"editor"}
+
+    auth_middleware already did a coarse check (valid signature+expiry OR the
+    raw ADSOH_API_KEY) before this runs. This does the fine-grained part that
+    middleware can't: for real users, re-checks `active` against the DB on
+    every call — so deactivating someone takes effect immediately, not just
+    after their 24h token expires.
+    """
+    api_secret = os.getenv("ADSOH_API_KEY", "")
+    if api_secret and x_api_key and hmac.compare_digest(x_api_key.encode(), api_secret.encode()):
+        return {"system": True, "id": None, "username": "system", "display_name": "System / Automation", "role": "admin"}
+
+    payload = _decode_website_admin_session_token(x_api_key) if x_api_key else None
+    if not payload:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    db = SessionLocal()
+    try:
+        user = db.query(WebsiteAdminUserModel).filter(WebsiteAdminUserModel.id == payload.get("uid")).first()
+        if not user or not user.active:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return {"system": False, "id": user.id, "username": user.username,
+                "display_name": user.display_name, "role": user.role}
+    finally:
+        db.close()
+
+def _require_admin_caller(caller: dict = Depends(_resolve_website_caller)) -> dict:
+    if caller["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return caller
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -368,6 +409,8 @@ class PortfolioItemModel(Base):
     description = Column(Text)
     image_url = Column(Text)
     display_order = Column(Integer, default=0)
+    created_by = Column(String(255))
+    updated_by = Column(String(255))
     created_at = Column(String(100))
     updated_at = Column(String(100))
 
@@ -379,6 +422,8 @@ class TestimonialModel(Base):
     text = Column(Text)
     image_url = Column(Text)
     approved = Column(Boolean, default=True)
+    created_by = Column(String(255))
+    updated_by = Column(String(255))
     created_at = Column(String(100))
     updated_at = Column(String(100))
 
@@ -393,6 +438,19 @@ class WebsiteBlogPostModel(Base):
     published_date = Column(String(50))
     sort_order = Column(Integer, default=0)
     active = Column(Boolean, default=True)
+    created_by = Column(String(255))
+    updated_by = Column(String(255))
+    created_at = Column(String(100))
+    updated_at = Column(String(100))
+
+class WebsiteAdminUserModel(Base):
+    __tablename__ = "website_admin_users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(255), unique=True, index=True)
+    password_hash = Column(Text)
+    display_name = Column(String(255))
+    role = Column(String(50), default="editor")  # "admin" or "editor"
+    active = Column(Boolean, default=True)
     created_at = Column(String(100))
     updated_at = Column(String(100))
 
@@ -401,7 +459,7 @@ try:
     logger.info("[DB] create_all succeeded")
 except Exception as _e:
     logger.error(f"[DB] create_all failed ({_e}). Falling back to per-table creation.")
-    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel, WebsiteBlogPostModel]:
+    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel, WebsiteBlogPostModel, WebsiteAdminUserModel]:
         try:
             _model.__table__.create(bind=engine, checkfirst=True)
             logger.info(f"[DB] Created table: {_model.__tablename__}")
@@ -483,6 +541,46 @@ try:
                 pass
 except Exception as _orm_me:
     pass
+
+# Add created_by/updated_by columns to website CMS tables that predate the
+# multi-user auth upgrade
+try:
+    with engine.begin() as _wau_mc:
+        for _wau_tbl in ("portfolio_items", "testimonials", "website_blog_posts"):
+            for _wau_col in ("created_by", "updated_by"):
+                try:
+                    _wau_mc.execute(text(f"ALTER TABLE {_wau_tbl} ADD COLUMN {_wau_col} VARCHAR(255)"))
+                except Exception:
+                    pass
+except Exception:
+    pass
+
+# Seed the first website-admin user (Krish) exactly once, on first boot when
+# the table is empty. The password below is only a bcrypt hash — it is not
+# reversible from this source file; the plaintext was generated once and
+# handed to Krish directly, never committed anywhere.
+def _seed_website_admin_users():
+    db = SessionLocal()
+    try:
+        if db.query(WebsiteAdminUserModel).count() == 0:
+            now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+            db.add(WebsiteAdminUserModel(
+                username="krish",
+                password_hash="$2b$12$8H7va/FegtpP6OE9Hs3J3ONne1cckgWqCluIyeafIRzqL3BS.Oysu",
+                display_name="Krish",
+                role="admin",
+                active=True,
+                created_at=now, updated_at=now,
+            ))
+            db.commit()
+            logger.info("[WEBSITE-ADMIN] Seeded first admin user: krish")
+    finally:
+        db.close()
+
+try:
+    _seed_website_admin_users()
+except Exception as _seed_e:
+    logger.warning(f"[WEBSITE-ADMIN] Seed failed (non-fatal): {_seed_e}")
 
 # ── Memory System Tables ─────────────────────────────────────────────────────
 # Use raw SQL so JSONB works on Postgres and TEXT works on SQLite identically.
@@ -17697,33 +17795,42 @@ class WebsiteAdminLoginRequest(BaseModel):
     password: str
 
 
+# Fixed dummy bcrypt hash checked when a username isn't found, so a login
+# attempt for a nonexistent user takes about as long as one for a real user
+# with the wrong password — otherwise the missing-bcrypt-check branch would
+# be measurably faster and leak which usernames exist via response timing.
+_DUMMY_BCRYPT_HASH = "$2b$12$ti4EqnhdpJ/Z9amWKcrPW.sPgVT9RjG1m2nT3rDMBofX7tzGsnIUK"
+
 @app.post("/admin/website/login")
 async def website_admin_login(request: WebsiteAdminLoginRequest):
     """
-    Username/password login for the website-admin.html CMS panel. Returns a
-    24h session token accepted in the X-API-Key header on all /admin/website/*
-    routes (see auth_middleware). Deliberately generic error message on any
-    failure — never reveals whether the username or password was wrong.
+    Username/password login for the website-admin.html CMS panel — each team
+    member has their own row in website_admin_users. Returns a 24h session
+    token accepted in the X-API-Key header on all /admin/website/* routes.
+    Deliberately generic error message on any failure — never reveals
+    whether the username or the password was wrong.
     """
-    configured_username = os.getenv("WEBSITE_ADMIN_USERNAME", "")
-    configured_password_hash = os.getenv("WEBSITE_ADMIN_PASSWORD", "")
-    if not configured_username or not configured_password_hash:
-        return JSONResponse(
-            {"success": False, "error": "Website admin login is not configured on the server"},
-            status_code=503,
-        )
-
-    username_ok = hmac.compare_digest(request.username.encode(), configured_username.encode())
+    db = SessionLocal()
     try:
-        password_ok = bcrypt.checkpw(request.password.encode(), configured_password_hash.encode())
-    except Exception:
+        user = (db.query(WebsiteAdminUserModel)
+                .filter(WebsiteAdminUserModel.username == request.username.strip())
+                .first())
+    finally:
+        db.close()
+
+    if user and user.active:
+        password_ok = bcrypt.checkpw(request.password.encode(), user.password_hash.encode())
+    else:
+        # Run a bcrypt check anyway (against a dummy hash) to keep timing
+        # consistent whether the username exists, is deactivated, or not.
+        bcrypt.checkpw(request.password.encode(), _DUMMY_BCRYPT_HASH.encode())
         password_ok = False
 
-    if not (username_ok and password_ok):
+    if not user or not user.active or not password_ok:
         return JSONResponse({"success": False, "error": "Invalid username or password"}, status_code=401)
 
-    token = _issue_website_admin_session_token(request.username)
-    return {"success": True, "token": token}
+    token = _issue_website_admin_session_token(user.id, user.username)
+    return {"success": True, "token": token, "display_name": user.display_name, "role": user.role}
 
 
 class PortfolioItemCreate(BaseModel):
@@ -17759,7 +17866,7 @@ class TestimonialUpdate(BaseModel):
 
 
 @app.post("/admin/website/upload-image")
-async def upload_website_image(file: UploadFile = File(...)):
+async def upload_website_image(file: UploadFile = File(...), caller: dict = Depends(_resolve_website_caller)):
     """
     Generic image upload for the website-admin.html CMS — used for both
     portfolio items and testimonials. Returns a public URL; the frontend
@@ -17802,11 +17909,12 @@ def _portfolio_item_dict(r: PortfolioItemModel) -> dict:
         "id": r.id, "title": r.title, "category": r.category,
         "description": r.description, "image_url": r.image_url,
         "display_order": r.display_order,
+        "created_by": r.created_by, "updated_by": r.updated_by,
     }
 
 
 @app.get("/admin/website/portfolio")
-async def list_portfolio_items():
+async def list_portfolio_items(caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         rows = (db.query(PortfolioItemModel)
@@ -17819,7 +17927,7 @@ async def list_portfolio_items():
 
 
 @app.post("/admin/website/portfolio")
-async def create_portfolio_item(request: PortfolioItemCreate):
+async def create_portfolio_item(request: PortfolioItemCreate, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         now = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -17829,6 +17937,7 @@ async def create_portfolio_item(request: PortfolioItemCreate):
             description=request.description.strip(),
             image_url=request.image_url.strip(),
             display_order=request.display_order,
+            created_by=caller["username"], updated_by=caller["username"],
             created_at=now, updated_at=now,
         )
         db.add(row)
@@ -17841,7 +17950,7 @@ async def create_portfolio_item(request: PortfolioItemCreate):
 
 
 @app.put("/admin/website/portfolio/{item_id}")
-async def update_portfolio_item(item_id: int, request: PortfolioItemUpdate):
+async def update_portfolio_item(item_id: int, request: PortfolioItemUpdate, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         row = db.query(PortfolioItemModel).filter(PortfolioItemModel.id == item_id).first()
@@ -17850,6 +17959,7 @@ async def update_portfolio_item(item_id: int, request: PortfolioItemUpdate):
         updates = request.model_dump(exclude_unset=True)
         for field, val in updates.items():
             setattr(row, field, val.strip() if isinstance(val, str) else val)
+        row.updated_by = caller["username"]
         row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
         db.commit()
         db.refresh(row)
@@ -17860,7 +17970,7 @@ async def update_portfolio_item(item_id: int, request: PortfolioItemUpdate):
 
 
 @app.delete("/admin/website/portfolio/{item_id}")
-async def delete_portfolio_item(item_id: int):
+async def delete_portfolio_item(item_id: int, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         row = db.query(PortfolioItemModel).filter(PortfolioItemModel.id == item_id).first()
@@ -17920,11 +18030,12 @@ def _testimonial_dict(r: TestimonialModel) -> dict:
     return {
         "id": r.id, "client_name": r.client_name, "position": r.position,
         "text": r.text, "image_url": r.image_url, "approved": r.approved,
+        "created_by": r.created_by, "updated_by": r.updated_by,
     }
 
 
 @app.get("/admin/website/testimonials")
-async def list_testimonials():
+async def list_testimonials(caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         rows = db.query(TestimonialModel).order_by(TestimonialModel.id.desc()).all()
@@ -17935,7 +18046,7 @@ async def list_testimonials():
 
 
 @app.post("/admin/website/testimonials")
-async def create_testimonial(request: TestimonialCreate):
+async def create_testimonial(request: TestimonialCreate, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         now = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -17945,6 +18056,7 @@ async def create_testimonial(request: TestimonialCreate):
             text=request.text.strip(),
             image_url=request.image_url.strip(),
             approved=request.approved,
+            created_by=caller["username"], updated_by=caller["username"],
             created_at=now, updated_at=now,
         )
         db.add(row)
@@ -17957,7 +18069,7 @@ async def create_testimonial(request: TestimonialCreate):
 
 
 @app.put("/admin/website/testimonials/{item_id}")
-async def update_testimonial(item_id: int, request: TestimonialUpdate):
+async def update_testimonial(item_id: int, request: TestimonialUpdate, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         row = db.query(TestimonialModel).filter(TestimonialModel.id == item_id).first()
@@ -17966,6 +18078,7 @@ async def update_testimonial(item_id: int, request: TestimonialUpdate):
         updates = request.model_dump(exclude_unset=True)
         for field, val in updates.items():
             setattr(row, field, val.strip() if isinstance(val, str) else val)
+        row.updated_by = caller["username"]
         row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
         db.commit()
         db.refresh(row)
@@ -17976,7 +18089,7 @@ async def update_testimonial(item_id: int, request: TestimonialUpdate):
 
 
 @app.delete("/admin/website/testimonials/{item_id}")
-async def delete_testimonial(item_id: int):
+async def delete_testimonial(item_id: int, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         row = db.query(TestimonialModel).filter(TestimonialModel.id == item_id).first()
@@ -18016,11 +18129,12 @@ def _blog_post_dict(r: WebsiteBlogPostModel) -> dict:
         "id": r.id, "title": r.title, "excerpt": r.excerpt, "content": r.content,
         "cover_image_url": r.cover_image_url, "author": r.author,
         "published_date": r.published_date, "sort_order": r.sort_order, "active": r.active,
+        "created_by": r.created_by, "updated_by": r.updated_by,
     }
 
 
 @app.get("/admin/website/blog")
-async def list_blog_posts():
+async def list_blog_posts(caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         rows = (db.query(WebsiteBlogPostModel)
@@ -18033,7 +18147,7 @@ async def list_blog_posts():
 
 
 @app.post("/admin/website/blog")
-async def create_blog_post(request: BlogPostCreate):
+async def create_blog_post(request: BlogPostCreate, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         now = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -18046,6 +18160,7 @@ async def create_blog_post(request: BlogPostCreate):
             published_date=request.published_date.strip() or date.today().isoformat(),
             sort_order=request.sort_order,
             active=request.active,
+            created_by=caller["username"], updated_by=caller["username"],
             created_at=now, updated_at=now,
         )
         db.add(row)
@@ -18058,7 +18173,7 @@ async def create_blog_post(request: BlogPostCreate):
 
 
 @app.put("/admin/website/blog/{post_id}")
-async def update_blog_post(post_id: int, request: BlogPostUpdate):
+async def update_blog_post(post_id: int, request: BlogPostUpdate, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         row = db.query(WebsiteBlogPostModel).filter(WebsiteBlogPostModel.id == post_id).first()
@@ -18067,6 +18182,7 @@ async def update_blog_post(post_id: int, request: BlogPostUpdate):
         updates = request.model_dump(exclude_unset=True)
         for field, val in updates.items():
             setattr(row, field, val.strip() if isinstance(val, str) else val)
+        row.updated_by = caller["username"]
         row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
         db.commit()
         db.refresh(row)
@@ -18077,7 +18193,7 @@ async def update_blog_post(post_id: int, request: BlogPostUpdate):
 
 
 @app.delete("/admin/website/blog/{post_id}")
-async def delete_blog_post(post_id: int):
+async def delete_blog_post(post_id: int, caller: dict = Depends(_resolve_website_caller)):
     db = SessionLocal()
     try:
         row = db.query(WebsiteBlogPostModel).filter(WebsiteBlogPostModel.id == post_id).first()
@@ -18137,6 +18253,130 @@ async def public_blog_detail(post_id: int, request: Request):
     item = {"id": row.id, "title": row.title, "excerpt": row.excerpt, "content": row.content,
             "cover_image_url": row.cover_image_url, "author": row.author, "published_date": row.published_date}
     return JSONResponse({"item": item}, headers={"Access-Control-Allow-Origin": _SOHSCAPE_ORIGIN})
+
+
+# ── Website CMS: team management (admin role only) ───────────────────────────
+class WebsiteAdminUserCreate(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+    role: str = "editor"
+
+
+class WebsiteAdminUserUpdate(BaseModel):
+    display_name: Optional[str] = None
+    role: Optional[str] = None
+    active: Optional[bool] = None
+    password: Optional[str] = None  # set to reset the user's password
+
+
+def _website_admin_user_dict(u: WebsiteAdminUserModel) -> dict:
+    return {
+        "id": u.id, "username": u.username, "display_name": u.display_name,
+        "role": u.role, "active": u.active,
+        "created_at": u.created_at, "updated_at": u.updated_at,
+    }
+
+
+def _count_active_admins(db) -> int:
+    return db.query(WebsiteAdminUserModel).filter(
+        WebsiteAdminUserModel.role == "admin", WebsiteAdminUserModel.active == True  # noqa: E712
+    ).count()
+
+
+@app.get("/admin/website/users")
+async def list_website_admin_users(caller: dict = Depends(_require_admin_caller)):
+    db = SessionLocal()
+    try:
+        rows = db.query(WebsiteAdminUserModel).order_by(WebsiteAdminUserModel.id.asc()).all()
+        items = [_website_admin_user_dict(u) for u in rows]
+    finally:
+        db.close()
+    return {"success": True, "items": items}
+
+
+@app.post("/admin/website/users")
+async def create_website_admin_user(request: WebsiteAdminUserCreate, caller: dict = Depends(_require_admin_caller)):
+    username = request.username.strip()
+    if not username or not request.password:
+        return JSONResponse({"success": False, "error": "Username and password are required"}, status_code=400)
+    if request.role not in ("admin", "editor"):
+        return JSONResponse({"success": False, "error": "Role must be 'admin' or 'editor'"}, status_code=400)
+
+    db = SessionLocal()
+    try:
+        existing = db.query(WebsiteAdminUserModel).filter(WebsiteAdminUserModel.username == username).first()
+        if existing:
+            return JSONResponse({"success": False, "error": "That username is already taken"}, status_code=409)
+
+        now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        password_hash = bcrypt.hashpw(request.password.encode(), bcrypt.gensalt()).decode()
+        row = WebsiteAdminUserModel(
+            username=username,
+            password_hash=password_hash,
+            display_name=request.display_name.strip() or username,
+            role=request.role,
+            active=True,
+            created_at=now, updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        item = _website_admin_user_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.put("/admin/website/users/{user_id}")
+async def update_website_admin_user(user_id: int, request: WebsiteAdminUserUpdate, caller: dict = Depends(_require_admin_caller)):
+    db = SessionLocal()
+    try:
+        row = db.query(WebsiteAdminUserModel).filter(WebsiteAdminUserModel.id == user_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        if request.role is not None and request.role not in ("admin", "editor"):
+            return JSONResponse({"success": False, "error": "Role must be 'admin' or 'editor'"}, status_code=400)
+
+        would_lose_admin = (
+            row.role == "admin" and row.active
+            and ((request.role is not None and request.role != "admin")
+                 or (request.active is not None and not request.active))
+        )
+        if would_lose_admin and _count_active_admins(db) <= 1:
+            return JSONResponse({"success": False, "error": "Can't remove the last active admin"}, status_code=400)
+
+        if request.display_name is not None:
+            row.display_name = request.display_name.strip()
+        if request.role is not None:
+            row.role = request.role
+        if request.active is not None:
+            row.active = request.active
+        if request.password:
+            row.password_hash = bcrypt.hashpw(request.password.encode(), bcrypt.gensalt()).decode()
+        row.updated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        db.commit()
+        db.refresh(row)
+        item = _website_admin_user_dict(row)
+    finally:
+        db.close()
+    return {"success": True, "item": item}
+
+
+@app.delete("/admin/website/users/{user_id}")
+async def delete_website_admin_user(user_id: int, caller: dict = Depends(_require_admin_caller)):
+    db = SessionLocal()
+    try:
+        row = db.query(WebsiteAdminUserModel).filter(WebsiteAdminUserModel.id == user_id).first()
+        if not row:
+            return JSONResponse({"success": False, "error": "Not found"}, status_code=404)
+        if row.role == "admin" and row.active and _count_active_admins(db) <= 1:
+            return JSONResponse({"success": False, "error": "Can't remove the last active admin"}, status_code=400)
+        db.delete(row)
+        db.commit()
+    finally:
+        db.close()
+    return {"success": True}
 
 
 @app.get("/admin-panel/website-admin.html")
