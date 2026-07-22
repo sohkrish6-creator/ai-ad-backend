@@ -15143,6 +15143,73 @@ async def creator_finder_discover_youtube(request: CreatorFinderYoutubeRequest):
     }
 
 
+async def _resolve_meta_access_token(uid: str):
+    """Returns (access_token, error_msg) using the same Krish/global-env-var
+    vs per-user-OAuth-table branching as get_meta_ads_client_for_user() —
+    factored out so both _get_own_ig_business_account_id and the
+    /creator-finder/debug-meta-pages diagnostic endpoint resolve the token
+    identically instead of duplicating this logic."""
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not uid or uid == krish_uid:
+        if _meta_global_disconnected():
+            return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+        access_token = _genv("META_ACCESS_TOKEN")
+        if not access_token:
+            return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+        return access_token, None
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT encrypted_access_token, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[1]:
+        return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+    return decrypt_token(row[0]), None
+
+
+async def _meta_discover_all_pages(access_token: str) -> list:
+    """Combines TWO distinct sources of Page access, because Meta's classic
+    /me/accounts endpoint only reliably lists Pages the user personally
+    administers — it does NOT reliably surface Pages where access was
+    granted purely via Business Manager asset assignment (confirmed live
+    2026-07-22: a user with verified Full Access to a Page in Business
+    Manager still got zero results from /me/accounts alone). For
+    Business-owned Pages, /{business_id}/owned_pages and
+    /{business_id}/client_pages (discovered via /me/businesses) are the
+    correct source. Returns a deduped list of {id, name, source} dicts —
+    source records WHICH call actually found each page, for debugging."""
+    pages = {}
+    async with httpx.AsyncClient(timeout=15) as c:
+        try:
+            resp = await c.get(f"{_META_GRAPH}/me/accounts", params={"fields": "id,name", "access_token": access_token})
+            for p in resp.json().get("data", []):
+                if p.get("id"):
+                    pages[p["id"]] = {"id": p["id"], "name": p.get("name", ""), "source": "me/accounts"}
+        except Exception as _e:
+            logger.warning(f"[CREATOR FINDER] /me/accounts failed: {_e}")
+
+        try:
+            biz_resp = await c.get(f"{_META_GRAPH}/me/businesses", params={"fields": "id,name", "access_token": access_token})
+            businesses = biz_resp.json().get("data", [])
+        except Exception as _e:
+            logger.warning(f"[CREATOR FINDER] /me/businesses failed: {_e}")
+            businesses = []
+
+        for biz in businesses:
+            biz_id = biz.get("id")
+            if not biz_id:
+                continue
+            for endpoint, source in (("owned_pages", "owned_pages"), ("client_pages", "client_pages")):
+                try:
+                    p_resp = await c.get(f"{_META_GRAPH}/{biz_id}/{endpoint}", params={"fields": "id,name", "access_token": access_token})
+                    for p in p_resp.json().get("data", []):
+                        if p.get("id") and p["id"] not in pages:
+                            pages[p["id"]] = {"id": p["id"], "name": p.get("name", ""), "source": f"business:{biz.get('name','')}/{source}"}
+                except Exception as _e:
+                    logger.warning(f"[CREATOR FINDER] /{biz_id}/{endpoint} failed: {_e}")
+
+    return list(pages.values())
+
+
 async def _get_own_ig_business_account_id(uid: str):
     """Returns (ig_business_account_id, access_token, error_msg). Meta's
     Business Discovery API can only be queried FROM an Instagram Business/
@@ -15150,59 +15217,28 @@ async def _get_own_ig_business_account_id(uid: str):
     Business Account for that purpose. Never fabricates an ID; returns an
     honest error_msg (error_msg=None on success) at every failure point.
 
-    Mirrors the same "Krish/global env-var token vs per-user OAuth table"
-    branching as get_meta_ads_client()/get_meta_ads_client_for_user() —
-    Krish's Meta connection lives entirely in global env vars with no row
-    in meta_oauth_tokens at all, so checking only that table wrongly
-    reported "Meta Ads account not connected" for him even though
-    Account -> Connected Accounts correctly showed Connected (found live
-    2026-07-22).
-
-    Also doesn't rely on a single stored page_id: probes EVERY Page the
-    access token can see (via /me/accounts) for a linked IG Business
-    Account, so "Meta connected but no Page has Instagram linked" is
-    distinguished from "Meta not connected at all" instead of collapsing
-    both into the same generic error.
+    Checks EVERY Page discoverable via _meta_discover_all_pages (personal
+    admin pages AND Business-Manager-assigned pages — see that function's
+    docstring for why both are needed) for a linked IG Business Account, so
+    "Meta connected but no Page has Instagram linked" is distinguished from
+    "Meta not connected at all" instead of collapsing both into one error.
     """
-    krish_uid = os.getenv("KRISH_USER_ID", "")
-    stored_page_id = None
-
-    if not uid or uid == krish_uid:
-        if _meta_global_disconnected():
-            return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
-        access_token = _genv("META_ACCESS_TOKEN")
-        if not access_token:
-            return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
-    else:
-        with engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT encrypted_access_token, page_id, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
-            ), {"uid": uid}).fetchone()
-        if not row or row[2]:
-            return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
-        access_token = decrypt_token(row[0])
-        stored_page_id = row[1] or None
+    access_token, err = await _resolve_meta_access_token(uid)
+    if err:
+        return None, None, err
 
     try:
+        pages = await _meta_discover_all_pages(access_token)
+        if not pages:
+            return None, None, (
+                "Meta Ads is connected, but no Facebook Page is accessible with this connection — neither as a "
+                "personal admin nor via Business Manager asset assignment. Check Business Manager -> Business Settings "
+                "-> Pages that this login has access to the right Page."
+            )
+
         async with httpx.AsyncClient(timeout=15) as c:
-            page_ids_to_try = [stored_page_id] if stored_page_id else []
-            resp = await c.get(f"{_META_GRAPH}/me/accounts", params={
-                "fields": "id,name", "access_token": access_token,
-            })
-            for p in resp.json().get("data", []):
-                pid = p.get("id")
-                if pid and pid not in page_ids_to_try:
-                    page_ids_to_try.append(pid)
-
-            if not page_ids_to_try:
-                return None, None, (
-                    "Meta Ads is connected, but no Facebook Page is accessible with this connection. "
-                    "Either the pages_show_list permission wasn't granted during login (reconnect and check the "
-                    "permissions screen), or this Facebook account isn't an admin/editor on any Page in Business Manager."
-                )
-
-            for pid in page_ids_to_try:
-                page_resp = await c.get(f"{_META_GRAPH}/{pid}", params={
+            for p in pages:
+                page_resp = await c.get(f"{_META_GRAPH}/{p['id']}", params={
                     "fields": "instagram_business_account", "access_token": access_token,
                 })
                 ig_id = (page_resp.json().get("instagram_business_account") or {}).get("id")
@@ -15213,6 +15249,49 @@ async def _get_own_ig_business_account_id(uid: str):
     except Exception as _e:
         logger.warning(f"[CREATOR FINDER] IG business account lookup failed: {_e}")
         return None, None, f"Could not verify your Instagram Business connection: {_e}"
+
+
+@app.get("/creator-finder/debug-meta-pages")
+async def creator_finder_debug_meta_pages():
+    """Diagnostic endpoint — returns the RAW JSON from /me/accounts,
+    /me/businesses, and /{business_id}/owned_pages + /{business_id}/client_pages
+    for every business, side by side, so a "Page not accessible" report can
+    be root-caused directly from the actual API responses instead of
+    guesswork. Not linked from any UI; hit it directly while authenticated."""
+    uid = _request_user_id.get()
+    access_token, err = await _resolve_meta_access_token(uid)
+    if err:
+        return {"success": False, "error": err}
+
+    raw = {}
+    async with httpx.AsyncClient(timeout=15) as c:
+        try:
+            r = await c.get(f"{_META_GRAPH}/me/accounts", params={"fields": "id,name,access_type", "access_token": access_token})
+            raw["me_accounts"] = r.json()
+        except Exception as _e:
+            raw["me_accounts"] = {"error": str(_e)}
+
+        try:
+            r = await c.get(f"{_META_GRAPH}/me/businesses", params={"fields": "id,name", "access_token": access_token})
+            raw["me_businesses"] = r.json()
+        except Exception as _e:
+            raw["me_businesses"] = {"error": str(_e)}
+
+        raw["businesses"] = {}
+        for biz in raw["me_businesses"].get("data", []) if isinstance(raw["me_businesses"], dict) else []:
+            biz_id = biz.get("id")
+            if not biz_id:
+                continue
+            biz_detail = {"name": biz.get("name", "")}
+            for endpoint in ("owned_pages", "client_pages"):
+                try:
+                    r = await c.get(f"{_META_GRAPH}/{biz_id}/{endpoint}", params={"fields": "id,name", "access_token": access_token})
+                    biz_detail[endpoint] = r.json()
+                except Exception as _e:
+                    biz_detail[endpoint] = {"error": str(_e)}
+            raw["businesses"][biz_id] = biz_detail
+
+    return {"success": True, "raw": raw}
 
 
 async def _fetch_ig_business_discovery(ig_business_account_id: str, access_token: str, handle: str) -> dict:
