@@ -454,12 +454,25 @@ class WebsiteAdminUserModel(Base):
     created_at = Column(String(100))
     updated_at = Column(String(100))
 
+class CommandAuditLogModel(Base):
+    __tablename__ = "command_audit_log"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(255), index=True)
+    command_text = Column(Text)
+    classified_intent = Column(String(100))
+    confidence = Column(String(20))       # stored as text ("0.92") — consistent with this file's other numeric-as-text columns
+    params_used = Column(Text)            # JSON
+    actions_taken = Column(Text)          # JSON array of strings
+    data_sources_used = Column(Text)      # JSON array of strings
+    result_summary = Column(Text)
+    created_at = Column(String(100))
+
 try:
     Base.metadata.create_all(bind=engine)
     logger.info("[DB] create_all succeeded")
 except Exception as _e:
     logger.error(f"[DB] create_all failed ({_e}). Falling back to per-table creation.")
-    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel, WebsiteBlogPostModel, WebsiteAdminUserModel]:
+    for _model in [LeadModel, AnalysisModel, ReportModel, WeeklyMarketInsightModel, PortfolioItemModel, TestimonialModel, WebsiteBlogPostModel, WebsiteAdminUserModel, CommandAuditLogModel]:
         try:
             _model.__table__.create(bind=engine, checkfirst=True)
             logger.info(f"[DB] Created table: {_model.__tablename__}")
@@ -11366,6 +11379,9 @@ class CommandRequest(BaseModel):
     city:     str = ""   # blank, not "Jaipur" — must stay falsy so a city mentioned in `text` can win the fallback below
     budget:   float = 0.0
     goal:     str = ""
+    confirm:        bool = False  # user clicked "Confirm & Run" on a plan preview for a multi-step intent
+    auto_run:       bool = False  # user's persistent "Run Automatically" preference — skip the preview entirely
+    forced_intent:  str = ""      # set when the user picked one of the clarifying_options chips directly
 
 _COMMAND_INTENTS = (
     "full_report", "prospect_discovery", "campaign_launch_kit", "ai_optimizer",
@@ -11716,7 +11732,19 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "but doesn't fit neatly into a specific action, choose market_query instead of unknown — always prefer "
         "attempting the closest real capability over refusing.\n\n"
         'Return ONLY JSON: {"intent": "one of the actions above", '
-        '"extracted": {"url":"", "industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line"}\n'
+        '"confidence": 0.0-1.0, '
+        '"extracted": {"url":"", "industry":"","city":"","budget":0,"goal":""}, "reasoning": "one line", '
+        '"clarifying_options": []}\n'
+        "For \"confidence\": how sure you are \"intent\" is the SINGLE correct action for this command — 1.0 if "
+        "unambiguous, lower if it could plausibly be one of several actions.\n"
+        "For \"clarifying_options\": ONLY populate this (2-3 entries) when the command is GENUINELY ambiguous "
+        "between multiple very-differently-behaved actions and you are not confident which one the user means "
+        "(confidence should then be below 0.6) — e.g. text that could equally be campaign_launch_kit (just write "
+        "the plan) or full_campaign_launch (actually make it go live), or hashtag_generation vs ad_script_writing. "
+        "Do NOT populate it for ordinary uncertainty about extracted fields (missing url/budget/city) — that's "
+        "handled separately. Each entry: {\"intent\": \"one of the actions above\", \"label\": \"one short "
+        "human-readable sentence describing what THIS interpretation would do, specific to the command given\"}. "
+        "Leave as an empty array when the command is reasonably clear.\n"
         "For \"url\": pull out any website/domain, Instagram handle (with or without @, or as instagram.com/name), "
         "or bare business name/username mentioned in the command text itself (e.g. 'sohscape.com', 'https://...', "
         "'www.foo.in', '@skyweds_events', 'instagram.com/skyweds_events', or a bare handle-like name such as "
@@ -11726,15 +11754,35 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
     )
     resp = await asyncio.to_thread(
         client.chat.completions.create,
-        model="gpt-4o",
+        # Classification is a cheap, well-bounded categorization task (fixed
+        # list of ~19 intents) — gpt-4o-mini handles it reliably at a
+        # fraction of the cost/latency of gpt-4o. The actual content
+        # generation/analysis steps once intent is known still use gpt-4o
+        # elsewhere in this file — this switch is scoped to classification
+        # only, per the "cheap model first, frontier model on escalation"
+        # pattern.
+        model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        max_tokens=300,
+        max_tokens=400,
         temperature=0,
     )
     parsed = json.loads(resp.choices[0].message.content.strip())
     if parsed.get("intent") not in _COMMAND_INTENTS:
         parsed["intent"] = "unknown"
+    try:
+        parsed["confidence"] = max(0.0, min(1.0, float(parsed.get("confidence", 1.0))))
+    except (TypeError, ValueError):
+        parsed["confidence"] = 1.0
+    if not isinstance(parsed.get("clarifying_options"), list):
+        parsed["clarifying_options"] = []
+    # Only keep well-formed options with a valid intent — never let a
+    # malformed clarifying_options entry cause the confidence-escalation
+    # branch to crash or offer a broken choice.
+    parsed["clarifying_options"] = [
+        o for o in parsed["clarifying_options"]
+        if isinstance(o, dict) and o.get("intent") in _COMMAND_INTENTS and o.get("label")
+    ][:3]
     return parsed
 
 
@@ -11884,6 +11932,147 @@ async def _run_multi_step_command(task_id: str, intent: str, url: str, industry:
         task["status"] = "error"
         task["result"] = {"success": False, "error": str(_e)}
         task["extra_fields"] = {}
+    finally:
+        # Always runs — including on the early `return`s above for a failed
+        # analyze/kit step — so every multi-step command gets a trust badge
+        # and an audit record exactly like the single-step path does, no
+        # matter where in the chain it stopped.
+        try:
+            _result = task.get("result") or {}
+            _extra = task.get("extra_fields") or {}
+            _trust_verdict, _based_on = _command_top_level_trust(intent, _result)
+            _extra.setdefault("trust_verdict", _trust_verdict)
+            _extra.setdefault("based_on", _based_on)
+            task["extra_fields"] = _extra
+            _write_command_audit_log(
+                _request_user_id.get(), task.get("text_cmd", ""), intent, task.get("confidence"),
+                task.get("params_used", {}),
+                _command_actions_taken(intent, _result, _extra),
+                _command_data_sources(intent, _result),
+                task.get("reasoning", "") or f"{intent} completed",
+            )
+        except Exception as _fin_e:
+            logger.warning(f"[COMMAND TASK {task_id}] trust/audit finalization failed (non-fatal): {_fin_e}")
+
+
+# ── Command Center: trust transparency + audit logging ──────────────────────
+def _command_top_level_trust(intent: str, result: dict) -> tuple:
+    """
+    Derives a top-level (trust_verdict, based_on) pair for ANY /command
+    result — reusing the existing _compute_trust_verdict/_compute_based_on_line
+    helpers (the same ones Marketing Brain/Creative Studio already use)
+    rather than inventing a second transparency system. Each intent already
+    computes its own grounding signal somewhere; this just finds it.
+    """
+    if not isinstance(result, dict):
+        return _compute_trust_verdict(False, False), _compute_based_on_line(False, False, False)
+
+    # full_report and autonomous_marketing already return a top-level trust_verdict.
+    if result.get("trust_verdict"):
+        return result["trust_verdict"], result.get("based_on") or _compute_based_on_line(False, False, False)
+
+    # full_campaign_launch / meta_campaign_launch nest it under brain_result.
+    brain = result.get("brain_result")
+    if isinstance(brain, dict) and brain.get("trust_verdict"):
+        return brain["trust_verdict"], brain.get("based_on") or ""
+
+    # hashtag_generation / ad_script_writing already set these two flags.
+    if "grounded_in_business_data" in result or "research_used" in result:
+        has_dna = bool(result.get("grounded_in_business_data"))
+        researched = bool(result.get("research_used"))
+        extra = "Grounded in live web research, not stored business data." if researched and not has_dna else ""
+        return _compute_trust_verdict(has_dna, researched, extra), _compute_based_on_line(has_dna, researched, False)
+
+    # trend_research / market_query set based_on directly (live Tavily search) but no verdict.
+    if result.get("based_on"):
+        return _compute_trust_verdict(True, False, "Grounded in real-time web search results, not invented."), result["based_on"]
+
+    return _compute_trust_verdict(False, False), _compute_based_on_line(False, False, False)
+
+
+def _command_actions_taken(intent: str, result: dict, extra_fields: dict) -> list:
+    """Short, human-readable list of what was actually done — shown step-by-step
+    in the audit card, not just the final result."""
+    result = result or {}
+    if intent in ("full_campaign_launch", "meta_campaign_launch"):
+        steps = ["Ran Marketing Brain analysis on the business", "Generated the ad campaign kit (keywords, headlines, audiences)"]
+        push = result.get("gads_result") or result.get("meta_result") or {}
+        if push.get("success"):
+            platform = "Google Ads" if intent == "full_campaign_launch" else "Meta Ads"
+            cid = push.get("campaign_id")
+            steps.append(f"Created a real (paused) {platform} campaign" + (f" — ID {cid}" if cid else ""))
+        else:
+            steps.append("Campaign creation failed — see result for details")
+        return steps
+    if intent == "full_report":
+        return ["Ran the complete Marketing Brain analysis (business, market, competitor, audience, campaign strategy)"]
+    if intent == "autonomous_marketing":
+        return ["Decided a complete campaign plan from the given budget and goal"]
+    if intent == "prospect_discovery":
+        n = len(_command_count_prospects_source(result))
+        return [f"Searched for prospects and found {n}" if n else "Searched for prospects — none found"]
+    if intent in ("hashtag_generation", "ad_script_writing"):
+        source = "live public research" if result.get("research_used") else ("stored business memory" if result.get("grounded_in_business_data") else "generic context (no business data found)")
+        return [f"Generated {'hashtags/captions' if intent == 'hashtag_generation' else 'a video ad script'} grounded in {source}"]
+    if intent in ("trend_research", "market_query"):
+        return ["Ran a live web search", "Summarized findings grounded in real search results"]
+    if result.get("success") is False:
+        return [f"Attempted {intent} — failed: {result.get('error', 'unknown error')}"]
+    return [f"Ran {intent}"]
+
+
+def _command_count_prospects_source(result: dict) -> list:
+    """Mirrors the frontend's prospectsFromResult() just for audit-log counting."""
+    d = (result or {}).get("data") or {}
+    if isinstance(d.get("prospects"), list):
+        return d["prospects"]
+    return [*(d.get("hot_prospects") or []), *(d.get("warm_prospects") or []), *(d.get("cold_prospects") or [])]
+
+
+def _command_data_sources(intent: str, result: dict) -> list:
+    result = result or {}
+    sources = []
+    if isinstance(result.get("brain_result"), dict) or "sections" in result:
+        sources.append("Marketing Brain (business/market/audience intelligence)")
+    if result.get("research_used") or intent in ("trend_research", "market_query"):
+        sources.append("Live Tavily web search")
+    if result.get("grounded_in_business_data"):
+        sources.append("Stored business memory")
+    if result.get("gads_result"):
+        sources.append("Google Ads API")
+    if result.get("meta_result"):
+        sources.append("Meta Ads API")
+    if intent == "prospect_discovery":
+        sources.append("Google Places / prospect search")
+    if not sources:
+        sources.append("Generic AI generation — no external data source")
+    return sources
+
+
+def _write_command_audit_log(user_id: str, command_text: str, intent: str, confidence,
+                              params_used: dict, actions_taken: list, data_sources_used: list,
+                              result_summary: str) -> None:
+    """Fire-and-forget audit record — never blocks or fails the actual command response."""
+    try:
+        db = SessionLocal()
+        try:
+            row = CommandAuditLogModel(
+                user_id=user_id or "",
+                command_text=command_text,
+                classified_intent=intent,
+                confidence=str(confidence if confidence is not None else ""),
+                params_used=json.dumps(params_used or {}, ensure_ascii=False),
+                actions_taken=json.dumps(actions_taken or [], ensure_ascii=False),
+                data_sources_used=json.dumps(data_sources_used or [], ensure_ascii=False),
+                result_summary=(result_summary or "")[:2000],
+                created_at=datetime.now().strftime("%d %b %Y, %I:%M %p"),
+            )
+            db.add(row)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as _e:
+        logger.warning(f"[COMMAND AUDIT] write failed (non-fatal): {_e}")
 
 
 @app.get("/command/status/{task_id}")
@@ -11894,19 +12083,71 @@ async def command_status(task_id: str):
     return {"success": True, **task}
 
 
+def _audit_log_dict(r: CommandAuditLogModel) -> dict:
+    def _jsonload(s, default):
+        try:
+            return json.loads(s) if s else default
+        except Exception:
+            return default
+    return {
+        "id": r.id,
+        "command_text": r.command_text,
+        "classified_intent": r.classified_intent,
+        "confidence": r.confidence,
+        "params_used": _jsonload(r.params_used, {}),
+        "actions_taken": _jsonload(r.actions_taken, []),
+        "data_sources_used": _jsonload(r.data_sources_used, []),
+        "result_summary": r.result_summary,
+        "timestamp": r.created_at,
+    }
+
+
+@app.get("/command/audit-log")
+async def command_audit_log(limit: int = 20, offset: int = 0):
+    """
+    Paginated, user-scoped Command History — every /command execution that
+    actually ran (not the missing-param/clarification back-and-forth) has a
+    row here. When user_id is unset (local dev, no Supabase JWT), this
+    matches the rest of the app's convention of passing through unscoped
+    rather than returning nothing.
+    """
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    uid = _request_user_id.get()
+    db = SessionLocal()
+    try:
+        q = db.query(CommandAuditLogModel)
+        if uid:
+            q = q.filter(CommandAuditLogModel.user_id == uid)
+        total = q.count()
+        rows = q.order_by(CommandAuditLogModel.id.desc()).offset(offset).limit(limit).all()
+        items = [_audit_log_dict(r) for r in rows]
+    finally:
+        db.close()
+    return {"success": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+
 @app.post("/command")
 async def command_center(request: CommandRequest):
     text_cmd = (request.text or "").strip()
     if not text_cmd:
         return {"success": False, "error": "text is required"}
 
-    try:
-        classification = await _classify_command(text_cmd, request.url, request.industry, request.city, request.budget)
-    except Exception as _e:
-        logger.error(f"[COMMAND] classification failed: {_e}")
-        return {"success": False, "error": f"Could not understand command: {_e}"}
+    if request.forced_intent and request.forced_intent in _COMMAND_INTENTS:
+        # User picked one of the clarifying_options chips directly — skip
+        # classification entirely rather than re-prompting GPT, since the
+        # user has already resolved the ambiguity themselves.
+        classification = {"intent": request.forced_intent, "extracted": {}, "reasoning": "You selected this interpretation directly.", "confidence": 1.0, "clarifying_options": []}
+    else:
+        try:
+            classification = await _classify_command(text_cmd, request.url, request.industry, request.city, request.budget)
+        except Exception as _e:
+            logger.error(f"[COMMAND] classification failed: {_e}")
+            return {"success": False, "error": f"Could not understand command: {_e}"}
 
-    intent    = classification.get("intent", "unknown")
+    intent      = classification.get("intent", "unknown")
+    confidence  = classification.get("confidence", 1.0)
+    clarify_opts = classification.get("clarifying_options") or []
     extracted = classification.get("extracted", {}) or {}
     industry  = request.industry or extracted.get("industry") or ""
     city      = request.city or extracted.get("city") or ""
@@ -11914,12 +12155,23 @@ async def command_center(request: CommandRequest):
     goal      = request.goal or extracted.get("goal") or text_cmd
     url       = request.url or extracted.get("url") or ""
 
-    logger.info(f"[COMMAND] text={text_cmd!r} -> intent={intent!r} url={url!r} industry={industry!r} city={city!r} budget={budget}")
+    logger.info(f"[COMMAND] text={text_cmd!r} -> intent={intent!r} confidence={confidence} url={url!r} industry={industry!r} city={city!r} budget={budget}")
 
     # Included on every early "missing param" return below so the frontend can
     # carry these already-known values forward when the user replies in the
     # same box (e.g. just "10000") instead of losing context on every retry.
     _pu = {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal}
+
+    # Confidence-based escalation: genuinely ambiguous between 2-3 very
+    # different actions — ask, don't guess. Skipped when the user already
+    # resolved this via forced_intent above (confidence is forced to 1.0
+    # and clarifying_options to [] in that branch, so this never re-triggers).
+    if confidence < 0.6 and len(clarify_opts) >= 2:
+        return {
+            "success": False, "needs_clarification": True,
+            "question": f"I'm not fully sure what you mean by \"{text_cmd}\" — did you mean:",
+            "options": clarify_opts, "params_used": _pu,
+        }
 
     if intent in _MULTI_STEP_INTENTS:
         # Real spend is on the line for the two campaign-launch intents —
@@ -11934,10 +12186,21 @@ async def command_center(request: CommandRequest):
         if intent == "autonomous_marketing" and not goal:
             return {"success": False, "intent": intent, "error": "Missing goal — describe what you need, e.g. 'doctor leads'", "params_used": _pu}
 
+        # Plan preview: show what will actually happen and wait for
+        # confirmation before spending real time (and, for campaign-launch
+        # intents, actually creating a paused ad campaign) — unless the user
+        # already confirmed, or has "Run Automatically" turned on.
+        if not request.confirm and not request.auto_run:
+            return {
+                "success": True, "intent": intent, "reasoning": classification.get("reasoning", ""),
+                "params_used": _pu, "needs_confirmation": True,
+                "planned_steps": [{"key": s["key"], "label": s["label"]} for s in _COMMAND_STEP_TEMPLATES[intent]],
+            }
+
         task_id = str(uuid.uuid4())
         _COMMAND_TASKS[task_id] = {
             "status": "running", "intent": intent, "reasoning": classification.get("reasoning", ""),
-            "params_used": _pu,
+            "params_used": _pu, "text_cmd": text_cmd, "confidence": confidence,
             "steps": [{"key": s["key"], "label": s["label"], "status": "pending", "detail": None} for s in _COMMAND_STEP_TEMPLATES[intent]],
             "result": None, "extra_fields": {},
         }
@@ -12193,14 +12456,31 @@ async def command_center(request: CommandRequest):
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[COMMAND] dispatch to {intent!r} failed: {_e}\n{tb}")
+        _write_command_audit_log(
+            _request_user_id.get(), text_cmd, intent, confidence, _pu,
+            [f"Attempted {intent} — raised an error before completing"], [], str(_e),
+        )
         return {"success": False, "intent": intent, "error": str(_e)}
+
+    trust_verdict, based_on = _command_top_level_trust(intent, result)
+    actions_taken = _command_actions_taken(intent, result, extra_fields)
+    data_sources = _command_data_sources(intent, result)
+    _write_command_audit_log(
+        _request_user_id.get(), text_cmd, intent, confidence,
+        {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal},
+        actions_taken, data_sources,
+        classification.get("reasoning", "") or f"{intent} completed",
+    )
 
     return {
         "success":   True,
         "intent":    intent,
+        "confidence": confidence,
         "reasoning": classification.get("reasoning", ""),
         "params_used": {"url": url, "industry": industry, "city": city, "budget": budget, "goal": goal},
         "result":    result,
+        "trust_verdict": trust_verdict,
+        "based_on":      based_on,
         **extra_fields,
     }
 
