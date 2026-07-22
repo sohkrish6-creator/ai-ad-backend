@@ -10073,12 +10073,23 @@ async def gads_add_keywords(request: AddKeywordsRequest):
 #  pages_show_list is what makes /me/accounts return the user's Pages at
 #  all — without it, Creator Finder's "no Facebook Page is accessible"
 #  error is expected, not a bug (see _get_own_ig_business_account_id).
-#  instagram_basic + pages_read_engagement are additionally required to
-#  read a Page's linked instagram_business_account field and to call
-#  Business Discovery once a Page IS found (added 2026-07-22 — Creator
-#  Finder's Instagram enrichment needs these; ads-only connections never
-#  needed them before).
-_META_OAUTH_SCOPES = "ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,instagram_basic"
+#  pages_read_engagement is additionally required to read a Page's linked
+#  instagram_business_account field and to call Business Discovery once a
+#  Page IS found (added 2026-07-22 for Creator Finder's Instagram
+#  enrichment; ads-only connections never needed it before).
+#  instagram_basic was tried here too but Facebook's OAuth dialog rejects
+#  it outright with "Invalid Scopes: instagram_basic" for this app/API
+#  version (confirmed live 2026-07-22) — it's not simply optional, it's
+#  unrequestable. instagram_business_basic exists in Meta's current docs as
+#  a nominal successor, but the docs tie it to the SEPARATE "Instagram API
+#  with Instagram Login" product (a different OAuth host, instagram.com,
+#  not this facebook.com/dialog/oauth flow) — adding it here risked the
+#  identical invalid-scope failure, so it's deliberately left out rather
+#  than guessed at. If instagram_business_account/Business Discovery still
+#  fails to authorize with pages_show_list+pages_read_engagement+
+#  business_management alone, that's the next thing to investigate — not
+#  another instagram_* scope guess.
+_META_OAUTH_SCOPES = "ads_management,ads_read,business_management,pages_show_list,pages_read_engagement"
 _META_GRAPH = "https://graph.facebook.com/v21.0"
 
 
