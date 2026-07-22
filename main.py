@@ -15253,18 +15253,40 @@ async def _get_own_ig_business_account_id(uid: str):
 
 @app.get("/creator-finder/debug-meta-pages")
 async def creator_finder_debug_meta_pages():
-    """Diagnostic endpoint — returns the RAW JSON from /me/accounts,
-    /me/businesses, and /{business_id}/owned_pages + /{business_id}/client_pages
-    for every business, side by side, so a "Page not accessible" report can
-    be root-caused directly from the actual API responses instead of
+    """Diagnostic endpoint — returns the RAW JSON from /debug_token (which
+    Facebook identity the stored token actually belongs to, its granted
+    scopes, validity), /me (human-readable name for that identity),
+    /me/accounts, and /me/businesses -> owned_pages/client_pages for every
+    business, side by side, so a "Page not accessible" report can be
+    root-caused directly from the actual API responses instead of
     guesswork. Not linked from any UI; hit it directly while authenticated."""
     uid = _request_user_id.get()
     access_token, err = await _resolve_meta_access_token(uid)
     if err:
         return {"success": False, "error": err}
 
+    app_id     = _genv("META_APP_ID")
+    app_secret = _genv("META_APP_SECRET")
+
     raw = {}
     async with httpx.AsyncClient(timeout=15) as c:
+        # Which identity does this stored token actually belong to, and
+        # what did it actually get granted — independent of what we asked
+        # for in the OAuth scope string.
+        try:
+            r = await c.get(f"{_META_GRAPH}/debug_token", params={
+                "input_token": access_token, "access_token": f"{app_id}|{app_secret}",
+            })
+            raw["debug_token"] = r.json()
+        except Exception as _e:
+            raw["debug_token"] = {"error": str(_e)}
+
+        try:
+            r = await c.get(f"{_META_GRAPH}/me", params={"fields": "id,name", "access_token": access_token})
+            raw["me"] = r.json()
+        except Exception as _e:
+            raw["me"] = {"error": str(_e)}
+
         try:
             r = await c.get(f"{_META_GRAPH}/me/accounts", params={"fields": "id,name,access_type", "access_token": access_token})
             raw["me_accounts"] = r.json()
