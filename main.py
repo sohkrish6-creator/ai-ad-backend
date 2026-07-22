@@ -10151,6 +10151,31 @@ else:
     logger.info("[MIGRATE] meta_oauth_tokens id sequence default already present — no action needed")
 
 
+def _meta_global_disconnected() -> bool:
+    """True if Krish's global (env-var) Meta connection has been explicitly
+    disconnected via Account -> Connected Accounts.
+
+    Krish's Meta connection normally lives entirely in env vars (the System
+    User token) with NO row in meta_oauth_tokens at all — so /meta/disconnect
+    used to run `UPDATE ... WHERE user_id=:uid`, which silently affected 0
+    rows for him and left every read path (this function's callers) still
+    seeing the env vars as connected. The fix: /meta/disconnect now UPSERTs
+    an override row keyed to KRISH_USER_ID with revoked=TRUE, and every
+    place that used to read the env vars directly (get_meta_ads_client,
+    /meta/status, /connected-accounts, Creator Finder's IG lookup) checks
+    this override first. Re-connecting through the real OAuth flow
+    (/meta/callback) clears it back to revoked=FALSE.
+    """
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    if not krish_uid:
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": krish_uid}).fetchone()
+    return bool(row and row[0])
+
+
 def get_meta_ads_client_for_user(uid: str) -> tuple:
     """Returns (api, ad_account_id) using the user's stored OAuth token.
 
@@ -10201,6 +10226,11 @@ def get_meta_ads_client():
     _krish = os.getenv("KRISH_USER_ID", "")
     if _uid and _uid != _krish:
         return get_meta_ads_client_for_user(_uid)
+
+    if _meta_global_disconnected():
+        raise MetaNotConnectedError(
+            "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+        )
 
     # Global env-var path (Krish's System User token)
     from facebook_business.api import FacebookAdsApi
@@ -15097,31 +15127,66 @@ async def creator_finder_discover_youtube(request: CreatorFinderYoutubeRequest):
 async def _get_own_ig_business_account_id(uid: str):
     """Returns (ig_business_account_id, access_token, error_msg). Meta's
     Business Discovery API can only be queried FROM an Instagram Business/
-    Creator account you control — this looks up the caller's own connected
-    Page's linked IG Business Account for that purpose. Never fabricates an
-    ID; returns an honest error_msg (error_msg=None on success) at every
-    failure point instead."""
-    if not uid:
-        return None, None, "Not authenticated."
-    with engine.connect() as conn:
-        row = conn.execute(text(
-            "SELECT encrypted_access_token, page_id, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
-        ), {"uid": uid}).fetchone()
-    if not row or row[2]:
-        return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
-    if not row[1]:
-        return None, None, "No Facebook Page selected. Go to Account → Connected Accounts and select a Page with a linked Instagram Business account."
-    access_token = decrypt_token(row[0])
+    Creator account you control — this resolves the caller's own linked IG
+    Business Account for that purpose. Never fabricates an ID; returns an
+    honest error_msg (error_msg=None on success) at every failure point.
+
+    Mirrors the same "Krish/global env-var token vs per-user OAuth table"
+    branching as get_meta_ads_client()/get_meta_ads_client_for_user() —
+    Krish's Meta connection lives entirely in global env vars with no row
+    in meta_oauth_tokens at all, so checking only that table wrongly
+    reported "Meta Ads account not connected" for him even though
+    Account -> Connected Accounts correctly showed Connected (found live
+    2026-07-22).
+
+    Also doesn't rely on a single stored page_id: probes EVERY Page the
+    access token can see (via /me/accounts) for a linked IG Business
+    Account, so "Meta connected but no Page has Instagram linked" is
+    distinguished from "Meta not connected at all" instead of collapsing
+    both into the same generic error.
+    """
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+    stored_page_id = None
+
+    if not uid or uid == krish_uid:
+        if _meta_global_disconnected():
+            return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+        access_token = _genv("META_ACCESS_TOKEN")
+        if not access_token:
+            return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+    else:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT encrypted_access_token, page_id, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+        if not row or row[2]:
+            return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+        access_token = decrypt_token(row[0])
+        stored_page_id = row[1] or None
+
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            resp = await c.get(f"{_META_GRAPH}/{row[1]}", params={
-                "fields": "instagram_business_account", "access_token": access_token,
+            page_ids_to_try = [stored_page_id] if stored_page_id else []
+            resp = await c.get(f"{_META_GRAPH}/me/accounts", params={
+                "fields": "id,name", "access_token": access_token,
             })
-            data = resp.json()
-        ig_id = (data.get("instagram_business_account") or {}).get("id")
-        if not ig_id:
-            return None, None, "Your connected Facebook Page doesn't have an Instagram Business account linked — link one in Meta Business Suite first."
-        return ig_id, access_token, None
+            for p in resp.json().get("data", []):
+                pid = p.get("id")
+                if pid and pid not in page_ids_to_try:
+                    page_ids_to_try.append(pid)
+
+            if not page_ids_to_try:
+                return None, None, "Meta Ads is connected, but no Facebook Page is accessible with this connection — check Meta Business Suite."
+
+            for pid in page_ids_to_try:
+                page_resp = await c.get(f"{_META_GRAPH}/{pid}", params={
+                    "fields": "instagram_business_account", "access_token": access_token,
+                })
+                ig_id = (page_resp.json().get("instagram_business_account") or {}).get("id")
+                if ig_id:
+                    return ig_id, access_token, None
+
+        return None, None, "Meta Ads is connected, but no Instagram Business account is linked to your Page — link one in Meta Business Suite."
     except Exception as _e:
         logger.warning(f"[CREATOR FINDER] IG business account lookup failed: {_e}")
         return None, None, f"Could not verify your Instagram Business connection: {_e}"
@@ -17382,6 +17447,8 @@ async def meta_status(request: Request):
     uid       = getattr(request.state, "user_id", "")
     krish_uid = os.getenv("KRISH_USER_ID", "")
     if not uid or uid == krish_uid:
+        if _meta_global_disconnected():
+            return {"connected": False}
         return {
             "connected":    bool(_genv("META_ACCESS_TOKEN")),
             "method":       "global",
@@ -17403,14 +17470,32 @@ async def meta_status(request: Request):
 
 @app.delete("/meta/disconnect")
 async def meta_disconnect(request: Request):
-    """Revoke the current user's Meta Ads OAuth token."""
+    """Revoke the current user's Meta Ads OAuth token.
+
+    UPSERTs rather than UPDATEs. Krish's connection normally lives entirely
+    in global env vars (the System User token) with NO row in this table —
+    a plain UPDATE was a silent no-op for him: the button reported success
+    but /connected-accounts kept reading the env vars directly and still
+    showed Connected. See _meta_global_disconnected() for the read side of
+    this fix.
+    """
     uid = getattr(request.state, "user_id", "")
     if not uid:
         return {"success": False, "error": "Not authenticated"}
+    now = datetime.utcnow().isoformat()
     with engine.begin() as conn:
-        conn.execute(text(
-            "UPDATE meta_oauth_tokens SET revoked=TRUE WHERE user_id=:uid"
-        ), {"uid": uid})
+        if _is_sqlite:
+            conn.execute(text(
+                "INSERT INTO meta_oauth_tokens (user_id, encrypted_access_token, connected_at, updated_at, revoked) "
+                "VALUES (:uid, '', :ts, :ts, TRUE) "
+                "ON CONFLICT(user_id) DO UPDATE SET revoked=TRUE, updated_at=:ts"
+            ), {"uid": uid, "ts": now})
+        else:
+            conn.execute(text(
+                "INSERT INTO meta_oauth_tokens (id, user_id, encrypted_access_token, connected_at, updated_at, revoked) "
+                "VALUES (nextval('meta_oauth_tokens_id_seq'), :uid, '', :ts, :ts, TRUE) "
+                "ON CONFLICT(user_id) DO UPDATE SET revoked=TRUE, updated_at=:ts"
+            ), {"uid": uid, "ts": now})
     return {"success": True}
 
 
@@ -17439,7 +17524,7 @@ async def connected_accounts(request: Request):
 
     # Meta Ads
     if not uid or uid == krish_uid:
-        m_connected = bool(_genv("META_ACCESS_TOKEN"))
+        m_connected = bool(_genv("META_ACCESS_TOKEN")) and not _meta_global_disconnected()
         m_info = {"method": "global", "ad_account_id": _genv("META_AD_ACCOUNT_ID") or None} if m_connected else {}
     else:
         with engine.connect() as conn:
