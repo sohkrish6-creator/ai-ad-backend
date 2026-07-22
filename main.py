@@ -14795,6 +14795,7 @@ async def fetch_youtube_channel_stats(handle_or_url: str) -> dict:
                     return {
                         "channel_id":       ch.get("id", ""),
                         "title":            snippet.get("title", ""),
+                        "description":      snippet.get("description", ""),
                         "subscriber_count": (None if stats.get("hiddenSubscriberCount")
                                              else int(stats.get("subscriberCount", 0))),
                         "video_count":      int(stats.get("videoCount", 0)),
@@ -14841,6 +14842,460 @@ async def fetch_youtube_channel_recent_videos(channel_id: str, max_results: int 
     except Exception as _e:
         logger.warning(f"[SIE] YouTube recent videos fetch failed: {_e}")
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CREATOR FINDER — find & reach out to Instagram/YouTube creators using ONLY
+#  what's already in the stack (YouTube Data API, Meta Graph API Business
+#  Discovery via the user's own connected Meta OAuth token, GPT reasoning).
+#  No paid third-party API (Modash/Apify/etc). HONESTY RULE enforced
+#  throughout: every follower/subscriber/view number returned is either a
+#  real number from a real API call, or the field is None/omitted with an
+#  honest "not verified" reason — GPT is never asked to produce a metric,
+#  only to reason ABOUT metrics it's given.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_youtube_channel_search(query: str, max_results: int = 15) -> list:
+    """Search for YOUTUBE CHANNELS (type=channel) matching a niche/city query —
+    distinct from fetch_youtube_search above, which searches VIDEOS. Returns
+    only channel_id + real snippet text; no statistics (search.list doesn't
+    return subscriber counts — those need a follow-up channels.list call)."""
+    if not YOUTUBE_API_KEY or not query.strip():
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "key": YOUTUBE_API_KEY, "q": query, "part": "snippet",
+                    "type": "channel", "maxResults": min(max(max_results, 1), 50),
+                },
+            )
+            items = resp.json().get("items", [])
+            return [
+                {
+                    "channel_id":  it["id"]["channelId"],
+                    "title":       it["snippet"]["title"],
+                    "description": it["snippet"].get("description", ""),
+                }
+                for it in items if it.get("id", {}).get("channelId")
+            ]
+    except Exception as _e:
+        logger.warning(f"[CREATOR FINDER] YouTube channel search failed: {_e}")
+        return []
+
+
+async def fetch_youtube_channels_batch(channel_ids: list) -> dict:
+    """Batch channels.list lookup by ID (up to 50 per call) — one API call
+    instead of one-per-candidate. Returns {channel_id: real_stats_dict}."""
+    if not YOUTUBE_API_KEY or not channel_ids:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"key": YOUTUBE_API_KEY, "part": "snippet,statistics", "id": ",".join(channel_ids[:50])},
+            )
+            out = {}
+            for ch in resp.json().get("items", []):
+                stats = ch.get("statistics", {})
+                snippet = ch.get("snippet", {})
+                out[ch["id"]] = {
+                    "channel_id":       ch["id"],
+                    "title":            snippet.get("title", ""),
+                    "description":      snippet.get("description", ""),
+                    "subscriber_count": (None if stats.get("hiddenSubscriberCount")
+                                         else int(stats.get("subscriberCount", 0))),
+                    "video_count":      int(stats.get("videoCount", 0)),
+                    "view_count":       int(stats.get("viewCount", 0)),
+                    "published_at":     snippet.get("publishedAt", "")[:10],
+                    "thumbnail":        snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                }
+            return out
+    except Exception as _e:
+        logger.warning(f"[CREATOR FINDER] YouTube batch channel stats failed: {_e}")
+        return {}
+
+
+def _creator_audience_fit_score(count) -> int:
+    """A SCORING HEURISTIC (not a verified fact about the creator) — favors
+    micro/mid-tier creators for local/niche business marketing over
+    mega-influencers, who are typically a poor fit for small local ad
+    budgets and less trusted by hyperlocal audiences. Only the input
+    `count` itself is real/verified; this function just buckets it.
+    Returns None only when count is None (unverified/hidden)."""
+    if count is None:
+        return None
+    if count < 500:
+        return 25
+    if count < 5000:
+        return 70
+    if count < 100_000:
+        return 95
+    if count < 500_000:
+        return 85
+    if count < 2_000_000:
+        return 60
+    return 35
+
+
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+
+
+async def _creator_finder_score_batch(enriched: list, niche: str, city: str, platform: str) -> list:
+    """One GPT call scores CONTENT RELEVANCE only, strictly grounded in the
+    real bio/description text already fetched — GPT never touches the
+    numeric fields (subscriber/follower counts, view counts), those are
+    computed purely from verified API data before this function is called.
+    If `niche` is blank (enrich-instagram has no niche input), GPT is asked
+    to honestly summarize the apparent content focus instead of scoring
+    relevance to an unspecified niche."""
+    if not enriched:
+        return []
+
+    lines = ""
+    for i, e in enumerate(enriched):
+        label = e.get("channel_title") or e.get("handle") or f"Candidate {i + 1}"
+        size_field = "Subscribers (verified)" if platform == "youtube" else "Followers (verified)"
+        size_value = e.get("subscriber_count") if platform == "youtube" else e.get("follower_count")
+        lines += (
+            f"\n---\nCandidate {i + 1}: {label}\n"
+            f"{size_field}: {size_value if size_value is not None else 'hidden/unknown'}\n"
+            f"Bio/description (real, verified text): {(e.get('description') or 'none listed')[:400]}\n"
+        )
+
+    if niche:
+        task_instruction = (
+            f"Judge CONTENT RELEVANCE: does this creator's real bio/description text above suggest their content "
+            f"actually relates to '{niche}'" + (f" / {city}" if city else "") + "? Base this STRICTLY on the "
+            "bio/description text given — never assume content you cannot see (don't claim posting frequency, "
+            "audience demographics, or brand deals not stated above).\n"
+            'Return ONLY JSON: {"scores": [{"candidate": 1, "content_relevance_score": 0-100, '
+            '"relevance_reasoning": "one sentence, grounded only in the text given"}, ...]}'
+        )
+    else:
+        task_instruction = (
+            "No specific niche was given. Instead, in one sentence, honestly summarize what content focus this "
+            "creator's real bio text suggests (e.g. 'fitness and nutrition', 'wedding photography'). If the bio "
+            "gives no real signal, say so honestly rather than guessing.\n"
+            'Return ONLY JSON: {"scores": [{"candidate": 1, "content_relevance_score": null, '
+            '"relevance_reasoning": "one sentence, grounded only in the text given, or an honest \'no signal\' note"}, ...]}'
+        )
+
+    prompt = (
+        f"You are scoring REAL, VERIFIED {'YouTube channels' if platform == 'youtube' else 'Instagram creator profiles'} "
+        "as potential brand-collaboration partners. Every number above came from a real API call — never invent, "
+        "adjust, or second-guess any of it; your only job is qualitative judgment on the bio/description text.\n"
+        f"CANDIDATES:\n{lines}\n\n{task_instruction}\nScore/describe all {len(enriched)} candidates."
+    )
+    score_map = {}
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create, model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}, max_tokens=1200, temperature=0.2,
+        )
+        parsed = json.loads(resp.choices[0].message.content.strip())
+        score_map = {
+            s["candidate"]: s for s in parsed.get("scores", [])
+            if isinstance(s, dict) and isinstance(s.get("candidate"), int)
+        }
+    except Exception as _e:
+        logger.warning(f"[CREATOR FINDER] scoring GPT call failed (candidates still returned, unscored): {_e}")
+
+    out = []
+    for i, e in enumerate(enriched):
+        s = score_map.get(i + 1, {})
+        content_relevance_score = s.get("content_relevance_score")
+        component_scores = [
+            x for x in (e.get("audience_size_fit_score"), e.get("engagement_signal_score"), content_relevance_score)
+            if isinstance(x, (int, float))
+        ]
+        overall_score = round(sum(component_scores) / len(component_scores)) if component_scores else 0
+        out.append({
+            **e,
+            "content_relevance_score": content_relevance_score,
+            "relevance_reasoning":     s.get("relevance_reasoning", ""),
+            "overall_score":           overall_score,
+        })
+    return out
+
+
+class CreatorFinderYoutubeRequest(BaseModel):
+    niche: str
+    city: str = ""
+    max_results: int = 15
+
+
+@app.post("/creator-finder/discover-youtube")
+async def creator_finder_discover_youtube(request: CreatorFinderYoutubeRequest):
+    niche = (request.niche or "").strip()
+    city  = (request.city or "").strip()
+    if not niche:
+        return {"success": False, "error": "niche is required"}
+    if not YOUTUBE_API_KEY:
+        return {"success": False, "error": "YouTube API not configured"}
+    max_results = max(3, min(request.max_results or 15, 25))
+
+    query = f"{niche} {city}".strip() if city else niche
+    candidates = await fetch_youtube_channel_search(query, max_results=max_results)
+    if not candidates:
+        return {"success": False, "error": f"YouTube search returned no channels for \"{query}\" — try a broader niche/city."}
+
+    channel_ids = [c["channel_id"] for c in candidates]
+    stats_map   = await fetch_youtube_channels_batch(channel_ids)
+
+    recent_lists = await asyncio.gather(
+        *[fetch_youtube_channel_recent_videos(cid, max_results=6) for cid in channel_ids],
+        return_exceptions=True,
+    )
+
+    enriched = []
+    for i, cand in enumerate(candidates):
+        cid = cand["channel_id"]
+        stats = stats_map.get(cid)
+        if not stats:
+            continue  # couldn't verify this channel's stats — skip rather than guess
+        recent = recent_lists[i] if isinstance(recent_lists[i], list) else []
+        views_list = [v["views"] for v in recent if isinstance(v.get("views"), (int, float)) and v["views"] > 0]
+        avg_views  = round(sum(views_list) / len(views_list)) if views_list else None
+        sub_count  = stats.get("subscriber_count")
+        ratio      = (avg_views / sub_count) if (avg_views is not None and sub_count) else None
+        email_m    = _EMAIL_RE.search(stats.get("description", "") or "")
+
+        enriched.append({
+            "platform":                 "youtube",
+            "channel_id":               cid,
+            "channel_title":            stats.get("title") or cand.get("title"),
+            "channel_url":              f"https://www.youtube.com/channel/{cid}",
+            "thumbnail":                stats.get("thumbnail", ""),
+            "subscriber_count":         sub_count,
+            "video_count":              stats.get("video_count"),
+            "avg_recent_views":         avg_views,
+            "views_per_sub_ratio":      round(ratio, 3) if ratio is not None else None,
+            "description":              (stats.get("description") or "")[:500],
+            "contact_email":            email_m.group(0) if email_m else None,
+            "recent_videos_sample":     recent[:3],
+            "audience_size_fit_score":  _creator_audience_fit_score(sub_count),
+            "engagement_signal_score":  min(100, round(ratio * 400)) if ratio is not None else None,
+            "verified":                 True,
+            "data_source":              "YouTube Data API v3 (search.list + channels.list)",
+        })
+
+    if not enriched:
+        return {"success": False, "error": "Found candidate channels but none had public statistics available to verify."}
+
+    scored = await _creator_finder_score_batch(enriched, niche, city, platform="youtube")
+    scored.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
+    return {
+        "success": True, "niche": niche, "city": city, "total_found": len(scored),
+        "results": scored,
+        "data_source": "YouTube Data API v3 — real subscriber/view counts, no third-party enrichment",
+    }
+
+
+async def _get_own_ig_business_account_id(uid: str):
+    """Returns (ig_business_account_id, access_token, error_msg). Meta's
+    Business Discovery API can only be queried FROM an Instagram Business/
+    Creator account you control — this looks up the caller's own connected
+    Page's linked IG Business Account for that purpose. Never fabricates an
+    ID; returns an honest error_msg (error_msg=None on success) at every
+    failure point instead."""
+    if not uid:
+        return None, None, "Not authenticated."
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT encrypted_access_token, page_id, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[2]:
+        return None, None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+    if not row[1]:
+        return None, None, "No Facebook Page selected. Go to Account → Connected Accounts and select a Page with a linked Instagram Business account."
+    access_token = decrypt_token(row[0])
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(f"{_META_GRAPH}/{row[1]}", params={
+                "fields": "instagram_business_account", "access_token": access_token,
+            })
+            data = resp.json()
+        ig_id = (data.get("instagram_business_account") or {}).get("id")
+        if not ig_id:
+            return None, None, "Your connected Facebook Page doesn't have an Instagram Business account linked — link one in Meta Business Suite first."
+        return ig_id, access_token, None
+    except Exception as _e:
+        logger.warning(f"[CREATOR FINDER] IG business account lookup failed: {_e}")
+        return None, None, f"Could not verify your Instagram Business connection: {_e}"
+
+
+async def _fetch_ig_business_discovery(ig_business_account_id: str, access_token: str, handle: str) -> dict:
+    """One Business Discovery lookup for one target handle. Returns
+    verified=True with real fields on success, or verified=False + an
+    honest `reason` — NEVER a guessed follower count."""
+    handle = (handle or "").strip().lstrip("@")
+    if not handle:
+        return {"handle": handle, "verified": False, "reason": "Empty handle."}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(f"{_META_GRAPH}/{ig_business_account_id}", params={
+                "fields": f"business_discovery.username({handle}){{followers_count,media_count,biography,name,profile_picture_url,website}}",
+                "access_token": access_token,
+            })
+            data = resp.json()
+        if "error" in data:
+            return {"handle": handle, "verified": False, "reason": f"Not verifiable via Meta Business Discovery: {data['error'].get('message', 'Unknown error')}"}
+        bd = data.get("business_discovery")
+        if not bd:
+            return {"handle": handle, "verified": False, "reason": "No public Business Discovery data returned — likely a personal (non-Business/Creator) account, or private/nonexistent."}
+        return {
+            "handle": handle, "verified": True,
+            "name":                bd.get("name", ""),
+            "follower_count":       bd.get("followers_count"),
+            "media_count":          bd.get("media_count"),
+            "biography":            bd.get("biography", ""),
+            "profile_picture_url":  bd.get("profile_picture_url", ""),
+            "website":              bd.get("website", ""),
+            "data_source":          "Meta Graph API Business Discovery",
+        }
+    except Exception as _e:
+        return {"handle": handle, "verified": False, "reason": f"Request failed: {_e}"}
+
+
+class CreatorFinderInstagramRequest(BaseModel):
+    handles: list[str]
+
+
+@app.post("/creator-finder/enrich-instagram")
+async def creator_finder_enrich_instagram(body: CreatorFinderInstagramRequest):
+    uid = _request_user_id.get()
+    handles = list(dict.fromkeys([h.strip().lstrip("@") for h in (body.handles or []) if h and h.strip()]))[:25]
+    if not handles:
+        return {"success": False, "error": "No handles provided"}
+
+    ig_id, access_token, err = await _get_own_ig_business_account_id(uid)
+    if err:
+        return {"success": False, "error": err, "connect_required": True}
+
+    raw_results = await asyncio.gather(*[_fetch_ig_business_discovery(ig_id, access_token, h) for h in handles])
+    verified     = [r for r in raw_results if r.get("verified")]
+    not_verified = [r for r in raw_results if not r.get("verified")]
+
+    enriched_for_scoring = [
+        {
+            "platform":                "instagram",
+            "handle":                  r["handle"],
+            "name":                    r.get("name", ""),
+            "follower_count":          r.get("follower_count"),
+            "media_count":             r.get("media_count"),
+            "description":             r.get("biography", ""),
+            "profile_picture_url":     r.get("profile_picture_url", ""),
+            "website":                 r.get("website", ""),
+            "audience_size_fit_score": _creator_audience_fit_score(r.get("follower_count")),
+            # Business Discovery exposes no per-post engagement metric — never
+            # fabricate one; leave this honestly unscored rather than guess.
+            "engagement_signal_score": None,
+            "verified":                True,
+            "data_source":             r.get("data_source"),
+        }
+        for r in verified
+    ]
+    scored = await _creator_finder_score_batch(enriched_for_scoring, "", "", platform="instagram") if enriched_for_scoring else []
+    scored.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
+
+    return {
+        "success": True, "verified_count": len(verified), "not_verified_count": len(not_verified),
+        "results": scored, "not_verified": not_verified,
+        "data_source": "Meta Graph API Business Discovery — real follower/media counts only for verified handles",
+    }
+
+
+class CreatorOutreachContext(BaseModel):
+    business_url: str = ""
+    industry: str = ""
+    city: str = ""
+    goal: str = ""
+
+
+class CreatorOutreachRequest(BaseModel):
+    creator_handle_or_channel: str
+    platform: str
+    campaign_context: CreatorOutreachContext = CreatorOutreachContext()
+
+
+@app.post("/creator-finder/generate-outreach")
+async def creator_finder_generate_outreach(body: CreatorOutreachRequest):
+    platform   = (body.platform or "").strip().lower()
+    identifier = (body.creator_handle_or_channel or "").strip()
+    if platform not in ("youtube", "instagram"):
+        return {"success": False, "error": "platform must be 'youtube' or 'instagram'"}
+    if not identifier:
+        return {"success": False, "error": "creator_handle_or_channel is required"}
+
+    # 1. Verify the creator with a REAL API call — refuse to generate anything
+    #    if we can't, rather than let GPT invent facts about an unverified handle.
+    if platform == "youtube":
+        if not YOUTUBE_API_KEY:
+            return {"success": False, "error": "YouTube API not configured"}
+        stats = await fetch_youtube_channel_stats(identifier)
+        if not stats or not stats.get("channel_id"):
+            return {"success": False, "error": f"Could not verify YouTube channel '{identifier}' — check the handle/URL. Nothing was generated."}
+        recent = await fetch_youtube_channel_recent_videos(stats["channel_id"], max_results=5)
+        creator_data = {
+            "platform":            "youtube",
+            "name":                stats.get("title"),
+            "subscriber_count":    stats.get("subscriber_count"),
+            "video_count":         stats.get("video_count"),
+            "description":         stats.get("description", ""),
+            "recent_video_titles": [v["title"] for v in recent],
+            "url":                 f"https://www.youtube.com/channel/{stats['channel_id']}",
+        }
+    else:
+        uid = _request_user_id.get()
+        ig_id, access_token, err = await _get_own_ig_business_account_id(uid)
+        if err:
+            return {"success": False, "error": err, "connect_required": True}
+        bd = await _fetch_ig_business_discovery(ig_id, access_token, identifier)
+        if not bd.get("verified"):
+            return {"success": False, "error": f"Could not verify Instagram handle '{identifier}': {bd.get('reason', 'unknown reason')}. Nothing was generated."}
+        creator_data = {
+            "platform":       "instagram",
+            "name":           bd.get("name") or identifier,
+            "follower_count": bd.get("follower_count"),
+            "media_count":    bd.get("media_count"),
+            "description":    bd.get("biography", ""),
+            "url":            f"https://instagram.com/{identifier}",
+        }
+
+    # 2. Real business grounding — same honesty-disciplined helper hashtag_generation uses.
+    ctx  = body.campaign_context or CreatorOutreachContext()
+    ctxr = await _command_memory_context(ctx.business_url, ctx.industry, ctx.city, ctx.goal or "creator collaboration outreach")
+
+    creator_lines = "\n".join(f"{k}: {v}" for k, v in creator_data.items() if v not in (None, "", []))
+    prompt = (
+        "You are writing creator/influencer outreach copy for a real business, using ONLY the verified data below. "
+        "NEVER invent facts about the creator (audience demographics, engagement rate, past brand deals, personal "
+        "details) beyond what's given here. NEVER invent facts about the business beyond what's given here.\n\n"
+        f"VERIFIED CREATOR DATA ({platform}):\n{creator_lines}\n\n"
+        f"BUSINESS CONTEXT (grounded_in_real_business_data={ctxr['grounded_in_business_data']}):\n{ctxr['context']}\n\n"
+        f"CAMPAIGN GOAL: {ctx.goal or 'general brand awareness / collaboration'}\n\n"
+        "Generate:\n"
+        "1. dm — a short, warm DM (2-4 sentences, platform-appropriate tone), referencing the creator's real name and, "
+        "only if given above, their real subscriber/follower count or bio-stated content focus.\n"
+        "2. email_pitch — a slightly more formal pitch, 3-5 short paragraphs.\n"
+        "3. collaboration_brief — {deliverables: [...], suggested_angle: '...', why_this_creator_fits: '...'} — "
+        "why_this_creator_fits MUST cite the real data given above, not assumptions.\n\n"
+        'Return ONLY JSON: {"dm": "...", "email_pitch": "...", "collaboration_brief": {"deliverables": ["..."], '
+        '"suggested_angle": "...", "why_this_creator_fits": "..."}}'
+    )
+    resp = await asyncio.to_thread(
+        client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"}, max_tokens=1400, temperature=0.4,
+    )
+    parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+    return {
+        "success": True, "creator_data": creator_data,
+        "grounded_in_business_data": ctxr["grounded_in_business_data"], "research_used": ctxr["research_used"],
+        **parsed,
+    }
 
 
 async def _sie_discover_platforms(input_value: str, input_type: str, city: str) -> dict:
