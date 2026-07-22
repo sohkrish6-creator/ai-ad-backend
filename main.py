@@ -15158,12 +15158,36 @@ async def creator_finder_discover_youtube(request: CreatorFinderYoutubeRequest):
 
 
 async def _resolve_meta_access_token(uid: str):
-    """Returns (access_token, error_msg) using the same Krish/global-env-var
-    vs per-user-OAuth-table branching as get_meta_ads_client_for_user() —
-    factored out so both _get_own_ig_business_account_id and the
-    /creator-finder/debug-meta-pages diagnostic endpoint resolve the token
-    identically instead of duplicating this logic."""
+    """Returns (access_token, error_msg). UNLIKE get_meta_ads_client() (which
+    deliberately keeps using Krish's global System User token for proven-
+    working ad account operations), this ALWAYS prefers a personal per-user
+    OAuth token when one exists and isn't revoked — including for Krish's
+    own uid.
+
+    Root cause found live 2026-07-22: Creator Finder's Page/Instagram
+    discovery was silently using Krish's global System User token (type
+    SYSTEM_USER, scopes ads_management/ads_read/business_management only —
+    no pages_show_list) even after he freshly reconnected his OWN personal
+    OAuth token via Disconnect -> Connect. System User tokens fundamentally
+    cannot see personal Page assignments via /me/accounts or
+    /me/businesses regardless of what scope is granted to them directly —
+    only a real user token can. So for THIS lookup specifically, a stored
+    personal token must always win over the global fallback, not the other
+    way around.
+    """
     krish_uid = os.getenv("KRISH_USER_ID", "")
+
+    if uid:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT encrypted_access_token, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+        if row and not row[1] and row[0]:
+            return decrypt_token(row[0]), None
+
+    # No usable personal token — fall back to the global System User token,
+    # but only for Krish (or unauthenticated dev requests); everyone else
+    # genuinely has no Meta connection at this point.
     if not uid or uid == krish_uid:
         if _meta_global_disconnected():
             return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
@@ -15171,13 +15195,8 @@ async def _resolve_meta_access_token(uid: str):
         if not access_token:
             return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
         return access_token, None
-    with engine.connect() as conn:
-        row = conn.execute(text(
-            "SELECT encrypted_access_token, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
-        ), {"uid": uid}).fetchone()
-    if not row or row[1]:
-        return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
-    return decrypt_token(row[0]), None
+
+    return None, "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
 
 
 async def _meta_discover_all_pages(access_token: str) -> list:
@@ -15275,14 +15294,32 @@ async def creator_finder_debug_meta_pages():
     root-caused directly from the actual API responses instead of
     guesswork. Not linked from any UI; hit it directly while authenticated."""
     uid = _request_user_id.get()
+
+    # Does a personal per-user OAuth row exist for this uid at all, and
+    # what shape is it in — answers "did my reconnect actually get stored"
+    # directly, without needing DB access. Never includes the token itself.
+    stored_row_info = {"row_exists": False}
+    if uid:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT page_id, connected_at, updated_at, revoked, "
+                "(encrypted_access_token IS NOT NULL AND encrypted_access_token != '') AS has_token "
+                "FROM meta_oauth_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+        if row:
+            stored_row_info = {
+                "row_exists": True, "page_id": row[0], "connected_at": row[1],
+                "updated_at": row[2], "revoked": bool(row[3]), "has_non_empty_token": bool(row[4]),
+            }
+
     access_token, err = await _resolve_meta_access_token(uid)
     if err:
-        return {"success": False, "error": err}
+        return {"success": False, "error": err, "personal_oauth_row": stored_row_info}
 
     app_id     = _genv("META_APP_ID")
     app_secret = _genv("META_APP_SECRET")
 
-    raw = {}
+    raw = {"personal_oauth_row": stored_row_info}
     async with httpx.AsyncClient(timeout=15) as c:
         # Which identity does this stored token actually belong to, and
         # what did it actually get granted — independent of what we asked
