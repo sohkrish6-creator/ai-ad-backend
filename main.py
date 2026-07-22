@@ -103,6 +103,7 @@ _request_user_id: ContextVar[str] = ContextVar("request_user_id", default="")
 
 _PUBLIC_PATHS = {
     "/",
+    "/version",          # deployed commit hash only — no secrets, useful to confirm a deploy actually landed
     "/google/callback",  # browser redirect from Google — no auth header; state HMAC is the security
     "/meta/callback",    # browser redirect from Meta — same reason
     "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
@@ -1303,6 +1304,19 @@ class LeadCreate(BaseModel):
 @app.get("/")
 def home():
     return {"message": "Adsoh Backend chal raha hai!"}
+
+
+@app.get("/version")
+def version():
+    """Which commit is actually running right now — Render auto-populates
+    RENDER_GIT_COMMIT on every deploy, so this settles "did my push actually
+    deploy" definitively instead of inferring it from whether a new field
+    shows up in some other endpoint's response."""
+    commit = os.getenv("RENDER_GIT_COMMIT", "")
+    return {
+        "commit": commit or "unknown (not running on Render, or var unset)",
+        "commit_short": commit[:7] if commit else "unknown",
+    }
 
 
 @app.get("/auth/me")
