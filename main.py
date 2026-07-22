@@ -10070,7 +10070,15 @@ async def gads_add_keywords(request: AddKeywordsRequest):
 #  META ADS — PER-USER OAUTH  +  LEGACY GLOBAL TOKEN (Krish)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_META_OAUTH_SCOPES = "ads_management,ads_read,business_management,pages_show_list"
+#  pages_show_list is what makes /me/accounts return the user's Pages at
+#  all — without it, Creator Finder's "no Facebook Page is accessible"
+#  error is expected, not a bug (see _get_own_ig_business_account_id).
+#  instagram_basic + pages_read_engagement are additionally required to
+#  read a Page's linked instagram_business_account field and to call
+#  Business Discovery once a Page IS found (added 2026-07-22 — Creator
+#  Finder's Instagram enrichment needs these; ads-only connections never
+#  needed them before).
+_META_OAUTH_SCOPES = "ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,instagram_basic"
 _META_GRAPH = "https://graph.facebook.com/v21.0"
 
 
@@ -15176,7 +15184,11 @@ async def _get_own_ig_business_account_id(uid: str):
                     page_ids_to_try.append(pid)
 
             if not page_ids_to_try:
-                return None, None, "Meta Ads is connected, but no Facebook Page is accessible with this connection — check Meta Business Suite."
+                return None, None, (
+                    "Meta Ads is connected, but no Facebook Page is accessible with this connection. "
+                    "Either the pages_show_list permission wasn't granted during login (reconnect and check the "
+                    "permissions screen), or this Facebook account isn't an admin/editor on any Page in Business Manager."
+                )
 
             for pid in page_ids_to_try:
                 page_resp = await c.get(f"{_META_GRAPH}/{pid}", params={
@@ -17317,6 +17329,12 @@ async def meta_connect(request: Request):
         f"&scope={_META_OAUTH_SCOPES}"
         f"&state={state}"
         f"&response_type=code"
+        # Forces Facebook to re-show the full permissions dialog even if
+        # these scopes were already granted before — without this, Facebook
+        # can silently skip straight to redirect on a reconnect, which looks
+        # identical to a successful re-consent but may carry over an OLD,
+        # narrower set of granted permissions instead of the current scope list.
+        f"&auth_type=rerequest"
     )
     return {"success": True, "auth_url": auth_url}
 
@@ -17358,6 +17376,21 @@ async def meta_callback(code: str = "", state: str = "", error: str = "", error_
             })
             r2.raise_for_status()
             long_token = r2.json().get("access_token", short_token)
+
+            # Diagnostic only — logs which of the REQUESTED scopes Facebook
+            # actually granted vs declined for this specific login. Added
+            # after a live case where /me/accounts came back with zero Pages
+            # despite pages_show_list being requested — this makes that
+            # distinguishable (declined permission vs. account genuinely has
+            # no Page access) from server logs instead of guesswork.
+            try:
+                r3 = await hc.get(f"{_META_GRAPH}/me/permissions", params={"access_token": long_token})
+                perms = r3.json().get("data", [])
+                granted  = sorted(p["permission"] for p in perms if p.get("status") == "granted")
+                declined = sorted(p["permission"] for p in perms if p.get("status") == "declined")
+                logger.info(f"[META-OAUTH] uid={uid!r} granted_permissions={granted} declined_permissions={declined}")
+            except Exception as _perm_e:
+                logger.warning(f"[META-OAUTH] could not check granted permissions (non-fatal): {_perm_e}")
 
         enc = encrypt_token(long_token)
         now = datetime.utcnow().isoformat()
