@@ -15590,6 +15590,178 @@ async def creator_finder_generate_outreach(body: CreatorOutreachRequest):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INSTAGRAM CONTENT COACH — pre-publish analysis of an uploaded image/caption
+#  via GPT-4o vision. Covers the genuinely buildable slice of a larger
+#  "Instagram Intelligence" spec; the rest is EXPLICITLY OUT OF SCOPE for this
+#  build, for real reasons (not just "later"):
+#
+#  - Full video/reel frame-by-frame analysis, audio extraction, scene-change
+#    detection: needs real video-processing infra (ffmpeg + per-frame vision +
+#    transcription) that isn't part of this stack — not a single-endpoint add.
+#  - Second-by-second retention curve predictions, exact Expected Reach/
+#    Shares/Comments numbers for content that hasn't been posted yet: there is
+#    no real signal to base an exact number on before publish — that would be
+#    fabricated precision, which this whole codebase treats as a hard rule to
+#    avoid (see hashtag_generation, _command_top_level_trust, etc.).
+#  - Posting Time Engine / Account Intelligence / Competitor Engine: these need
+#    real Instagram account history (own or competitor) via Business Discovery,
+#    which is currently blocked for this Meta app pending App Review — error
+#    #10 confirmed live on BOTH the app's own connected account and a random
+#    third-party one this same session (see Creator Finder's Instagram tab
+#    caveat). Add these once Advanced Access is granted.
+#  - Self-learning recalibration against imported real Insights data: deferred
+#    for the same reason — it needs the same blocked Instagram API access to
+#    import real post performance in the first place.
+#
+#  What ships here: qualitative, evidence-based feedback on an actual
+#  uploaded image + caption — hook/thumbnail assessment, caption analysis,
+#  visual psychology, direct coach-style feedback, and improvement
+#  suggestions. STRONG/MODERATE/WEAK ratings only, never a fabricated
+#  precision score. Hashtags reuse hashtag_generation's exact research-then-
+#  verify discipline via _command_memory_context.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class InstagramCoachRequest(BaseModel):
+    image_base64: str = ""   # data URI (data:image/...;base64,...) or raw base64
+    image_url:    str = ""   # alternative to image_base64 — an already-hosted URL
+    caption:      str = ""
+    business_url: str = ""
+    industry:     str = ""
+    city:         str = ""
+
+
+@app.post("/instagram-coach/analyze")
+async def instagram_coach_analyze(request: InstagramCoachRequest):
+    caption = (request.caption or "").strip()
+    image_data_uri = ""
+
+    if request.image_base64:
+        raw_b64 = request.image_base64.strip()
+        if raw_b64.startswith("data:"):
+            try:
+                raw_b64 = raw_b64.split(",", 1)[1]
+            except IndexError:
+                return {"success": False, "error": "Malformed image data URI"}
+        try:
+            image_bytes = base64.b64decode(raw_b64, validate=True)
+        except Exception:
+            return {"success": False, "error": "Invalid base64 image data"}
+        if len(image_bytes) > _MAX_UPLOAD_BYTES:
+            return {"success": False, "error": "Image too large — max 5MB"}
+        try:
+            _ext, mime = await asyncio.to_thread(_validate_and_normalize_image_sync, image_bytes)
+        except ValueError as _e:
+            return {"success": False, "error": str(_e)}
+        # Re-encode from the validated bytes (not the raw input) so a
+        # mislabeled/mismatched data: URI prefix can never reach GPT-4o.
+        image_data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+    elif request.image_url.strip():
+        image_data_uri = request.image_url.strip()
+    else:
+        return {"success": False, "error": "image_base64 or image_url is required"}
+
+    # Real business grounding — same honesty-disciplined helper hashtag_generation uses.
+    _ctxr = await _command_memory_context(
+        request.business_url, request.industry, request.city, caption or "instagram post content coaching"
+    )
+    _ctx, _grounded, _researched = _ctxr["context"], _ctxr["grounded_in_business_data"], _ctxr["research_used"]
+
+    _no_signal_guard = (
+        "\nNO REAL BUSINESS DATA IS AVAILABLE ABOVE: do NOT invent or guess a specific business category/industry "
+        "that isn't stated. Ground hashtags and the brand-consistency comment ONLY in what is actually visible in "
+        "the image and present in the caption text — e.g. if the image visibly shows a coffee cup, '#coffee' is "
+        "fine since that's directly observed, but never invent an unstated business type or vertical.\n"
+    ) if not _grounded and not _researched else ""
+    _research_note_for_prompt = (
+        "\nNOTE: the BUSINESS CONTEXT above includes REAL public research about this business — ground hashtags "
+        "and the brand-consistency comment in what this business actually does, per that research.\n"
+    ) if _researched else ""
+
+    prompt = (
+        "You are an Instagram content coach reviewing ONE real, unpublished image + caption before the user posts "
+        "it. Give specific, evidence-based feedback.\n\n"
+        "HARD RULES:\n"
+        "- NEVER invent precision numbers, percentages, or performance predictions (no fake scores like '73/100', "
+        "no 'this will get 4,200 views/shares/comments', no exact engagement-rate figures) — there is zero real "
+        "performance data for content that hasn't been posted yet. Use ONLY STRONG / MODERATE / WEAK for the hook "
+        "rating, never a numeric score.\n"
+        "- Every observation must be traceable to something ACTUALLY visible in the image or present in the exact "
+        "caption text given below — cite specifics (position in frame, actual colors present, exact caption "
+        "wording/line it appears on). Never write generic filler that could apply to any random image/caption.\n"
+        "- If the image has no legible overlay text, say so — don't invent text that isn't there.\n\n"
+        f"CAPTION (verbatim, empty means none was provided):\n{caption or '(no caption provided)'}\n\n"
+        f"BUSINESS CONTEXT:\n{_ctx}\n"
+        f"{_no_signal_guard}{_research_note_for_prompt}\n"
+        'Return ONLY JSON:\n'
+        '{\n'
+        '  "hook_assessment": {\n'
+        '    "rating": "STRONG|MODERATE|WEAK",\n'
+        '    "strengths": ["specific things that work, citing what is actually visible"],\n'
+        '    "weaknesses": ["specific things that don\'t work, citing what is actually visible"],\n'
+        '    "reasoning": "one paragraph tying the rating to the specific observations above"\n'
+        '  },\n'
+        '  "caption_analysis": {\n'
+        '    "hook_quality": "assessment of the first line specifically, quoting it",\n'
+        '    "has_clear_cta": true|false,\n'
+        '    "cta_feedback": "...",\n'
+        '    "length_feedback": "...",\n'
+        '    "hashtags": {"broad": ["...","...","...","...","..."], "niche": ["...","...","...","...","..."], "local": ["...","...","...","...","..."]}\n'
+        '  },\n'
+        '  "visual_psychology": {\n'
+        '    "color_observations": "actual colors observed and their likely emotional effect",\n'
+        '    "emotional_tone": "...",\n'
+        '    "brand_consistency": "only meaningful if business context above is grounded/researched — otherwise say so honestly rather than guessing"\n'
+        '  },\n'
+        '  "ai_coach_feedback": ["3 to 5 direct, specific, actionable coaching lines about THIS exact image/caption — "'
+        '"e.g. \'Your subject is too small in the frame\', \'The caption buries the offer in the third line — move it up\'"],\n'
+        '  "improvement_suggestions": {\n'
+        '    "rewritten_caption": "a full rewritten caption option",\n'
+        '    "suggested_cta": "...",\n'
+        '    "retake_suggestion": "what to change about the shot/composition for a retake — empty string if no real visual weakness was found"\n'
+        '  }\n'
+        '}\n'
+        "Omit local hashtags entirely (empty array) if no city/location context is available — do not invent a city."
+    )
+
+    content = [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": image_data_uri}}]
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": content}],
+            response_format={"type": "json_object"},
+            max_tokens=1800,
+            temperature=0.4,
+        )
+        message = resp.choices[0].message
+        if not message.content:
+            # message.content can legitimately be None (a safety refusal on the
+            # image, or the model declining to analyze it) — .strip() on None
+            # crashes with an unhelpful AttributeError instead of a real
+            # explanation. Confirmed live: this DOES happen for some images.
+            refusal = getattr(message, "refusal", None)
+            logger.warning(f"[INSTAGRAM COACH] Empty content — finish_reason={resp.choices[0].finish_reason!r} refusal={refusal!r}")
+            return {
+                "success": False,
+                "error": refusal or "GPT-4o declined to analyze this image (no content returned) — try a different image.",
+            }
+        parsed = _clean_banned_words_deep(json.loads(message.content.strip()))
+    except Exception as _e:
+        logger.error(f"[INSTAGRAM COACH] GPT-4o vision call failed: {_e}")
+        return {"success": False, "error": f"Analysis failed: {_e}"}
+
+    parsed["grounded_in_business_data"] = _grounded
+    parsed["research_used"] = _researched
+    if _researched:
+        parsed["note"] = f"Hashtags/brand notes grounded in public research on {_ctxr['identifier']} — for deeper analysis, run Marketing Brain."
+    elif not _grounded:
+        parsed["note"] = "No business context found — hashtags/brand notes are grounded only in what's visible in the image/caption. Run Marketing Brain first for suggestions tailored to your real positioning."
+
+    return {"success": True, **parsed}
+
+
 async def _sie_discover_platforms(input_value: str, input_type: str, city: str) -> dict:
     """
     Step 1 — Discovery. If input is a website: Firecrawl it and extract social
