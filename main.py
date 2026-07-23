@@ -10209,88 +10209,100 @@ def _meta_global_disconnected() -> bool:
     return bool(row and row[0])
 
 
-def get_meta_ads_client_for_user(uid: str) -> tuple:
-    """Returns (api, ad_account_id) using the user's stored OAuth token.
-
-    Falls back to the global env-var token for Krish's user_id.
-    Raises MetaNotConnectedError if the user hasn't connected Meta Ads.
-    """
-    from facebook_business.api import FacebookAdsApi as _FBApi
-    krish_uid = os.getenv("KRISH_USER_ID", "")
-    if not uid or uid == krish_uid:
-        return get_meta_ads_client()
-    with engine.connect() as _conn:
-        row = _conn.execute(text(
-            "SELECT encrypted_access_token, ad_account_id, revoked "
-            "FROM meta_oauth_tokens WHERE user_id=:uid"
-        ), {"uid": uid}).fetchone()
-    if not row or row[2]:
-        raise MetaNotConnectedError(
-            "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
-        )
-    access_token   = decrypt_token(row[0])
-    ad_account_id  = row[1] or ""
-    if not ad_account_id:
-        raise MetaNotConnectedError(
-            "Meta Ads connected but no ad account selected. Visit Account → Connected Accounts."
-        )
-    if not ad_account_id.startswith("act_"):
-        ad_account_id = f"act_{ad_account_id}"
-    app_id     = _genv("META_APP_ID")
-    app_secret = _genv("META_APP_SECRET")
-    api = _FBApi.init(app_id, app_secret, access_token)
-    return api, ad_account_id
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  META ADS (Facebook/Instagram) — READ-ONLY INTEGRATION
 #  Same safe pattern as Google Ads: test-connection first, read-only endpoints
 #  only. No campaign creation yet. Isolated from Google Ads / Cricket code.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_meta_ads_client():
-    """
-    Initialize the Meta Marketing API client.
-    For non-Krish users: uses their stored OAuth token (raises MetaNotConnectedError if none).
-    For Krish / unauthenticated: uses global env vars (existing System User flow).
-    Returns (api, ad_account_id).
-    """
-    _uid = _request_user_id.get()
-    _krish = os.getenv("KRISH_USER_ID", "")
-    if _uid and _uid != _krish:
-        return get_meta_ads_client_for_user(_uid)
+def get_meta_ads_client_for_user(uid: str) -> tuple:
+    """Returns (api, ad_account_id) — the single source of truth for
+    resolving a Meta client, used by every /meta-ads/* endpoint via the
+    get_meta_ads_client() wrapper below.
 
-    if _meta_global_disconnected():
+    Prefers a personal per-user OAuth token + explicitly selected ad
+    account when one exists — ANY uid, Krish included. Only falls back to
+    the global System User env-var token for Krish (or unauthenticated dev
+    requests) when no personal selection has been made yet, so his
+    original Sohscape workflow keeps working untouched by default — but
+    once he explicitly picks a different account (e.g. "sohjustbe") via
+    the Account page picker, campaign creation must use THAT account, not
+    the old global one. Previously this preference only applied to
+    Creator Finder's Page/Instagram lookups (_resolve_meta_access_token);
+    this closes the same gap for actual ad account operations.
+    Raises MetaNotConnectedError if nothing usable is found.
+    """
+    from facebook_business.api import FacebookAdsApi as _FBApi
+    krish_uid = os.getenv("KRISH_USER_ID", "")
+
+    row = None
+    if uid:
+        with engine.connect() as _conn:
+            row = _conn.execute(text(
+                "SELECT encrypted_access_token, ad_account_id, revoked "
+                "FROM meta_oauth_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+
+    if row and not row[2] and row[1]:
+        access_token  = decrypt_token(row[0])
+        ad_account_id = row[1]
+        if not ad_account_id.startswith("act_"):
+            ad_account_id = f"act_{ad_account_id}"
+        app_id     = _genv("META_APP_ID")
+        app_secret = _genv("META_APP_SECRET")
+        api = _FBApi.init(app_id, app_secret, access_token)
+        return api, ad_account_id
+
+    if not uid or uid == krish_uid:
+        if _meta_global_disconnected():
+            raise MetaNotConnectedError(
+                "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
+            )
+
+        # Global env-var path (Krish's original System User token) — the
+        # only fallback preserved, and only when he has no personal pick.
+        from facebook_business.api import FacebookAdsApi
+
+        app_id       = _genv("META_APP_ID")
+        app_secret   = _genv("META_APP_SECRET")
+        access_token = _genv("META_ACCESS_TOKEN")
+        account_id   = _genv("META_AD_ACCOUNT_ID")
+
+        missing = [k for k, v in {
+            "META_APP_ID": app_id, "META_APP_SECRET": app_secret,
+            "META_ACCESS_TOKEN": access_token, "META_AD_ACCOUNT_ID": account_id,
+        }.items() if not v]
+        if missing:
+            raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+        account_id_raw = account_id
+        if not account_id.startswith("act_"):
+            account_id = f"act_{account_id}"
+
+        api = FacebookAdsApi.init(app_id, app_secret, access_token)
+        logger.info(
+            f"[META ADS] Client initialized (global fallback) — app_id={app_id[:5]}…(len={len(app_id)}) "
+            f"access_token={access_token[:8]}…(len={len(access_token)}) "
+            f"account_id_raw={account_id_raw!r} account_id_used={account_id}"
+        )
+        return api, account_id
+
+    if not row or row[2]:
         raise MetaNotConnectedError(
             "Meta Ads account not connected. Go to Account → Connected Accounts to connect."
         )
-
-    # Global env-var path (Krish's System User token)
-    from facebook_business.api import FacebookAdsApi
-
-    app_id       = _genv("META_APP_ID")
-    app_secret   = _genv("META_APP_SECRET")
-    access_token = _genv("META_ACCESS_TOKEN")
-    account_id   = _genv("META_AD_ACCOUNT_ID")
-
-    missing = [k for k, v in {
-        "META_APP_ID": app_id, "META_APP_SECRET": app_secret,
-        "META_ACCESS_TOKEN": access_token, "META_AD_ACCOUNT_ID": account_id,
-    }.items() if not v]
-    if missing:
-        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
-
-    account_id_raw = account_id
-    if not account_id.startswith("act_"):
-        account_id = f"act_{account_id}"
-
-    api = FacebookAdsApi.init(app_id, app_secret, access_token)
-    logger.info(
-        f"[META ADS] Client initialized — app_id={app_id[:5]}…(len={len(app_id)}) "
-        f"access_token={access_token[:8]}…(len={len(access_token)}) "
-        f"account_id_raw={account_id_raw!r} account_id_used={account_id}"
+    raise MetaNotConnectedError(
+        "Meta Ads connected but no ad account selected. Visit Account → Connected Accounts."
     )
-    return api, account_id
+
+
+def get_meta_ads_client():
+    """Thin wrapper around get_meta_ads_client_for_user, resolving the
+    current request's uid from the _request_user_id ContextVar — kept so
+    every existing /meta-ads/* call site (create-campaign, performance,
+    campaigns, PushToAdsSection, etc.) needs zero changes; the actual
+    per-user-vs-global routing logic lives in one place now."""
+    return get_meta_ads_client_for_user(_request_user_id.get())
 
 
 # https://developers.facebook.com/docs/marketing-api/reference/ad-account/#account_status
