@@ -10412,9 +10412,18 @@ async def meta_ads_campaigns():
     try:
         _, account_id = get_meta_ads_client()
     except MetaNotConnectedError as _e:
+        logger.error(f"[META ADS CAMPAIGNS] Meta account resolution failed: {_e}")
         return {"success": False, "connect_required": True, "error": str(_e), "connect_url": "/account"}
     except RuntimeError as _e:
+        logger.error(f"[META ADS CAMPAIGNS] Meta client init failed: {_e}")
         return {"success": False, "error": str(_e)}
+    except Exception as _e:
+        # Safety net — any exception type other than the two above would
+        # otherwise propagate unhandled into FastAPI's generic 500 body
+        # (no "error" key), which the frontend renders as an unhelpful
+        # bare fallback string with zero diagnostic detail.
+        logger.error(f"[META ADS CAMPAIGNS] Meta client resolution — unexpected error: {type(_e).__name__}: {_e}\n{_traceback.format_exc()}")
+        return {"success": False, "error": f"{type(_e).__name__}: {_e}"}
 
     try:
         def _fetch():
@@ -10532,9 +10541,14 @@ async def meta_ads_performance(date_range: str = "last_30d"):
     try:
         _, account_id = get_meta_ads_client()
     except MetaNotConnectedError as _e:
+        logger.error(f"[META ADS PERFORMANCE] Meta account resolution failed: {_e}")
         return {"success": False, "connect_required": True, "error": str(_e), "connect_url": "/account"}
     except RuntimeError as _e:
+        logger.error(f"[META ADS PERFORMANCE] Meta client init failed: {_e}")
         return {"success": False, "error": str(_e)}
+    except Exception as _e:
+        logger.error(f"[META ADS PERFORMANCE] Meta client resolution — unexpected error: {type(_e).__name__}: {_e}\n{_traceback.format_exc()}")
+        return {"success": False, "error": f"{type(_e).__name__}: {_e}"}
 
     valid_presets = {p for p in dir(AdsInsights.DatePreset) if not p.startswith("_")}
     if date_range not in valid_presets:
@@ -10787,8 +10801,29 @@ async def meta_ads_create_campaign(request: CreateMetaCampaignRequest):
     # ── Meta account config (needed for actual API calls) ───────────────────
     try:
         _, account_id = get_meta_ads_client()
+    except MetaNotConnectedError as _e:
+        # Previously fell through to the bare RuntimeError branch below (it
+        # IS a RuntimeError subclass) with zero logging and none of the
+        # connect_required/connect_url guidance the later matching handler
+        # gives — silent, unhelpful failures right here were plausible.
+        logger.error(f"[META ADS CREATE] Meta account resolution failed (not connected/no account selected): {_e}")
+        return {"success": False, "connect_required": True, "error": str(_e), "connect_url": "/account"}
     except RuntimeError as _e:
+        logger.error(f"[META ADS CREATE] Meta client init failed: {_e}")
         return {"success": False, "error": str(_e)}
+    except Exception as _e:
+        # Safety net matching the rest of this function's exception
+        # handling below — WITHOUT this, any exception type other than
+        # MetaNotConnectedError/RuntimeError (a DB hiccup, a decrypt
+        # failure, anything unanticipated) propagates unhandled here,
+        # which FastAPI turns into a bare {"detail": "Internal Server
+        # Error"} 500 body with no "error" key at all — the frontend's
+        # `data.error || 'Campaign creation failed.'` fallback then shows
+        # that exact unhelpful generic string with zero diagnostic detail,
+        # client OR server side (this early call had no logging before).
+        tb = _traceback.format_exc()
+        logger.error(f"[META ADS CREATE] Meta client resolution — unexpected error: {type(_e).__name__}: {_e}\n{tb}")
+        return {"success": False, "error": f"{type(_e).__name__}: {_e}"}
 
     # ── Zero-Waste Meta pre-flight check ────────────────────────────────────
     _meta_preflight = await run_meta_launch_preflight(
