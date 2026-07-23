@@ -10666,7 +10666,12 @@ class CreateMetaCampaignRequest(BaseModel):
                                             # when business_key isn't passed directly
     industry:      str   = ""
     city:          str   = ""
-    creative_id:   str   = ""              # existing Post ID (object_story_id), created manually
+    # Optional[str], not str — the frontend sends JSON null when the Post ID
+    # input is left blank, and a plain `str` field rejects null with a 422
+    # (confirmed live: this was silently blocking BOTH the "no creative_id"
+    # amber Action-Needed path AND the full auto-create path from ever being
+    # reached, since the request never even parsed).
+    creative_id:   Optional[str] = None    # existing Post ID (object_story_id), created manually
                                             # in Ads Manager — required to complete the Ad step
                                             # while the app is in Development Mode (see below)
     force_override: bool = False           # skip blocking pre-flight issues
