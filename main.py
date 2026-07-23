@@ -17557,16 +17557,26 @@ async def meta_callback(code: str = "", state: str = "", error: str = "", error_
 
         enc = encrypt_token(long_token)
         now = datetime.utcnow().isoformat()
-        logger.info(f"[META-OAUTH] storing token uid={uid!r}")
+        logger.info(f"[META-OAUTH] storing token uid={uid!r} (ad_account_id/page_id reset — user will pick explicitly)")
         with engine.begin() as conn:
+            # ad_account_id/page_id=NULL on EVERY (re)connect, including the
+            # ON CONFLICT branch — Krish has access to multiple ad accounts
+            # (Sohscape's + sohjustbe's) through this same Facebook login,
+            # and the previous UPSERT never touched these columns on
+            # conflict, so a stale selection from a much earlier connection
+            # silently survived every disconnect/reconnect cycle instead of
+            # requiring an explicit re-pick. Same root cause class as the
+            # earlier Google Ads fix, just surfacing as "wrong account
+            # carried forward" instead of "auto-picked first account".
             conn.execute(text(
                 "INSERT INTO meta_oauth_tokens "
-                "(id, user_id, encrypted_access_token, connected_at, updated_at, revoked) "
-                "VALUES (nextval('meta_oauth_tokens_id_seq'), :uid, :enc, :ts, :ts, FALSE) "
-                "ON CONFLICT(user_id) DO UPDATE SET encrypted_access_token=:enc, updated_at=:ts, revoked=FALSE"
+                "(id, user_id, encrypted_access_token, ad_account_id, page_id, connected_at, updated_at, revoked) "
+                "VALUES (nextval('meta_oauth_tokens_id_seq'), :uid, :enc, NULL, NULL, :ts, :ts, FALSE) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "encrypted_access_token=:enc, ad_account_id=NULL, page_id=NULL, updated_at=:ts, revoked=FALSE"
             ), {"uid": uid, "enc": enc, "ts": now})
-        logger.info(f"[META-OAUTH] Connected uid={uid or 'anon'}")
-        return RedirectResponse(f"{frontend}/account?meta_connected=true")
+        logger.info(f"[META-OAUTH] Connected uid={uid or 'anon'} — redirecting to account picker")
+        return RedirectResponse(f"{frontend}/account?meta_connected=pending")
     except Exception as _e:
         logger.error(f"[META-OAUTH] callback error: {_e}")
         return RedirectResponse(f"{frontend}/account?meta_connected=false&error=exchange_failed")
@@ -17591,7 +17601,7 @@ async def meta_accounts(request: Request):
     try:
         async with httpx.AsyncClient(timeout=15) as hc:
             r1 = await hc.get(f"{_META_GRAPH}/me/adaccounts", params={
-                "fields":       "name,account_id,account_status",
+                "fields":       "name,account_id,account_status,currency",
                 "access_token": access_token,
             })
             r1.raise_for_status()
@@ -17718,17 +17728,35 @@ async def connected_accounts(request: Request):
             "pending_account_selection": g_connected and not g_row[0],
         } if g_connected else {}
 
-    # Meta Ads
-    if not uid or uid == krish_uid:
-        m_connected = bool(_genv("META_ACCESS_TOKEN")) and not _meta_global_disconnected()
-        m_info = {"method": "global", "ad_account_id": _genv("META_AD_ACCOUNT_ID") or None} if m_connected else {}
-    else:
+    # Meta Ads — a personal per-user connection (Krish included) always takes
+    # priority over the legacy global System User token: Krish has his own
+    # OAuth connection with its own ad-account choice (e.g. "sohjustbe"),
+    # separate from the old global token (Sohscape's account) — reporting
+    # the global account here even after Krish picked a different personal
+    # one was the root of the wrong-account confusion.
+    m_row = None
+    if uid:
         with engine.connect() as conn:
             m_row = conn.execute(text(
                 "SELECT ad_account_id, page_id, connected_at, revoked FROM meta_oauth_tokens WHERE user_id=:uid"
             ), {"uid": uid}).fetchone()
-        m_connected = bool(m_row and not m_row[3])
-        m_info = {"ad_account_id": m_row[0], "page_id": m_row[1], "connected_at": m_row[2]} if m_connected else {}
+
+    if m_row and not m_row[3]:
+        m_connected = True
+        m_info = {
+            "ad_account_id": m_row[0], "page_id": m_row[1], "connected_at": m_row[2],
+            "pending_account_selection": not m_row[0],
+        }
+    elif not uid or uid == krish_uid:
+        if _meta_global_disconnected():
+            m_connected = False
+            m_info = {}
+        else:
+            m_connected = bool(_genv("META_ACCESS_TOKEN"))
+            m_info = {"method": "global", "ad_account_id": _genv("META_AD_ACCOUNT_ID") or None} if m_connected else {}
+    else:
+        m_connected = False
+        m_info = {}
 
     return {
         "google_ads": {"connected": g_connected, **g_info},
