@@ -1648,7 +1648,7 @@ async def fetch_tavily(query: str, include_domains: list | None = None) -> str:
     except Exception:
         return ""
 
-async def fetch_google_places(query: str, city: str, max_results: int = 20) -> list:
+async def fetch_google_places(query: str, city: str, max_results: int = 20, _debug: dict = None) -> list:
     """Search Google Places Text Search API, paginating through multiple
     pages when max_results asks for more than one page's worth. Google's
     Text Search returns ~20 results per page (up to 3 pages / ~60 total)
@@ -1656,12 +1656,21 @@ async def fetch_google_places(query: str, city: str, max_results: int = 20) -> l
     everything at ~20 regardless of max_results, since it only sliced
     page 1. Returns [] on failure or missing key; returns whatever pages
     succeeded so far if a later page fails, rather than discarding
-    already-fetched results."""
+    already-fetched results.
+
+    _debug, if passed a dict, gets populated with Google's actual raw
+    per-page status/count/next_page_token — added specifically to answer
+    "did Google itself only have N results, or did pagination silently
+    stop early" without needing server log access.
+    """
     if not GOOGLE_PLACES_API_KEY:
         return []
     out = []
     page_token = None
     pages_fetched = 0
+    if _debug is not None:
+        _debug["query_sent"] = f"{query} in {city}"
+        _debug["pages"] = []
     try:
         async with httpx.AsyncClient(timeout=12) as c:
             while len(out) < max_results and pages_fetched < 3:
@@ -1691,11 +1700,24 @@ async def fetch_google_places(query: str, city: str, max_results: int = 20) -> l
                     })
                 pages_fetched += 1
                 page_token = data.get("next_page_token")
-                logger.info(f"[PLACES] page {pages_fetched} fetched — {len(out)} total so far, next_page_token={'yes' if page_token else 'no'}")
+                google_status = data.get("status")
+                logger.info(
+                    f"[PLACES] page {pages_fetched} — google_status={google_status!r} "
+                    f"results_this_page={len(data.get('results', []))} total_so_far={len(out)} "
+                    f"next_page_token={'yes' if page_token else 'no'}"
+                )
+                if _debug is not None:
+                    _debug["pages"].append({
+                        "page": pages_fetched, "google_status": google_status,
+                        "results_this_page": len(data.get("results", [])),
+                        "had_next_page_token": bool(page_token),
+                    })
                 if not page_token:
                     break
     except Exception as _e:
         logger.warning(f"[PLACES] fetch_google_places failed after {pages_fetched} page(s), {len(out)} results so far: {_e}")
+        if _debug is not None:
+            _debug["error"] = str(_e)
     return out[:max_results]
 
 async def fetch_place_details(place_id: str) -> dict:
@@ -8484,9 +8506,10 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
 
         # 1. Text-search Google Places — paginates internally (next_page_token)
         # when max_prospects exceeds one page's worth (~20) of results.
-        raw_places = await fetch_google_places(search_terms, search_scope, max_results=max(max_prospects, 20))
+        _places_debug = {}
+        raw_places = await fetch_google_places(search_terms, search_scope, max_results=max(max_prospects, 20), _debug=_places_debug)
         google_places_used = bool(raw_places)
-        logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results (paginated)")
+        logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results (paginated) — debug={_places_debug}")
 
         # 2. Enrich up to max_prospects with place details, in parallel
         # batches (not all-at-once) to bound concurrency against Places API
@@ -8577,6 +8600,18 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 "- HOT = opportunity_score > 75\n"
                 "- WARM = opportunity_score 50-75\n"
                 "- COLD = opportunity_score < 50\n\n"
+                "DO NOT TEMPLATE SCORES BY CATEGORY: the ranges above are ranges, not a single fixed number to "
+                "reuse for every business that falls into the same weakness category. Two 'no website' businesses "
+                "with very different review_count/rating must NOT get identical opportunity_score, website_score, "
+                "closing_probability, or expected_ltv — pick the exact number WITHIN each range from this "
+                "business's actual review_count and rating, not a copy-pasted default. Use review_count as a "
+                "rough proxy for the business's real scale/demand: a business with thousands of reviews and no "
+                "website is an established, high-demand operation missing a website — a much bigger opportunity "
+                "(higher end of the range, higher expected_ltv) than a business with a few hundred reviews and "
+                "the same weakness (lower end of the range, smaller expected_ltv), even though both are still "
+                "genuinely HIGH opportunity. expected_ltv in particular must scale with the business's apparent "
+                "size (review_count/rating), never reuse the same rupee figure across businesses of different "
+                "scale just because they share a weakness category.\n\n"
                 "For each business provide a SPECIFIC, PERSONALIZED analysis based on the actual data.\n"
                 "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness).\n"
                 "Use " + RS + " for Indian Rupee symbol in expected_ltv.\n\n"
@@ -8686,6 +8721,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         return {
             "success":            True,
             "google_places_used": google_places_used,
+            "places_debug":       _places_debug,
             "data":               result_obj,
         }
 
