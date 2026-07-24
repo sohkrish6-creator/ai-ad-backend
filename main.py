@@ -1649,32 +1649,54 @@ async def fetch_tavily(query: str, include_domains: list | None = None) -> str:
         return ""
 
 async def fetch_google_places(query: str, city: str, max_results: int = 20) -> list:
-    """Search Google Places Text Search API. Returns [] on failure or missing key."""
+    """Search Google Places Text Search API, paginating through multiple
+    pages when max_results asks for more than one page's worth. Google's
+    Text Search returns ~20 results per page (up to 3 pages / ~60 total)
+    via next_page_token — a single call previously silently capped
+    everything at ~20 regardless of max_results, since it only sliced
+    page 1. Returns [] on failure or missing key; returns whatever pages
+    succeeded so far if a later page fails, rather than discarding
+    already-fetched results."""
     if not GOOGLE_PLACES_API_KEY:
         return []
+    out = []
+    page_token = None
+    pages_fetched = 0
     try:
         async with httpx.AsyncClient(timeout=12) as c:
-            resp = await c.get(
-                "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                params={"query": f"{query} in {city}", "key": GOOGLE_PLACES_API_KEY},
-            )
-            data = resp.json()
-            results = data.get("results", [])[:max_results]
-            out = []
-            for r in results:
-                out.append({
-                    "name":                r.get("name", ""),
-                    "address":             r.get("formatted_address", ""),
-                    "rating":              r.get("rating"),
-                    "user_ratings_total":  r.get("user_ratings_total", 0),
-                    "website":             r.get("website", ""),
-                    "place_id":            r.get("place_id", ""),
-                    "business_status":     r.get("business_status", ""),
-                })
-            return out
+            while len(out) < max_results and pages_fetched < 3:
+                params = {"key": GOOGLE_PLACES_API_KEY}
+                if page_token:
+                    # Google requires a short delay before a next_page_token
+                    # becomes valid — requesting immediately 400s with
+                    # INVALID_REQUEST.
+                    await asyncio.sleep(2)
+                    params["pagetoken"] = page_token
+                else:
+                    params["query"] = f"{query} in {city}"
+                resp = await c.get(
+                    "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                    params=params,
+                )
+                data = resp.json()
+                for r in data.get("results", []):
+                    out.append({
+                        "name":                r.get("name", ""),
+                        "address":             r.get("formatted_address", ""),
+                        "rating":              r.get("rating"),
+                        "user_ratings_total":  r.get("user_ratings_total", 0),
+                        "website":             r.get("website", ""),
+                        "place_id":            r.get("place_id", ""),
+                        "business_status":     r.get("business_status", ""),
+                    })
+                pages_fetched += 1
+                page_token = data.get("next_page_token")
+                logger.info(f"[PLACES] page {pages_fetched} fetched — {len(out)} total so far, next_page_token={'yes' if page_token else 'no'}")
+                if not page_token:
+                    break
     except Exception as _e:
-        logger.warning(f"[PLACES] fetch_google_places failed: {_e}")
-        return []
+        logger.warning(f"[PLACES] fetch_google_places failed after {pages_fetched} page(s), {len(out)} results so far: {_e}")
+    return out[:max_results]
 
 async def fetch_place_details(place_id: str) -> dict:
     """Fetch detailed info for a single place. Returns {} on failure."""
@@ -8412,6 +8434,18 @@ class ProspectDiscoveryRequest(BaseModel):
     max_prospects:  int  = 15
 
 
+async def _gather_in_chunks(coros: list, chunk_size: int = 15) -> list:
+    """Run coroutines in parallel batches of chunk_size rather than all at
+    once — bounds concurrency against Google Places/Tavily rate limits when
+    scaling prospect counts up to 50, instead of firing 50+ requests
+    simultaneously in a single asyncio.gather."""
+    results = []
+    for i in range(0, len(coros), chunk_size):
+        chunk = coros[i:i + chunk_size]
+        results.extend(await asyncio.gather(*chunk, return_exceptions=True))
+    return results
+
+
 async def _retry_openai_call(fn, retries: int = 2, base_delay: float = 2.0, label: str = ""):
     """
     Retry a blocking OpenAI call on transient rate-limit/timeout/connection
@@ -8443,24 +8477,37 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # Prospect discovery genuinely needs a location to search — blank means
         # search nationally (India) rather than silently assuming a specific city.
         search_scope   = city or "India"
-        max_prospects  = max(5, min(request.max_prospects, 20))
+        max_prospects  = max(5, min(request.max_prospects, 50))
 
         search_terms   = _get_search_terms(industry)
-        logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms!r}")
+        logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms!r} max_prospects={max_prospects}")
 
-        # 1. Text-search Google Places
-        raw_places = await fetch_google_places(search_terms, search_scope, max_results=20)
+        # 1. Text-search Google Places — paginates internally (next_page_token)
+        # when max_prospects exceeds one page's worth (~20) of results.
+        raw_places = await fetch_google_places(search_terms, search_scope, max_results=max(max_prospects, 20))
         google_places_used = bool(raw_places)
-        logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results")
+        logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results (paginated)")
 
-        # 2. Enrich top 10 with place details (parallel)
-        top_places = raw_places[:10]
-        detail_tasks = [fetch_place_details(p["place_id"]) for p in top_places if p.get("place_id")]
-        details_list = await asyncio.gather(*detail_tasks, return_exceptions=True)
+        # 2. Enrich up to max_prospects with place details, in parallel
+        # batches (not all-at-once) to bound concurrency against Places API
+        # rate limits as this scales toward 50.
+        top_places = raw_places[:max_prospects]
+        places_with_id = [p for p in top_places if p.get("place_id")]
+        detail_tasks = [fetch_place_details(p["place_id"]) for p in places_with_id]
+        details_list = await _gather_in_chunks(detail_tasks, chunk_size=15)
+        # Keyed by place_id, not position — a place missing a place_id used
+        # to silently misalign every enrichment after it (details_list was
+        # shorter than top_places whenever any place lacked an id, but the
+        # old code still indexed both by the same i). Not just theoretical:
+        # more likely to actually happen once results scale up to 50.
+        details_by_id = {
+            places_with_id[i]["place_id"]: d
+            for i, d in enumerate(details_list) if isinstance(d, dict)
+        }
 
         enriched = []
-        for i, place in enumerate(top_places):
-            det = details_list[i] if i < len(details_list) and isinstance(details_list[i], dict) else {}
+        for place in top_places:
+            det = details_by_id.get(place.get("place_id"), {})
             enriched.append({
                 "name":               det.get("name") or place.get("name", ""),
                 "address":            det.get("formatted_address") or place.get("address", ""),
@@ -8473,120 +8520,141 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 "recent_reviews":     [r.get("text", "")[:120] for r in (det.get("reviews") or [])[:2]],
             })
 
-        # 3. Tavily social / ad presence checks for businesses with names
+        # 3. Tavily social / ad presence checks — now for EVERY enriched
+        # business (previously hardcoded to just the top 6), in parallel
+        # batches so 50 businesses × 2 checks each doesn't fire 100
+        # simultaneous requests.
         tavily_results = {}
+        tavily_call_count = 0
         if TAVILY_API_KEY and enriched:
-            tasks_social = [
-                fetch_tavily(f"{p['name']} {search_scope} Instagram Facebook social media")
-                for p in enriched[:6]
-            ]
-            tasks_ads = [
-                fetch_tavily(f"{p['name']} {search_scope} ads marketing campaigns")
-                for p in enriched[:6]
-            ]
+            tasks_social = [fetch_tavily(f"{p['name']} {search_scope} Instagram Facebook social media") for p in enriched]
+            tasks_ads    = [fetch_tavily(f"{p['name']} {search_scope} ads marketing campaigns") for p in enriched]
+            tavily_call_count = len(tasks_social) + len(tasks_ads)
             social_data, ads_data = await asyncio.gather(
-                asyncio.gather(*tasks_social, return_exceptions=True),
-                asyncio.gather(*tasks_ads,    return_exceptions=True),
+                _gather_in_chunks(tasks_social, chunk_size=15),
+                _gather_in_chunks(tasks_ads, chunk_size=15),
             )
-            for i, p in enumerate(enriched[:6]):
+            for i, p in enumerate(enriched):
                 tavily_results[p["name"]] = {
                     "social": social_data[i] if isinstance(social_data[i], str) else "",
                     "ads":    ads_data[i]    if isinstance(ads_data[i],    str) else "",
                 }
 
-        # 4. Build prompt (plain string concat — no f-string dicts)
+        # 4. Score in parallel batches of up to 15 businesses per GPT-4o call
+        # instead of one single call for all of them — scoring 50 in one
+        # call risks exceeding a sane output-token budget and forfeits the
+        # speed benefit of running batches concurrently.
         RS = "RS"
+        SCORE_BATCH_SIZE = 15
+        batches = [enriched[i:i + SCORE_BATCH_SIZE] for i in range(0, len(enriched), SCORE_BATCH_SIZE)]
 
-        biz_lines = ""
-        for i, p in enumerate(enriched):
-            tv = tavily_results.get(p["name"], {})
-            biz_lines += (
-                "\n---\n"
-                "Business " + str(i + 1) + ": " + p["name"] + "\n"
-                "Address: " + p["address"] + "\n"
-                "Phone: " + (p["phone"] or "not found") + "\n"
-                "Website: " + (p["website"] or "NONE") + "\n"
-                "Google Rating: " + str(p["rating"] or "no rating") + " (" + str(p["user_ratings_total"]) + " reviews)\n"
-                "Status: " + (p["business_status"] or "unknown") + "\n"
-                "Recent Reviews: " + (" | ".join(p["recent_reviews"]) or "none") + "\n"
-                "Social Media Intel: " + (tv.get("social") or "no data")[:300] + "\n"
-                "Ads/Marketing Intel: " + (tv.get("ads") or "no data")[:300] + "\n"
+        async def _score_batch(batch: list) -> list:
+            biz_lines = ""
+            for i, p in enumerate(batch):
+                tv = tavily_results.get(p["name"], {})
+                biz_lines += (
+                    "\n---\n"
+                    "Business " + str(i + 1) + ": " + p["name"] + "\n"
+                    "Address: " + p["address"] + "\n"
+                    "Phone: " + (p["phone"] or "not found") + "\n"
+                    "Website: " + (p["website"] or "NONE") + "\n"
+                    "Google Rating: " + str(p["rating"] or "no rating") + " (" + str(p["user_ratings_total"]) + " reviews)\n"
+                    "Status: " + (p["business_status"] or "unknown") + "\n"
+                    "Recent Reviews: " + (" | ".join(p["recent_reviews"]) or "none") + "\n"
+                    "Social Media Intel: " + (tv.get("social") or "no data")[:300] + "\n"
+                    "Ads/Marketing Intel: " + (tv.get("ads") or "no data")[:300] + "\n"
+                )
+            prompt = (
+                "You are a B2B prospect scoring expert for a digital marketing agency in " + search_scope + ".\n"
+                "Industry focus: " + industry + "\n\n"
+                "Analyse these REAL local businesses found on Google Maps and score them as prospects.\n\n"
+                "SCORING RULES:\n"
+                "- No website → HIGH opportunity (score 80-95)\n"
+                "- Low rating (<3.5) + few reviews → HIGH opportunity (score 70-90)\n"
+                "- Few reviews (<20) → HIGH opportunity\n"
+                "- No social media presence → HIGH opportunity\n"
+                "- Already running active ads → LOWER opportunity (score 30-50)\n"
+                "- HOT = opportunity_score > 75\n"
+                "- WARM = opportunity_score 50-75\n"
+                "- COLD = opportunity_score < 50\n\n"
+                "For each business provide a SPECIFIC, PERSONALIZED analysis based on the actual data.\n"
+                "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness).\n"
+                "Use " + RS + " for Indian Rupee symbol in expected_ltv.\n\n"
+                "Businesses to score:\n" + biz_lines + "\n"
+                "Return JSON:\n"
+                "{\n"
+                '  "prospects": [\n'
+                "    {\n"
+                '      "rank": 1,\n'
+                '      "name": "exact business name from data",\n'
+                '      "address": "exact address",\n'
+                '      "phone": "phone or empty string",\n'
+                '      "website": "url or empty string",\n'
+                '      "google_rating": 4.2,\n'
+                '      "total_reviews": 145,\n'
+                '      "classification": "hot",\n'
+                '      "opportunity_score": 85,\n'
+                '      "website_score": 30,\n'
+                '      "marketing_maturity": "low",\n'
+                '      "closing_probability": "75%",\n'
+                '      "expected_ltv": "' + RS + '25,000/month",\n'
+                '      "why_contact": "specific reason based on real data",\n'
+                '      "weakness_found": "specific weakness (no website / 3 reviews only / no Instagram / last post 4 months ago)",\n'
+                '      "recommended_service": "Meta Ads Management",\n'
+                '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + search_scope + ' get more customers through [service]. Would love to show you what we did for similar businesses here."\n'
+                "    }\n"
+                "  ]\n"
+                "}\n"
+                "Return ONLY valid JSON. Score all " + str(len(batch)) + " businesses. Rank by opportunity_score descending within this batch."
             )
+            raw_resp = await _retry_openai_call(
+                lambda: client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=3500,
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                ).choices[0].message.content,
+                label="prospect_discovery GPT-4o call",
+            )
+            return json.loads(raw_resp).get("prospects", [])
 
-        prompt = (
-            "You are a B2B prospect scoring expert for a digital marketing agency in " + search_scope + ".\n"
-            "Industry focus: " + industry + "\n\n"
-            "Analyse these REAL local businesses found on Google Maps and score them as prospects.\n\n"
-            "SCORING RULES:\n"
-            "- No website → HIGH opportunity (score 80-95)\n"
-            "- Low rating (<3.5) + few reviews → HIGH opportunity (score 70-90)\n"
-            "- Few reviews (<20) → HIGH opportunity\n"
-            "- No social media presence → HIGH opportunity\n"
-            "- Already running active ads → LOWER opportunity (score 30-50)\n"
-            "- HOT = opportunity_score > 75\n"
-            "- WARM = opportunity_score 50-75\n"
-            "- COLD = opportunity_score < 50\n\n"
-            "For each business provide a SPECIFIC, PERSONALIZED analysis based on the actual data.\n"
-            "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness).\n"
-            "Use " + RS + " for Indian Rupee symbol in expected_ltv.\n\n"
-            "Businesses to score:\n" + biz_lines + "\n"
-            "Return JSON:\n"
-            "{\n"
-            '  "total_found": ' + str(len(enriched)) + ',\n'
-            '  "city": "' + search_scope + '",\n'
-            '  "industry": "' + industry + '",\n'
-            '  "search_query_used": "' + search_terms + ' in ' + search_scope + '",\n'
-            '  "data_source": "Google Places API + Tavily",\n'
-            '  "top_opportunity": "Name of best prospect and one sentence why",\n'
-            '  "prospects": [\n'
-            "    {\n"
-            '      "rank": 1,\n'
-            '      "name": "exact business name from data",\n'
-            '      "address": "exact address",\n'
-            '      "phone": "phone or empty string",\n'
-            '      "website": "url or empty string",\n'
-            '      "google_rating": 4.2,\n'
-            '      "total_reviews": 145,\n'
-            '      "classification": "hot",\n'
-            '      "opportunity_score": 85,\n'
-            '      "website_score": 30,\n'
-            '      "marketing_maturity": "low",\n'
-            '      "closing_probability": "75%",\n'
-            '      "expected_ltv": "' + RS + '25,000/month",\n'
-            '      "why_contact": "specific reason based on real data",\n'
-            '      "weakness_found": "specific weakness (no website / 3 reviews only / no Instagram / last post 4 months ago)",\n'
-            '      "recommended_service": "Meta Ads Management",\n'
-            '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + search_scope + ' get more customers through [service]. Would love to show you what we did for similar businesses here."\n'
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "Return ONLY valid JSON. Score all " + str(len(enriched)) + " businesses. Rank by opportunity_score descending."
+        logger.info(f"[PROSPECT] Scoring {len(enriched)} businesses across {len(batches)} parallel GPT-4o batch(es)")
+        batch_results = await asyncio.gather(*[_score_batch(b) for b in batches])
+        prospects = _fix_rs([p for batch in batch_results for p in batch])
+
+        # Re-rank across the merged set — each batch only ranked within
+        # itself, so the final order/rank must be resolved globally.
+        prospects.sort(key=lambda p: p.get("opportunity_score", 0), reverse=True)
+        for i, p in enumerate(prospects):
+            p["rank"] = i + 1
+        prospects = prospects[:max_prospects]
+
+        result_obj = {
+            "city":              search_scope,
+            "industry":          industry,
+            "search_query_used": f"{search_terms} in {search_scope}",
+            "data_source":       "Google Places API + Tavily",
+            "top_opportunity": (
+                f"{prospects[0]['name']} — {prospects[0].get('why_contact', 'highest-scored prospect in this scan')}"
+                if prospects else ""
+            ),
+            "prospects":         prospects,
+        }
+
+        # Cost/rate-limit visibility — real API call counts for this run,
+        # so cost-per-run at scale (up to 50) is never a guess.
+        logger.info(
+            f"[PROSPECT] Run cost: {len(places_with_id)} Places Details call(s), "
+            f"{tavily_call_count} Tavily call(s), {len(batches)} GPT-4o call(s) "
+            f"for {len(prospects)} scored prospects"
         )
-
-        logger.info(f"[PROSPECT] Calling GPT-4o with {len(enriched)} businesses")
-        raw_resp = await _retry_openai_call(
-            lambda: client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=3500,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            ).choices[0].message.content,
-            label="prospect_discovery GPT-4o call",
-        )
-
-        result_obj = json.loads(raw_resp)
-        result_obj = _fix_rs(result_obj)
 
         # Separate into hot/warm/cold
-        prospects = result_obj.get("prospects", [])
         result_obj["hot_prospects"]  = [p for p in prospects if p.get("classification", "").lower() == "hot"]
         result_obj["warm_prospects"] = [p for p in prospects if p.get("classification", "").lower() == "warm"]
         result_obj["cold_prospects"] = [p for p in prospects if p.get("classification", "").lower() == "cold"]
         result_obj["total_found"]    = len(prospects)
-
-        # Trim to max_prospects
-        result_obj["prospects"] = prospects[:max_prospects]
 
         # 5. Save to prospect_memory keyed by industry::city
         prospect_key = derive_business_key("", industry, city)
