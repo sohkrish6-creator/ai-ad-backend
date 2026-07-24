@@ -15690,11 +15690,26 @@ async def instagram_coach_analyze(request: InstagramCoachRequest):
         "caption text given below — cite specifics (position in frame, actual colors present, exact caption "
         "wording/line it appears on). Never write generic filler that could apply to any random image/caption.\n"
         "- If the image has no legible overlay text, say so — don't invent text that isn't there.\n\n"
+        "CONTENT COHERENCE CHECK — separate from same-business tone/angle mismatches:\n"
+        "Compare the apparent SUBJECT MATTER of the image (what it's actually visibly about/promoting — a "
+        "business, service, product, or topic) against the apparent SUBJECT MATTER of the caption text. Only "
+        "flag this as incoherent if they appear to be about CLEARLY DIFFERENT businesses, topics, or offers "
+        "entirely — e.g. an image with overlay text about a photography service paired with a caption about "
+        "restaurant dinner plans. Do NOT flag it if the image and caption are plausibly about the SAME business "
+        "but just have a tone/angle/timing mismatch (e.g. a '24/7 support' image paired with a 'new product "
+        "drop' caption from what could be the same business) — that subtler case belongs in caption_analysis's "
+        "existing feedback, not here. When in doubt whether it's the same business, do not flag incoherence.\n\n"
         f"CAPTION (verbatim, empty means none was provided):\n{caption or '(no caption provided)'}\n\n"
         f"BUSINESS CONTEXT:\n{_ctx}\n"
         f"{_no_signal_guard}{_research_note_for_prompt}\n"
         'Return ONLY JSON:\n'
         '{\n'
+        '  "content_coherence": {\n'
+        '    "coherent": true|false,\n'
+        '    "image_subject": "one short phrase — what the image actually appears to be about/promoting",\n'
+        '    "caption_subject": "one short phrase — what the caption actually appears to be about (\'none provided\' if caption is empty)",\n'
+        '    "mismatch_warning": "empty string if coherent=true or no caption was given; otherwise a direct one-sentence warning naming both subjects, e.g. \'Your image seems to be about X, but your caption seems to be about Y — check that you uploaded the right files together.\'"\n'
+        '  },\n'
         '  "hook_assessment": {\n'
         '    "rating": "STRONG|MODERATE|WEAK",\n'
         '    "strengths": ["specific things that work, citing what is actually visible"],\n'
@@ -15751,6 +15766,14 @@ async def instagram_coach_analyze(request: InstagramCoachRequest):
     except Exception as _e:
         logger.error(f"[INSTAGRAM COACH] GPT-4o vision call failed: {_e}")
         return {"success": False, "error": f"Analysis failed: {_e}"}
+
+    if not caption:
+        # Nothing to compare the image against — force coherent rather than
+        # risk GPT flagging a false mismatch against an empty string.
+        parsed["content_coherence"] = {
+            "coherent": True, "image_subject": parsed.get("content_coherence", {}).get("image_subject", ""),
+            "caption_subject": "none provided", "mismatch_warning": "",
+        }
 
     parsed["grounded_in_business_data"] = _grounded
     parsed["research_used"] = _researched
