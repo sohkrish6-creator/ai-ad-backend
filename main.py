@@ -15704,12 +15704,22 @@ async def instagram_coach_analyze(request: InstagramCoachRequest):
         "CONTENT COHERENCE CHECK — separate from same-business tone/angle mismatches:\n"
         "Compare the apparent SUBJECT MATTER of the image (what it's actually visibly about/promoting — a "
         "business, service, product, or topic) against the apparent SUBJECT MATTER of the caption text. Only "
-        "flag this as incoherent if they appear to be about CLEARLY DIFFERENT businesses, topics, or offers "
-        "entirely — e.g. an image with overlay text about a photography service paired with a caption about "
-        "restaurant dinner plans. Do NOT flag it if the image and caption are plausibly about the SAME business "
-        "but just have a tone/angle/timing mismatch (e.g. a '24/7 support' image paired with a 'new product "
-        "drop' caption from what could be the same business) — that subtler case belongs in caption_analysis's "
-        "existing feedback, not here. When in doubt whether it's the same business, do not flag incoherence.\n\n"
+        "flag this as incoherent when the image and caption appear to be for FUNDAMENTALLY DIFFERENT "
+        "businesses or industries with no plausible connection — e.g. an image about a photography service "
+        "paired with a caption about restaurant dinner plans, or a fitness-studio image paired with a "
+        "jewellery-store caption. Do NOT flag it in either of these two cases:\n"
+        "  1. Same business, different tone/angle/timing (e.g. a '24/7 support' image paired with a 'new "
+        "product drop' caption from what could be the same business) — that subtler case belongs in "
+        "caption_analysis's existing feedback, not here.\n"
+        "  2. Same broad industry/niche, but the image's specific hook topic differs from the caption's "
+        "specific sub-service — e.g. an image hooked around 'photographers book 4 months early' (a relatable "
+        "wedding-industry pain point) paired with a caption about broader wedding event/vendor coordination "
+        "services. A hook using a relatable pain point or adjacent topic within the SAME industry, that leads "
+        "into a different but related service in the caption, is a normal and valid marketing technique (hook "
+        "with something specific and relatable, then pivot to the broader offering) — do not flag this as "
+        "incoherent.\n"
+        "When in doubt whether it's the same business OR the same broad industry, do not flag incoherence — "
+        "only flag confidently fundamental mismatches.\n\n"
         f"CAPTION (verbatim, empty means none was provided):\n{caption or '(no caption provided)'}\n\n"
         f"BUSINESS CONTEXT:\n{_ctx}\n"
         f"{_no_signal_guard}{_research_note_for_prompt}\n"
@@ -15785,6 +15795,13 @@ async def instagram_coach_analyze(request: InstagramCoachRequest):
             "coherent": True, "image_subject": parsed.get("content_coherence", {}).get("image_subject", ""),
             "caption_subject": "none provided", "mismatch_warning": "",
         }
+    elif parsed.get("content_coherence", {}).get("coherent") is True and parsed["content_coherence"].get("mismatch_warning"):
+        # Confirmed live: GPT sometimes fills mismatch_warning even when
+        # coherent=true, contradicting its own field definition — never
+        # trust it blindly, since the frontend (and any future caller)
+        # should be able to rely on mismatch_warning being empty whenever
+        # coherent is true, without also re-checking coherent itself.
+        parsed["content_coherence"]["mismatch_warning"] = ""
 
     parsed["grounded_in_business_data"] = _grounded
     parsed["research_used"] = _researched
