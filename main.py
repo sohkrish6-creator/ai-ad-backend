@@ -8412,41 +8412,55 @@ async def ad_to_creative(request: AdToCreativeRequest):
 
 # ── Module 3: Prospect Discovery ─────────────────────────────────────────────
 
+#  Each entry is a LIST of distinct sub-type search terms, not one combined
+#  phrase. Confirmed live: Google Places Text Search treats a combined
+#  phrase like "hotels restaurants cafes in Jaipur" as one literal query and
+#  returns far fewer results than the area actually has (13, in a live
+#  test) — it does not search each type independently. Every sub-type here
+#  is run as its own PARALLEL query and the results are merged + de-duped
+#  by place_id (see /prospect-discovery), so a compound industry like
+#  "Hospitality (Hotels, Restaurants, Cafes)" genuinely surfaces hotels AND
+#  restaurants AND cafes, not whatever narrow overlap matches all three
+#  words in one search string.
 _INDUSTRY_SEARCH_TERMS = {
-    "hospitality (hotels, restaurants, cafes)": "hotels restaurants cafes",
-    "schools & education":                      "schools coaching institutes tuition",
-    "healthcare & clinics":                     "clinics hospitals doctors medical centre",
-    "real estate":                              "real estate developers builders property dealers",
-    "retail & fashion":                         "clothing stores boutiques fashion retail",
-    "food & beverage":                          "restaurants cafes bakeries food delivery",
-    "wellness & fitness":                       "gyms fitness centres yoga wellness spa",
-    "wedding & events":                         "wedding planners event management decorators",
-    "auto & transport":                         "car dealers service centres auto garage",
-    "professional services":                    "chartered accountants lawyers consultants",
-    "coaching & tutoring":                      "coaching centres tutors training institutes",
-    "jewellery & accessories":                  "jewellery stores showrooms gold silver",
-    "interior design & architecture":           "interior designers architects home decor",
-    "photography & videography":                "photographers videographers studios",
-    "legal & ca services":                      "lawyers advocates chartered accountants",
-    "it & software companies":                  "software companies IT firms tech startups",
-    "travel & tourism":                         "travel agents tour operators holiday packages",
-    "salon & beauty":                           "salons beauty parlours makeup artists",
-    "gym & sports academy":                     "gyms sports academies fitness clubs",
-    "ngo & social enterprise":                  "NGO social enterprise non profit foundation",
-    "agriculture & dairy":                      "dairy farms agriculture suppliers",
-    "logistics & transport":                    "logistics courier transport fleet",
-    "printing & packaging":                     "printing press packaging manufacturers",
-    "construction & builders":                  "construction companies builders contractors",
-    "media & entertainment":                    "media production entertainment events",
-    "other":                                    "local businesses services",
+    "hospitality (hotels, restaurants, cafes)": ["hotels", "restaurants", "cafes"],
+    "schools & education":                      ["schools", "coaching institutes", "tuition centres"],
+    "healthcare & clinics":                     ["clinics", "hospitals", "doctors", "medical centre"],
+    "real estate":                              ["real estate developers", "builders", "property dealers"],
+    "retail & fashion":                         ["clothing stores", "boutiques", "fashion retail"],
+    "food & beverage":                          ["restaurants", "cafes", "bakeries", "food delivery"],
+    "wellness & fitness":                       ["gyms", "fitness centres", "yoga studios", "wellness spa"],
+    "wedding & events":                         ["wedding planners", "event management", "decorators"],
+    "auto & transport":                         ["car dealers", "service centres", "auto garage"],
+    "professional services":                    ["chartered accountants", "lawyers", "consultants"],
+    "coaching & tutoring":                      ["coaching centres", "tutors", "training institutes"],
+    "jewellery & accessories":                  ["jewellery stores", "showrooms", "gold silver dealers"],
+    "interior design & architecture":           ["interior designers", "architects", "home decor"],
+    "photography & videography":                ["photographers", "videographers", "studios"],
+    "legal & ca services":                      ["lawyers", "advocates", "chartered accountants"],
+    "it & software companies":                  ["software companies", "IT firms", "tech startups"],
+    "travel & tourism":                         ["travel agents", "tour operators", "holiday packages"],
+    "salon & beauty":                           ["salons", "beauty parlours", "makeup artists"],
+    "gym & sports academy":                     ["gyms", "sports academies", "fitness clubs"],
+    "ngo & social enterprise":                  ["NGO", "social enterprise", "non profit foundation"],
+    "agriculture & dairy":                      ["dairy farms", "agriculture suppliers"],
+    "logistics & transport":                    ["logistics", "courier", "transport fleet"],
+    "printing & packaging":                     ["printing press", "packaging manufacturers"],
+    "construction & builders":                  ["construction companies", "builders", "contractors"],
+    "media & entertainment":                    ["media production", "entertainment events"],
+    "other":                                    ["local businesses", "services"],
 }
 
-def _get_search_terms(industry: str) -> str:
+def _get_search_terms(industry: str) -> list:
+    """Returns a LIST of distinct sub-type search terms for the given
+    industry — always a list now (even a single-term industry returns a
+    one-item list), so every caller runs them as separate parallel Places
+    queries uniformly rather than special-casing "one term vs many"."""
     k = (industry or "").strip().lower()
     for key, terms in _INDUSTRY_SEARCH_TERMS.items():
         if k == key or k in key or key in k:
             return terms
-    return k or "local businesses"
+    return [k] if k else ["local businesses"]
 
 
 class ProspectDiscoveryRequest(BaseModel):
@@ -8501,15 +8515,44 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         search_scope   = city or "India"
         max_prospects  = max(5, min(request.max_prospects, 50))
 
-        search_terms   = _get_search_terms(industry)
-        logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms!r} max_prospects={max_prospects}")
+        search_terms_list = _get_search_terms(industry)
+        logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms_list!r} max_prospects={max_prospects}")
 
-        # 1. Text-search Google Places — paginates internally (next_page_token)
-        # when max_prospects exceeds one page's worth (~20) of results.
-        _places_debug = {}
-        raw_places = await fetch_google_places(search_terms, search_scope, max_results=max(max_prospects, 20), _debug=_places_debug)
+        # 1. Text-search Google Places — one PARALLEL query per sub-type
+        # term (e.g. "hotels", "restaurants", "cafes" independently), not
+        # one combined phrase. Confirmed live: Google's Text Search treats a
+        # combined phrase as a single literal query and returns far fewer
+        # results than the area actually has across all sub-types (13 vs a
+        # genuine ~40+ once split). Each query paginates internally via
+        # fetch_google_places; results are merged and de-duplicated by
+        # place_id (a business can legitimately appear in more than one
+        # sub-type search, e.g. a hotel with its own restaurant).
+        _places_debug = {"per_term": {}}
+
+        async def _fetch_term(term: str):
+            dbg = {}
+            places = await fetch_google_places(term, search_scope, max_results=max_prospects, _debug=dbg)
+            return term, places, dbg
+
+        term_results = await asyncio.gather(*[_fetch_term(t) for t in search_terms_list])
+
+        raw_places = []
+        seen_place_ids = set()
+        for term, places, dbg in term_results:
+            _places_debug["per_term"][term] = dbg
+            for p in places:
+                pid = p.get("place_id")
+                if pid and pid in seen_place_ids:
+                    continue
+                if pid:
+                    seen_place_ids.add(pid)
+                raw_places.append(p)
+
         google_places_used = bool(raw_places)
-        logger.info(f"[PROSPECT] Google Places returned {len(raw_places)} results (paginated) — debug={_places_debug}")
+        logger.info(
+            f"[PROSPECT] Google Places returned {len(raw_places)} deduplicated results across "
+            f"{len(search_terms_list)} parallel sub-searches — debug={_places_debug}"
+        )
 
         # 2. Enrich up to max_prospects with place details, in parallel
         # batches (not all-at-once) to bound concurrency against Places API
@@ -8668,7 +8711,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         result_obj = {
             "city":              search_scope,
             "industry":          industry,
-            "search_query_used": f"{search_terms} in {search_scope}",
+            "search_query_used": f"{', '.join(search_terms_list)} in {search_scope}",
             "data_source":       "Google Places API + Tavily",
             "top_opportunity": (
                 f"{prospects[0]['name']} — {prospects[0].get('why_contact', 'highest-scored prospect in this scan')}"
@@ -8678,11 +8721,14 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         }
 
         # Cost/rate-limit visibility — real API call counts for this run,
-        # so cost-per-run at scale (up to 50) is never a guess.
+        # so cost-per-run at scale (up to 50, across multiple sub-searches)
+        # is never a guess.
+        _places_text_search_calls = sum(len(d.get("pages", [])) for d in _places_debug["per_term"].values())
         logger.info(
-            f"[PROSPECT] Run cost: {len(places_with_id)} Places Details call(s), "
-            f"{tavily_call_count} Tavily call(s), {len(batches)} GPT-4o call(s) "
-            f"for {len(prospects)} scored prospects"
+            f"[PROSPECT] Run cost: {len(search_terms_list)} sub-search term(s) / "
+            f"{_places_text_search_calls} Places Text Search call(s) (with pagination), "
+            f"{len(places_with_id)} Places Details call(s), {tavily_call_count} Tavily call(s), "
+            f"{len(batches)} GPT-4o call(s) for {len(prospects)} scored prospects"
         )
 
         # Separate into hot/warm/cold
