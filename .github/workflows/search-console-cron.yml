@@ -1,0 +1,17 @@
+name: Search Console Daily Sync
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  sync-search-console:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger /search-console/sync-all
+        run: |
+          curl -X POST https://ai-ad-backend-zhpj.onrender.com/search-console/sync-all \
+            --header "X-API-Key: ${{ secrets.BACKEND_API_KEY }}" \
+            --max-time 300 \
+            --fail-with-body

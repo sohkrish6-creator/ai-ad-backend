@@ -106,6 +106,7 @@ _PUBLIC_PATHS = {
     "/version",          # deployed commit hash only — no secrets, useful to confirm a deploy actually landed
     "/google/callback",  # browser redirect from Google — no auth header; state HMAC is the security
     "/meta/callback",    # browser redirect from Meta — same reason
+    "/search-console/callback",  # browser redirect from Google (Search Console scope) — same reason
     "/public/weekly-market-insight",  # public website widget — no auth, rate-limited instead
     "/public/portfolio",              # public website widget — no auth, rate-limited instead
     "/public/testimonials",           # public website widget — no auth, rate-limited instead
@@ -128,6 +129,7 @@ _LOGIN_PATH = "/admin/website/login"
 # has verified the caller, the JWT gate below is skipped for these paths.
 _API_KEY_ONLY_PATHS = {
     "/admin/weekly-market-insight/create",
+    "/search-console/sync-all",  # daily GitHub Actions cron — no Supabase session, X-API-Key only
 }
 # Same idea, but for a whole path family (dynamic /{id} segments) — the
 # website-admin.html panel authenticates with X-API-Key only, entered once
@@ -18128,6 +18130,454 @@ async def meta_disconnect(request: Request):
                 "ON CONFLICT(user_id) DO UPDATE SET revoked=TRUE, updated_at=:ts"
             ), {"uid": uid, "ts": now})
     return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ORGANIC INTELLIGENCE — GOOGLE SEARCH CONSOLE MODULE
+#  Multi-tenant OAuth (per-user, no global/legacy fallback — unlike Google Ads/Meta
+#  this integration has no pre-existing global connection to preserve). Reuses the
+#  same Fernet encryption + HMAC state-signing utilities as Google Ads/Meta OAuth
+#  above. Connect UI lives in Account.jsx (a 3rd "Connected Accounts" row), NOT a
+#  standalone page — mirrors the same "never auto-select on callback" lesson that
+#  fixed a real cross-account-contamination bug in the Google Ads flow.
+#
+#  EXPLICITLY DEFERRED (do not build until a real client need surfaces):
+#  Instagram/YouTube/TikTok/X "Platform Properties" support; full 14-asset-type
+#  Content Repurposing fan-out (only 3 built: Instagram caption, ad copy angle,
+#  video script hook); Email/SMS/WhatsApp auto-dispatch; Content Gap AI across
+#  5 platforms; weekly/monthly PDF report generation; a persistent notification
+#  center (toast-only for now via the existing useToast).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_GSC_OAUTH_SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+
+
+def _gsc_oauth_redirect_uri() -> str:
+    return _genv("SEARCH_CONSOLE_OAUTH_REDIRECT_URI") or "http://localhost:8000/search-console/callback"
+
+
+if not _gsc_oauth_redirect_uri().startswith("https://"):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+
+def _gsc_oauth_client_config() -> dict:
+    # Reuses the SAME Google OAuth app as Google Ads (GOOGLE_OAUTH_CLIENT_ID/SECRET) —
+    # only the "Google Search Console API" needs enabling on that GCP project, and
+    # webmasters.readonly added to the consent screen's scope list. No new OAuth client.
+    return {"web": {
+        "client_id":     _genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
+        "client_secret": _genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
+        "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+        "token_uri":     "https://oauth2.googleapis.com/token",
+        "redirect_uris": [_gsc_oauth_redirect_uri()],
+    }}
+
+
+# ── DB tables ─────────────────────────────────────────────────────────────────
+_GSC_DDL = """
+CREATE TABLE IF NOT EXISTS search_console_tokens (
+    id                       BIGSERIAL PRIMARY KEY,
+    user_id                  TEXT UNIQUE,
+    encrypted_refresh_token  TEXT NOT NULL,
+    selected_site_url        TEXT,
+    scope                    TEXT,
+    connected_at             TEXT,
+    updated_at               TEXT,
+    revoked                  BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS search_console_properties (
+    id                BIGSERIAL PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    site_url          TEXT NOT NULL,
+    permission_level  TEXT,
+    is_active         BOOLEAN DEFAULT FALSE,
+    discovered_at     TEXT,
+    last_synced_at    TEXT,
+    UNIQUE(user_id, site_url)
+);
+
+CREATE TABLE IF NOT EXISTS search_queries (
+    id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    site_url      TEXT NOT NULL,
+    query_date    DATE NOT NULL,
+    query_text    TEXT NOT NULL,
+    country       TEXT,
+    device        TEXT,
+    impressions   INTEGER DEFAULT 0,
+    clicks        INTEGER DEFAULT 0,
+    ctr           REAL DEFAULT 0,
+    position      REAL DEFAULT 0,
+    synced_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS search_pages (
+    id            BIGSERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    site_url      TEXT NOT NULL,
+    query_date    DATE NOT NULL,
+    page_url      TEXT NOT NULL,
+    country       TEXT,
+    device        TEXT,
+    impressions   INTEGER DEFAULT 0,
+    clicks        INTEGER DEFAULT 0,
+    ctr           REAL DEFAULT 0,
+    position      REAL DEFAULT 0,
+    synced_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS search_console_ai_insights (
+    id             BIGSERIAL PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    site_url       TEXT NOT NULL,
+    insights_json  TEXT,
+    generated_at   TEXT,
+    UNIQUE(user_id, site_url)
+);
+"""
+
+
+def _create_gsc_tables():
+    ddl = _GSC_DDL
+    if _is_sqlite:
+        ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.connect() as conn:
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+        conn.commit()
+    with engine.connect() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_search_queries_lookup ON search_queries(user_id, site_url, query_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_search_pages_lookup ON search_pages(user_id, site_url, query_date)"))
+        conn.commit()
+    logger.info("[GSC] search_console_*/search_queries/search_pages tables ready")
+
+
+try:
+    _create_gsc_tables()
+except Exception as _gsce:
+    logger.warning(f"[GSC] Table create failed: {_gsce}")
+
+
+# ── Search Console service client — sources refresh_token from the encrypted ──
+# DB row for this user (per-user, no global/env-var fallback for this integration).
+def _build_gsc_service(user_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT encrypted_refresh_token, revoked FROM search_console_tokens WHERE user_id=:uid"
+        ), {"uid": user_id}).fetchone()
+    if not row or row[1]:
+        raise RuntimeError("Search Console not connected. Visit /search-console/connect.")
+    refresh_token = decrypt_token(row[0])
+    creds = Credentials(
+        None,
+        refresh_token=refresh_token,
+        client_id=_genv("GOOGLE_OAUTH_CLIENT_ID") or _genv("GOOGLE_ADS_CLIENT_ID"),
+        client_secret=_genv("GOOGLE_OAUTH_CLIENT_SECRET") or _genv("GOOGLE_ADS_CLIENT_SECRET"),
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=_GSC_OAUTH_SCOPES,
+    )
+    from googleapiclient.discovery import build as _gsc_build
+    return _gsc_build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+
+
+# ── Property discovery ───────────────────────────────────────────────────────
+def _list_gsc_properties_sync(user_id: str) -> list:
+    service = _build_gsc_service(user_id)
+    resp = service.sites().list().execute()
+    entries = resp.get("siteEntry", []) or []
+    properties = []
+    for e in entries:
+        level = e.get("permissionLevel", "")
+        if level == "siteUnverifiedUser":
+            continue
+        properties.append({"site_url": e.get("siteUrl", ""), "permission_level": level})
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        for p in properties:
+            conn.execute(text(
+                "INSERT INTO search_console_properties (user_id, site_url, permission_level, discovered_at) "
+                "VALUES (:uid, :su, :lvl, :ts) "
+                "ON CONFLICT(user_id, site_url) DO UPDATE SET permission_level=:lvl, discovered_at=:ts"
+            ), {"uid": user_id, "su": p["site_url"], "lvl": p["permission_level"], "ts": now})
+    return properties
+
+
+# ── Search Analytics fetch ───────────────────────────────────────────────────
+def _gsc_date_range():
+    # GSC's Search Analytics data has a ~2-3 day reporting lag; dataState="final"
+    # below additionally excludes still-fluctuating provisional days.
+    end = date.today() - timedelta(days=3)
+    start = end - timedelta(days=90)
+    return start, end
+
+
+def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, user_id: str) -> list:
+    dim_key = "query" if kind == "query" else "page"
+    body = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "dimensions": ["date", dim_key, "country", "device"],
+        "rowLimit": 25000,
+        "startRow": 0,
+        "dataState": "final",
+    }
+    all_rows = []
+    for _ in range(4):   # safety cap: 4 pages = 100k rows max per property per kind
+        resp = service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+        page = resp.get("rows", []) or []
+        if not page:
+            break
+        all_rows.extend(page)
+        if len(page) < body["rowLimit"]:
+            break
+        body["startRow"] += body["rowLimit"]
+
+    now = datetime.utcnow().isoformat()
+    out = []
+    for r in all_rows:
+        keys = r.get("keys", [])
+        if len(keys) < 4:
+            continue
+        row = {
+            "user_id": user_id, "site_url": site_url, "query_date": keys[0],
+            "country": keys[2], "device": keys[3],
+            "impressions": int(r.get("impressions", 0)), "clicks": int(r.get("clicks", 0)),
+            "ctr": float(r.get("ctr", 0.0)), "position": float(r.get("position", 0.0)),
+            "synced_at": now,
+        }
+        if kind == "query":
+            row["query_text"] = keys[1]
+        else:
+            row["page_url"] = keys[1]
+        out.append(row)
+    return out
+
+
+def _write_gsc_sync_data(user_id: str, site_url: str, query_rows: list, page_rows: list):
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM search_queries WHERE user_id=:uid AND site_url=:su"), {"uid": user_id, "su": site_url})
+        if query_rows:
+            conn.execute(text(
+                "INSERT INTO search_queries (user_id, site_url, query_date, query_text, country, device, "
+                "impressions, clicks, ctr, position, synced_at) "
+                "VALUES (:user_id, :site_url, :query_date, :query_text, :country, :device, "
+                ":impressions, :clicks, :ctr, :position, :synced_at)"
+            ), query_rows)
+
+        conn.execute(text("DELETE FROM search_pages WHERE user_id=:uid AND site_url=:su"), {"uid": user_id, "su": site_url})
+        if page_rows:
+            conn.execute(text(
+                "INSERT INTO search_pages (user_id, site_url, query_date, page_url, country, device, "
+                "impressions, clicks, ctr, position, synced_at) "
+                "VALUES (:user_id, :site_url, :query_date, :page_url, :country, :device, "
+                ":impressions, :clicks, :ctr, :position, :synced_at)"
+            ), page_rows)
+
+        conn.execute(text(
+            "UPDATE search_console_properties SET last_synced_at=:ts WHERE user_id=:uid AND site_url=:su"
+        ), {"ts": now, "uid": user_id, "su": site_url})
+
+
+async def _sync_search_console_for_user(user_id: str, site_url: str) -> dict:
+    service = await asyncio.to_thread(_build_gsc_service, user_id)
+    start, end = _gsc_date_range()
+    query_rows = await asyncio.to_thread(_gsc_fetch_rows, service, site_url, "query", start, end, user_id)
+    page_rows  = await asyncio.to_thread(_gsc_fetch_rows, service, site_url, "page",  start, end, user_id)
+    await asyncio.to_thread(_write_gsc_sync_data, user_id, site_url, query_rows, page_rows)
+    log_activity("organic_intelligence_sync", url=site_url,
+                 summary=f"Synced {len(query_rows)} query-rows, {len(page_rows)} page-rows for {site_url}")
+    return {"success": True, "site_url": site_url, "query_rows": len(query_rows), "page_rows": len(page_rows)}
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+@app.get("/search-console/connect")
+async def search_console_connect(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    try:
+        flow = _GoogleOAuthFlow.from_client_config(
+            _gsc_oauth_client_config(),
+            scopes=_GSC_OAUTH_SCOPES,
+            redirect_uri=_gsc_oauth_redirect_uri(),
+        )
+        state = _make_oauth_state(uid)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+            state=state,
+        )
+        return {"success": True, "auth_url": auth_url}
+    except Exception as _e:
+        logger.error(f"[GSC-OAUTH] /search-console/connect error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+@app.get("/search-console/callback")
+async def search_console_callback(code: str = "", state: str = "", error: str = ""):
+    frontend = _genv("FRONTEND_URL") or "http://localhost:5173"
+    if error:
+        return RedirectResponse(f"{frontend}/account?gsc_connected=false&error={error}")
+    valid, uid = _verify_oauth_state(state)
+    if not valid:
+        return RedirectResponse(f"{frontend}/account?gsc_connected=false&error=invalid_state")
+    if not uid:
+        # No global/legacy fallback for this integration — Search Console requires
+        # a real logged-in user (unlike Google Ads/Meta, there's no pre-existing
+        # global connection here worth preserving).
+        return RedirectResponse(f"{frontend}/account?gsc_connected=false&error=not_authenticated")
+
+    _redirect_uri_used = _gsc_oauth_redirect_uri()
+    logger.info(f"[GSC-OAUTH] callback uid={uid!r} redirect_uri={_redirect_uri_used!r}")
+    try:
+        flow = _GoogleOAuthFlow.from_client_config(
+            _gsc_oauth_client_config(),
+            scopes=_GSC_OAUTH_SCOPES,
+            redirect_uri=_redirect_uri_used,
+        )
+
+        def _fetch():
+            flow.fetch_token(code=code)
+            return flow.credentials
+        creds = await asyncio.to_thread(_fetch)
+
+        if not creds.refresh_token:
+            return RedirectResponse(f"{frontend}/account?gsc_connected=false&error=no_refresh_token")
+
+        enc = encrypt_token(creds.refresh_token)
+        now = datetime.utcnow().isoformat()
+
+        # Same lesson as Google Ads: never auto-select a property on callback —
+        # store the token WITHOUT a selected_site_url and require the user to
+        # explicitly pick in the Account picker.
+        with engine.begin() as conn:
+            if _is_sqlite:
+                conn.execute(text(
+                    "INSERT INTO search_console_tokens "
+                    "(user_id, encrypted_refresh_token, selected_site_url, scope, connected_at, updated_at, revoked) "
+                    "VALUES (:uid, :enc, NULL, :scope, :ts, :ts, FALSE) "
+                    "ON CONFLICT(user_id) DO UPDATE SET "
+                    "encrypted_refresh_token=:enc, selected_site_url=NULL, scope=:scope, updated_at=:ts, revoked=FALSE"
+                ), {"uid": uid, "enc": enc, "scope": " ".join(_GSC_OAUTH_SCOPES), "ts": now})
+            else:
+                conn.execute(text(
+                    "INSERT INTO search_console_tokens "
+                    "(id, user_id, encrypted_refresh_token, selected_site_url, scope, connected_at, updated_at, revoked) "
+                    "VALUES (nextval('search_console_tokens_id_seq'), :uid, :enc, NULL, :scope, :ts, :ts, FALSE) "
+                    "ON CONFLICT(user_id) DO UPDATE SET "
+                    "encrypted_refresh_token=:enc, selected_site_url=NULL, scope=:scope, updated_at=:ts, revoked=FALSE"
+                ), {"uid": uid, "enc": enc, "scope": " ".join(_GSC_OAUTH_SCOPES), "ts": now})
+
+        logger.info(f"[GSC-OAUTH] Token stored uid={uid!r} — redirecting to property picker")
+        return RedirectResponse(f"{frontend}/account?gsc_connected=pending")
+    except Exception as _e:
+        import traceback as _tb
+        _detail = str(_e)[:200]
+        logger.error(f"[GSC-OAUTH] /search-console/callback FAILED redirect_uri={_redirect_uri_used!r} error={_detail}\n{_tb.format_exc()}")
+        import urllib.parse as _up
+        return RedirectResponse(f"{frontend}/account?gsc_connected=false&error={_up.quote(_detail)}")
+
+
+@app.get("/search-console/status")
+async def search_console_status(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"connected": False}
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT selected_site_url, connected_at, revoked FROM search_console_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[2]:
+        return {"connected": False}
+    return {"connected": True, "site_url": row[0], "connected_at": row[1]}
+
+
+@app.delete("/search-console/disconnect")
+async def search_console_disconnect(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE search_console_tokens SET revoked=TRUE WHERE user_id=:uid"), {"uid": uid})
+    return {"success": True}
+
+
+@app.get("/search-console/properties")
+async def search_console_properties(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "properties": [], "error": "Not authenticated"}
+    try:
+        properties = await asyncio.to_thread(_list_gsc_properties_sync, uid)
+        return {"success": True, "properties": properties}
+    except Exception as _e:
+        logger.error(f"[GSC] /search-console/properties error: {_e}")
+        return {"success": False, "properties": [], "error": str(_e)}
+
+
+@app.post("/search-console/select-property")
+async def search_console_select_property(request: Request):
+    body = await request.json()
+    uid = getattr(request.state, "user_id", "")
+    site_url = str(body.get("site_url", "")).strip()
+    if not uid or not site_url:
+        return {"success": False, "error": "user_id and site_url required"}
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE search_console_tokens SET selected_site_url=:su WHERE user_id=:uid"), {"su": site_url, "uid": uid})
+        conn.execute(text("UPDATE search_console_properties SET is_active=FALSE WHERE user_id=:uid"), {"uid": uid})
+        conn.execute(text("UPDATE search_console_properties SET is_active=TRUE WHERE user_id=:uid AND site_url=:su"), {"uid": uid, "su": site_url})
+    return {"success": True, "site_url": site_url}
+
+
+@app.post("/search-console/sync")
+async def search_console_sync(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT selected_site_url, revoked FROM search_console_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row or row[1]:
+        return {"success": False, "error": "Search Console not connected. Visit /search-console/connect."}
+    site_url = row[0]
+    if not site_url:
+        return {"success": False, "error": "No property selected. Call /search-console/select-property first."}
+    try:
+        return await _sync_search_console_for_user(uid, site_url)
+    except Exception as _e:
+        logger.error(f"[GSC] /search-console/sync error: {_e}")
+        return {"success": False, "error": str(_e)}
+
+
+@app.post("/search-console/sync-all")
+async def search_console_sync_all():
+    """Batch sync for all users' active properties — triggered by the daily GitHub
+    Actions cron (search-console-cron.yml) via X-API-Key, no user JWT involved."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT user_id, site_url FROM search_console_properties WHERE is_active=TRUE"
+            )).fetchall()
+    except Exception as _e:
+        logger.error(f"[GSC-SYNC-ALL] Could not list active properties: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    results = []
+    for uid, site_url in rows:
+        try:
+            outcome = await _sync_search_console_for_user(uid, site_url)
+            results.append({"user_id": uid, "site_url": site_url, "success": outcome.get("success", False),
+                             "query_rows": outcome.get("query_rows"), "page_rows": outcome.get("page_rows")})
+        except Exception as _e:
+            logger.error(f"[GSC-SYNC-ALL] Failed for uid={uid!r} site_url={site_url!r}: {_e}")
+            results.append({"user_id": uid, "site_url": site_url, "success": False, "error": str(_e)})
+
+    ok_count = sum(1 for r in results if r.get("success"))
+    logger.info(f"[GSC-SYNC-ALL] Processed {len(results)} properties, {ok_count} succeeded")
+    return {"success": True, "properties_processed": len(results), "succeeded": ok_count, "results": results}
 
 
 # ── Unified connected-accounts status ─────────────────────────────────────────
