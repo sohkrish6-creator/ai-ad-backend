@@ -2918,6 +2918,7 @@ class CampaignLaunchKitRequest(BaseModel):
     goal: str = ""
     language: str = "Hinglish"
     sections: dict = {}
+    additional_context: str = ""   # e.g. a real Organic Intelligence opportunity to ground ad copy in
 
 
 def _extract_campaign_kit_assets(google_kit_text: str) -> dict:
@@ -3027,6 +3028,12 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
 
     _growth_block = growth_learning_block(request.industry)
 
+    extra_context_block = (
+        f"ADDITIONAL CONTEXT FOR THIS CAMPAIGN (ground the copy in this real data point — reference it directly, "
+        f"don't paraphrase it away):\n{request.additional_context}\n\n"
+        if request.additional_context else ""
+    )
+
     prompt = (
         f"You are a senior media buyer building a ready-to-paste campaign launch kit.\n"
         f"Business: {biz_label} | City: {city_label} | Total Monthly Budget: Rs {bdgt}\n"
@@ -3036,6 +3043,7 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
         f"{sections_summary}\n\n"
         f"{real_perf_block}"
         f"{_growth_block}"
+        f"{extra_context_block}"
         "RULES — READ BEFORE GENERATING:\n"
         "1. ZERO generic copy. Every asset must reference the specific business, industry, or city above.\n"
         "2. Ad Copy formula: Hook (problem/desire specific to this audience) + Body (specific benefit with proof or number) + CTA (one exact action).\n"
@@ -18904,6 +18912,159 @@ async def search_console_opportunities(request: Request, url: str = "", industry
             "position_4_10_pages": position_4_10_pages,
             "declining_queries": declining_queries,
         },
+    }
+
+
+# ── AI Recommendations — grounded only in the real health-score/opportunities ──
+# data just computed above, never re-touches the Search Console or OpenAI API on
+# every dashboard load (cached in search_console_ai_insights, 24h TTL).
+def _generate_gsc_recommendations_sync(health: dict, opportunities: dict) -> dict:
+    prompt = (
+        "You are an SEO strategist writing recommendations for a real Google Search Console account. "
+        "Use ONLY the numbers given below — never invent a metric, query, or page that isn't listed. "
+        "Every recommendation must cite at least one real number from the data.\n\n"
+        f"HEALTH SCORE: {json.dumps(health)}\n\n"
+        f"OPPORTUNITIES: {json.dumps(opportunities.get('opportunities', {}))}\n\n"
+        "If a section above has no items, say so explicitly rather than inventing content.\n\n"
+        "Return ONLY valid JSON with this exact structure:\n"
+        "{\n"
+        '  "narrative": "2-3 sentence plain-English summary citing real numbers",\n'
+        '  "top_actions": [{"action": "...", "why": "cites a specific query/page/number", "impact": "HIGH|MEDIUM|LOW"}]\n'
+        "}"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+        max_tokens=900,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+@app.get("/search-console/recommendations")
+async def search_console_recommendations(request: Request, refresh: bool = False):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    site_url, err = _gsc_get_selected_property(uid)
+    if err:
+        return err
+
+    if not refresh:
+        with engine.connect() as conn:
+            cached = conn.execute(text(
+                "SELECT insights_json, generated_at FROM search_console_ai_insights WHERE user_id=:uid AND site_url=:su"
+            ), {"uid": uid, "su": site_url}).fetchone()
+        if cached and cached[0] and cached[1]:
+            try:
+                gen_at = datetime.fromisoformat(cached[1])
+                if datetime.utcnow() - gen_at < timedelta(hours=24):
+                    return {"success": True, "cached": True, "generated_at": cached[1], **json.loads(cached[0])}
+            except Exception:
+                pass
+
+    health = await search_console_health_score(request)
+    opportunities = await search_console_opportunities(request)
+    if not health.get("success") or not opportunities.get("success"):
+        return {"success": False, "error": "Could not compute health score / opportunities."}
+
+    try:
+        insights = await asyncio.to_thread(_generate_gsc_recommendations_sync, health, opportunities)
+    except Exception as _e:
+        logger.error(f"[GSC] AI recommendations generation failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "DELETE FROM search_console_ai_insights WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url})
+        conn.execute(text(
+            "INSERT INTO search_console_ai_insights (user_id, site_url, insights_json, generated_at) "
+            "VALUES (:uid, :su, :json, :ts)"
+        ), {"uid": uid, "su": site_url, "json": json.dumps(insights), "ts": now})
+
+    log_activity("organic_intelligence_recommendations", url=site_url, summary="Generated AI recommendations")
+    return {"success": True, "cached": False, "generated_at": now, **insights}
+
+
+# ── Repurpose Content — one self-contained call grounded in one real page's ────
+# data (not _run_creative_studio, whose 3 fixed tone-of-voice variants don't map
+# to these 3 asset types). Same anti-filler discipline as the cricket-ads/gads
+# prompts: every asset must cite the page's real numbers.
+def _generate_gsc_repurpose_content_sync(page_url: str, top_query: str, impressions: int, clicks: int,
+                                          ctr: float, avg_position: float) -> dict:
+    prompt = (
+        "This page is already ranking in real Google search results — use its REAL performance data below, "
+        "don't invent anything.\n\n"
+        f"Page: {page_url}\nTop query: '{top_query}'\nImpressions: {impressions}\nClicks: {clicks}\n"
+        f"CTR: {ctr:.1%}\nAverage position: {avg_position:.1f}\n\n"
+        "Generate 3 assets repurposing this real, already-ranking page/query — cite the numbers above naturally "
+        "in the copy where it strengthens the pitch, no generic filler.\n\n"
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        '  "instagram_caption": "...",\n'
+        '  "ad_copy_angle": {"headline": "...", "body": "..."},\n'
+        '  "video_script_hook": {"hook": "...", "body": "...", "cta": "..."}\n'
+        "}"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.5,
+        max_tokens=700,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+@app.post("/search-console/repurpose-content")
+async def search_console_repurpose_content(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    site_url, err = _gsc_get_selected_property(uid)
+    if err:
+        return err
+
+    body = await request.json()
+    page_url = str(body.get("page_url", "")).strip()
+    top_query = str(body.get("top_query", "")).strip()
+    if not page_url:
+        return {"success": False, "error": "page_url is required"}
+
+    with engine.connect() as conn:
+        page_row = conn.execute(text(
+            "SELECT SUM(impressions), SUM(clicks), AVG(position) FROM search_pages "
+            "WHERE user_id=:uid AND site_url=:su AND page_url=:pu"
+        ), {"uid": uid, "su": site_url, "pu": page_url}).fetchone()
+        if not top_query:
+            q_row = conn.execute(text(
+                "SELECT query_text FROM search_queries WHERE user_id=:uid AND site_url=:su "
+                "GROUP BY query_text ORDER BY SUM(clicks) DESC LIMIT 1"
+            ), {"uid": uid, "su": site_url}).fetchone()
+            top_query = q_row[0] if q_row else ""
+
+    if not page_row or not page_row[0]:
+        return {"success": False, "error": "No synced data found for that page."}
+
+    impressions, clicks, avg_position = int(page_row[0] or 0), int(page_row[1] or 0), float(page_row[2] or 0)
+    ctr = (clicks / impressions) if impressions else 0
+
+    try:
+        assets = await asyncio.to_thread(
+            _generate_gsc_repurpose_content_sync, page_url, top_query, impressions, clicks, ctr, avg_position
+        )
+    except Exception as _e:
+        logger.error(f"[GSC] repurpose-content generation failed: {_e}")
+        return {"success": False, "error": str(_e)}
+
+    log_activity("organic_intelligence_repurpose", url=page_url, summary=f"Repurposed content for {page_url}")
+    return {
+        "success": True, "page_url": page_url, "top_query": top_query,
+        "impressions": impressions, "clicks": clicks, "ctr": round(ctr, 4), "avg_position": round(avg_position, 1),
+        "assets": assets,
     }
 
 
