@@ -18331,10 +18331,20 @@ def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, u
         "startRow": 0,
         "dataState": "final",
     }
+    logger.info(f"[GSC-SYNC] searchanalytics().query kind={kind!r} siteUrl={site_url!r} body={json.dumps(body)}")
+
     all_rows = []
-    for _ in range(4):   # safety cap: 4 pages = 100k rows max per property per kind
-        resp = service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+    for page_num in range(4):   # safety cap: 4 pages = 100k rows max per property per kind
+        try:
+            resp = service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+        except Exception as _api_e:
+            # googleapiclient raises HttpError for non-2xx responses — surface the raw
+            # error body instead of letting it look like a silent "0 rows" result.
+            logger.error(f"[GSC-SYNC] API call FAILED kind={kind!r} siteUrl={site_url!r} page={page_num}: {_api_e}")
+            raise
         page = resp.get("rows", []) or []
+        logger.info(f"[GSC-SYNC] response kind={kind!r} page={page_num} rows_returned={len(page)} "
+                    f"responseAggregationType={resp.get('responseAggregationType')!r}")
         if not page:
             break
         all_rows.extend(page)
@@ -18342,6 +18352,7 @@ def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, u
             break
         body["startRow"] += body["rowLimit"]
 
+    logger.info(f"[GSC-SYNC] kind={kind!r} siteUrl={site_url!r} TOTAL raw rows from API: {len(all_rows)}")
     now = datetime.utcnow().isoformat()
     out = []
     for r in all_rows:
@@ -18536,7 +18547,16 @@ async def search_console_select_property(request: Request):
         conn.execute(text("UPDATE search_console_tokens SET selected_site_url=:su WHERE user_id=:uid"), {"su": site_url, "uid": uid})
         conn.execute(text("UPDATE search_console_properties SET is_active=FALSE WHERE user_id=:uid"), {"uid": uid})
         conn.execute(text("UPDATE search_console_properties SET is_active=TRUE WHERE user_id=:uid AND site_url=:su"), {"uid": uid, "su": site_url})
-    return {"success": True, "site_url": site_url}
+
+    # Fire-and-forget: kick off an initial sync immediately so a newly-selected
+    # property doesn't sit at 0 rows until the next daily cron run. Bug found in
+    # production — nothing ever called /search-console/sync before this fix; only
+    # the daily cron did, so a freshly connected property could show "0 days
+    # synced" for up to 24h with no indication that sync simply hadn't run yet.
+    logger.info(f"[GSC] Auto-triggering initial sync after property selection: uid={uid!r} site_url={site_url!r}")
+    asyncio.create_task(_sync_search_console_for_user(uid, site_url))
+
+    return {"success": True, "site_url": site_url, "sync_triggered": True}
 
 
 @app.post("/search-console/sync")
@@ -18586,6 +18606,68 @@ async def search_console_sync_all():
     ok_count = sum(1 for r in results if r.get("success"))
     logger.info(f"[GSC-SYNC-ALL] Processed {len(results)} properties, {ok_count} succeeded")
     return {"success": True, "properties_processed": len(results), "succeeded": ok_count, "results": results}
+
+
+@app.get("/search-console/debug")
+async def search_console_debug(request: Request):
+    """Diagnostic endpoint: token status/scope, a raw sites().list() call, and a
+    raw searchanalytics().query() test call (wide 480-day range, no dataState
+    filter, single dimension) — surfaces the ACTUAL Google API request/response
+    so a sync producing 0 rows can be told apart from a call that's silently
+    failing or malformed, instead of both looking identical from the outside."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT selected_site_url, scope, connected_at, revoked FROM search_console_tokens WHERE user_id=:uid"
+        ), {"uid": uid}).fetchone()
+    if not row:
+        return {"success": False, "error": "No Search Console token found for this user."}
+
+    site_url, scope, connected_at, revoked = row
+    result = {
+        "success": True,
+        "token": {"connected_at": connected_at, "revoked": bool(revoked), "scope": scope, "selected_site_url": site_url},
+    }
+    if revoked:
+        result["error"] = "Token is revoked."
+        return result
+
+    try:
+        service = await asyncio.to_thread(_build_gsc_service, uid)
+    except Exception as _e:
+        result["success"] = False
+        result["error"] = f"Could not build Search Console service: {_e}"
+        return result
+
+    # 1. sites().list() — confirms the token can reach the API and shows exactly
+    # which properties/permission levels it can see (independent of any sync logic).
+    try:
+        sites_resp = await asyncio.to_thread(lambda: service.sites().list().execute())
+        result["sites_list"] = sites_resp.get("siteEntry", [])
+    except Exception as _e:
+        result["sites_list_error"] = str(_e)
+
+    if not site_url:
+        result["note"] = "No property selected — cannot test searchanalytics().query()."
+        return result
+
+    # 2. A minimal, WIDE date range (480 days — GSC retains ~16 months), single
+    # dimension, no dataState filter — the simplest possible query that should
+    # succeed if there is ANY data at all for this property/token combination.
+    end = date.today() - timedelta(days=3)
+    start = end - timedelta(days=480)
+    body = {"startDate": start.isoformat(), "endDate": end.isoformat(), "dimensions": ["query"], "rowLimit": 5}
+    result["test_query"] = {"siteUrl": site_url, "body": body}
+    try:
+        resp = await asyncio.to_thread(lambda: service.searchanalytics().query(siteUrl=site_url, body=body).execute())
+        result["test_query_response"] = resp
+    except Exception as _e:
+        result["test_query_error"] = str(_e)
+
+    return result
 
 
 # ── Significance guard — mirrors _check_data_sufficiency's shape (Performance ──
