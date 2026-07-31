@@ -18580,6 +18580,333 @@ async def search_console_sync_all():
     return {"success": True, "properties_processed": len(results), "succeeded": ok_count, "results": results}
 
 
+# ── Significance guard — mirrors _check_data_sufficiency's shape (Performance ──
+# Intelligence / Optimizer), new domain-appropriate thresholds since GSC has no
+# "spend". Computed deterministically in Python, never left to GPT.
+_GSC_DATA_SUFFICIENCY_THRESHOLDS = {"min_days_synced": 7, "min_total_clicks": 50, "min_total_impressions": 500}
+
+
+def _check_gsc_data_sufficiency(days_of_data: int, total_clicks: int, total_impressions: int) -> dict:
+    t = _GSC_DATA_SUFFICIENCY_THRESHOLDS
+    insufficient = (days_of_data < t["min_days_synced"] or total_clicks < t["min_total_clicks"]
+                    or total_impressions < t["min_total_impressions"])
+    banner = None
+    if insufficient:
+        banner = (
+            f"⚠️ INSUFFICIENT DATA: Only {days_of_data} day(s) synced, {total_clicks} clicks, "
+            f"{total_impressions} impressions. Recommendations below are preliminary — Search Console needs "
+            f"at least {t['min_days_synced']} days of data and {t['min_total_clicks']}+ clicks for a reliable read."
+        )
+    return {"insufficient_data": insufficient, "banner": banner, "thresholds": t}
+
+
+def _gsc_clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# Real, widely-cited industry-average CTR-by-position benchmarks — used as a rough
+# anchor, not a fabricated-precision claim.
+_GSC_CTR_BENCHMARKS = {"1-3": 0.28, "4-6": 0.09, "7-10": 0.03, "11+": 0.01}
+
+
+def _gsc_position_bucket(avg_position: float) -> str:
+    if avg_position <= 3:
+        return "1-3"
+    if avg_position <= 6:
+        return "4-6"
+    if avg_position <= 10:
+        return "7-10"
+    return "11+"
+
+
+def _gsc_query_totals(user_id: str, site_url: str, start: date, end: date) -> tuple:
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT COALESCE(SUM(impressions),0), COALESCE(SUM(clicks),0) "
+            "FROM search_queries WHERE user_id=:uid AND site_url=:su AND query_date BETWEEN :s AND :e"
+        ), {"uid": user_id, "su": site_url, "s": start.isoformat(), "e": end.isoformat()}).fetchone()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def _gsc_weighted_avg_position(user_id: str, site_url: str, start: date = None, end: date = None) -> float:
+    """Impression-weighted average position — more accurate than a naive AVG()."""
+    clauses = "user_id=:uid AND site_url=:su"
+    params = {"uid": user_id, "su": site_url}
+    if start and end:
+        clauses += " AND query_date BETWEEN :s AND :e"
+        params["s"], params["e"] = start.isoformat(), end.isoformat()
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT COALESCE(SUM(position*impressions),0), COALESCE(SUM(impressions),0) FROM search_queries WHERE {clauses}"
+        ), params).fetchone()
+    weighted_sum, imp_sum = float(row[0] or 0), int(row[1] or 0)
+    return (weighted_sum / imp_sum) if imp_sum else 0.0
+
+
+def _gsc_get_selected_property(user_id: str):
+    """Returns (site_url, error_dict_or_None)."""
+    with engine.connect() as conn:
+        tok = conn.execute(text(
+            "SELECT selected_site_url, revoked FROM search_console_tokens WHERE user_id=:uid"
+        ), {"uid": user_id}).fetchone()
+    if not tok or tok[1]:
+        return None, {"success": False, "error": "Search Console not connected. Visit /search-console/connect."}
+    if not tok[0]:
+        return None, {"success": False, "error": "No property selected. Call /search-console/select-property first."}
+    return tok[0], None
+
+
+@app.get("/search-console/health-score")
+async def search_console_health_score(request: Request):
+    """Organic Health Score — 4 sub-scores computed deterministically in Python
+    from real synced data only (never fabricated/GPT-guessed precision), mirroring
+    the Performance Intelligence philosophy at the Optimizer module above."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    site_url, err = _gsc_get_selected_property(uid)
+    if err:
+        return err
+
+    with engine.connect() as conn:
+        days_row = conn.execute(text(
+            "SELECT COUNT(DISTINCT query_date) FROM search_queries WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+        totals_row = conn.execute(text(
+            "SELECT COALESCE(SUM(clicks),0), COALESCE(SUM(impressions),0) "
+            "FROM search_queries WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+    days_of_data = int(days_row[0] or 0)
+    total_clicks, total_impressions = int(totals_row[0] or 0), int(totals_row[1] or 0)
+    sufficiency = _check_gsc_data_sufficiency(days_of_data, total_clicks, total_impressions)
+
+    anchor = date.today() - timedelta(days=3)   # matches the sync's own reporting-lag buffer
+    recent_start, recent_end = anchor - timedelta(days=30), anchor
+    prior_start, prior_end = anchor - timedelta(days=60), anchor - timedelta(days=30)
+
+    sub_scores = {}
+
+    # 1. Click trend — last 30d vs prior 30d
+    if days_of_data >= 60:
+        _, r_clk = _gsc_query_totals(uid, site_url, recent_start, recent_end)
+        _, p_clk = _gsc_query_totals(uid, site_url, prior_start, prior_end)
+        pct_change = (r_clk - p_clk) / max(p_clk, 1)
+        sub_scores["click_trend"] = {
+            "score": round(50 + _gsc_clamp(pct_change * 100, -50, 50)),
+            "recent_clicks": r_clk, "prior_clicks": p_clk, "pct_change": round(pct_change, 3),
+        }
+    else:
+        sub_scores["click_trend"] = None
+
+    # 2. CTR vs position-bucketed benchmark
+    if total_impressions > 0:
+        actual_ctr = total_clicks / total_impressions
+        overall_pos = _gsc_weighted_avg_position(uid, site_url)
+        bucket = _gsc_position_bucket(overall_pos)
+        benchmark_ctr = _GSC_CTR_BENCHMARKS[bucket]
+        sub_scores["ctr_vs_benchmark"] = {
+            "score": round(_gsc_clamp((actual_ctr / benchmark_ctr) * 50, 0, 100)),
+            "actual_ctr": round(actual_ctr, 4), "benchmark_ctr": benchmark_ctr, "avg_position_bucket": bucket,
+        }
+    else:
+        sub_scores["ctr_vs_benchmark"] = None
+
+    # 3. Position trend — last 30d vs prior 30d, impression-weighted
+    if days_of_data >= 60:
+        recent_pos = _gsc_weighted_avg_position(uid, site_url, recent_start, recent_end)
+        prior_pos = _gsc_weighted_avg_position(uid, site_url, prior_start, prior_end)
+        if prior_pos > 0:
+            pct_improve = (prior_pos - recent_pos) / prior_pos   # positive = improved (closer to #1)
+            sub_scores["position_trend"] = {
+                "score": round(50 + _gsc_clamp(pct_improve * 200, -50, 50)),
+                "recent_avg_position": round(recent_pos, 1), "prior_avg_position": round(prior_pos, 1),
+            }
+        else:
+            sub_scores["position_trend"] = None
+    else:
+        sub_scores["position_trend"] = None
+
+    # 4. Content freshness — fraction of ever-clicked pages still earning clicks in the last 30d
+    with engine.connect() as conn:
+        ever_row = conn.execute(text(
+            "SELECT COUNT(DISTINCT page_url) FROM search_pages WHERE user_id=:uid AND site_url=:su AND clicks > 0"
+        ), {"uid": uid, "su": site_url}).fetchone()
+        recent_row = conn.execute(text(
+            "SELECT COUNT(DISTINCT page_url) FROM search_pages WHERE user_id=:uid AND site_url=:su "
+            "AND clicks > 0 AND query_date >= :s"
+        ), {"uid": uid, "su": site_url, "s": recent_start.isoformat()}).fetchone()
+    pages_ever, pages_recent = int(ever_row[0] or 0), int(recent_row[0] or 0)
+    if pages_ever > 0:
+        sub_scores["content_freshness"] = {
+            "score": round(_gsc_clamp((pages_recent / pages_ever) * 100, 0, 100)),
+            "pages_active_30d": pages_recent, "pages_total_ever": pages_ever,
+        }
+    else:
+        sub_scores["content_freshness"] = None
+
+    computable = [v["score"] for v in sub_scores.values() if v is not None]
+    overall = round(sum(computable) / len(computable)) if computable else None
+
+    return {
+        "success": True,
+        "insufficient_data": sufficiency["insufficient_data"],
+        "banner": sufficiency["banner"],
+        "overall_score": overall,
+        "partial": len(computable) < 4,
+        "sub_scores": sub_scores,
+        "site_url": site_url,
+    }
+
+
+# ── Opportunity detection — deterministic SQL, HIGH/MEDIUM/LOW ratings grounded ──
+# in real thresholds, never a fabricated numeric "Opportunity Score".
+_GSC_OPPORTUNITY_THRESHOLDS = {
+    "low_ctr_min_impressions": 200, "low_ctr_ceiling": 0.02,
+    "page_4_10_min_impressions": 100,
+    "declining_min_prior_clicks": 10, "declining_drop_ratio": 0.7,
+}
+
+
+def _gsc_rate_by_impressions(imp: int, high: int, medium: int) -> str:
+    if imp >= high:
+        return "HIGH"
+    if imp >= medium:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _detect_gsc_low_ctr_queries(user_id: str, site_url: str) -> list:
+    t = _GSC_OPPORTUNITY_THRESHOLDS
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT query_text, SUM(impressions) imp, SUM(clicks) clk,
+                   CAST(SUM(clicks) AS REAL)/NULLIF(SUM(impressions),0) ctr, AVG(position) pos
+            FROM search_queries WHERE user_id=:uid AND site_url=:su
+            GROUP BY query_text
+            HAVING SUM(impressions) >= :min_imp AND CAST(SUM(clicks) AS REAL)/NULLIF(SUM(impressions),0) < :ceiling
+            ORDER BY imp DESC LIMIT 25
+        """), {"uid": user_id, "su": site_url, "min_imp": t["low_ctr_min_impressions"], "ceiling": t["low_ctr_ceiling"]}).fetchall()
+    return [{
+        "query_text": q, "impressions": int(imp), "clicks": int(clk),
+        "ctr": round(float(ctr or 0), 4), "avg_position": round(float(pos or 0), 1),
+        "rating": _gsc_rate_by_impressions(imp, 1000, 500),
+    } for q, imp, clk, ctr, pos in rows]
+
+
+def _detect_gsc_position_4_10_pages(user_id: str, site_url: str) -> list:
+    t = _GSC_OPPORTUNITY_THRESHOLDS
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT page_url, AVG(position) pos, SUM(impressions) imp, SUM(clicks) clk
+            FROM search_pages WHERE user_id=:uid AND site_url=:su
+            GROUP BY page_url
+            HAVING AVG(position) BETWEEN 4 AND 10 AND SUM(impressions) >= :min_imp
+            ORDER BY imp DESC LIMIT 25
+        """), {"uid": user_id, "su": site_url, "min_imp": t["page_4_10_min_impressions"]}).fetchall()
+    return [{
+        "page_url": p, "avg_position": round(float(pos or 0), 1),
+        "impressions": int(imp), "clicks": int(clk),
+        "rating": _gsc_rate_by_impressions(imp, 500, 200),
+    } for p, pos, imp, clk in rows]
+
+
+def _detect_gsc_declining_queries(user_id: str, site_url: str) -> list:
+    t = _GSC_OPPORTUNITY_THRESHOLDS
+    anchor = date.today() - timedelta(days=3)
+    recent_start, recent_end = anchor - timedelta(days=30), anchor
+    prior_start, prior_end = anchor - timedelta(days=60), anchor - timedelta(days=30)
+
+    with engine.connect() as conn:
+        recent_rows = conn.execute(text(
+            "SELECT query_text, SUM(clicks) FROM search_queries WHERE user_id=:uid AND site_url=:su "
+            "AND query_date BETWEEN :s AND :e GROUP BY query_text"
+        ), {"uid": user_id, "su": site_url, "s": recent_start.isoformat(), "e": recent_end.isoformat()}).fetchall()
+        prior_rows = conn.execute(text(
+            "SELECT query_text, SUM(clicks) FROM search_queries WHERE user_id=:uid AND site_url=:su "
+            "AND query_date BETWEEN :s AND :e GROUP BY query_text"
+        ), {"uid": user_id, "su": site_url, "s": prior_start.isoformat(), "e": prior_end.isoformat()}).fetchall()
+
+    recent_map = {q: int(c or 0) for q, c in recent_rows}
+    out = []
+    for query_text, prior_clicks in ((q, int(c or 0)) for q, c in prior_rows):
+        if prior_clicks < t["declining_min_prior_clicks"]:
+            continue
+        recent_clicks = recent_map.get(query_text, 0)
+        if recent_clicks < prior_clicks * t["declining_drop_ratio"]:
+            out.append({
+                "query_text": query_text, "recent_clicks": recent_clicks, "prior_clicks": prior_clicks,
+                "pct_change": round((recent_clicks - prior_clicks) / prior_clicks, 3),
+                "rating": "HIGH" if prior_clicks >= 50 else ("MEDIUM" if prior_clicks >= 20 else "LOW"),
+            })
+    out.sort(key=lambda x: x["prior_clicks"], reverse=True)
+    return out[:25]
+
+
+def _cross_reference_visibility_intel(opportunities: list, url: str, industry: str, city: str) -> None:
+    """Best-effort: tags opportunities whose query_text substring-matches a
+    missing_keyword/content_gap from Visibility Intelligence's memory for this
+    business, if any exists. Never a hard dependency — wrapped in try/except."""
+    try:
+        business_key = derive_business_key(url, industry, city)
+        mem = get_memory(business_key)
+        visibility_data = (mem.get("visibility") or {}).get("visibility_data") or {}
+        seo = visibility_data.get("seo") or {}
+        candidates = list(seo.get("missing_keywords") or []) + list(seo.get("content_gaps") or [])
+        if not candidates:
+            return
+        for opp in opportunities:
+            qt = (opp.get("query_text") or "").lower()
+            if not qt:
+                continue
+            for cand in candidates:
+                cand_lower = str(cand).lower()
+                if cand_lower and (cand_lower in qt or qt in cand_lower):
+                    opp["visibility_intel_match"] = cand
+                    break
+    except Exception as _e:
+        logger.warning(f"[GSC] Visibility Intelligence cross-reference skipped: {_e}")
+
+
+@app.get("/search-console/opportunities")
+async def search_console_opportunities(request: Request, url: str = "", industry: str = "", city: str = ""):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    site_url, err = _gsc_get_selected_property(uid)
+    if err:
+        return err
+
+    with engine.connect() as conn:
+        days_row = conn.execute(text(
+            "SELECT COUNT(DISTINCT query_date) FROM search_queries WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+        totals_row = conn.execute(text(
+            "SELECT COALESCE(SUM(clicks),0), COALESCE(SUM(impressions),0) "
+            "FROM search_queries WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+    sufficiency = _check_gsc_data_sufficiency(int(days_row[0] or 0), int(totals_row[0] or 0), int(totals_row[1] or 0))
+
+    low_ctr_queries = _detect_gsc_low_ctr_queries(uid, site_url)
+    position_4_10_pages = _detect_gsc_position_4_10_pages(uid, site_url)
+    declining_queries = _detect_gsc_declining_queries(uid, site_url)
+
+    if url:
+        _cross_reference_visibility_intel(low_ctr_queries, url, industry, city)
+        _cross_reference_visibility_intel(declining_queries, url, industry, city)
+
+    return {
+        "success": True,
+        "insufficient_data": sufficiency["insufficient_data"],
+        "banner": sufficiency["banner"],
+        "site_url": site_url,
+        "opportunities": {
+            "low_ctr_queries": low_ctr_queries,
+            "position_4_10_pages": position_4_10_pages,
+            "declining_queries": declining_queries,
+        },
+    }
+
+
 # ── Unified connected-accounts status ─────────────────────────────────────────
 @app.get("/connected-accounts")
 async def connected_accounts(request: Request):
