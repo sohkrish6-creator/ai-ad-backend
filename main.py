@@ -19068,6 +19068,96 @@ async def search_console_repurpose_content(request: Request):
     }
 
 
+# ── Lightweight query/page list endpoints — power the frontend's Top/Growing/ ──
+# Declining/Opportunity query tabs and Top Pages table without shipping all 90
+# days of raw rows to the browser.
+def _list_gsc_top_queries(user_id: str, site_url: str, limit: int = 25) -> list:
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT query_text, SUM(clicks) clk, SUM(impressions) imp,
+                   CAST(SUM(clicks) AS REAL)/NULLIF(SUM(impressions),0) ctr, AVG(position) pos
+            FROM search_queries WHERE user_id=:uid AND site_url=:su
+            GROUP BY query_text ORDER BY clk DESC LIMIT :lim
+        """), {"uid": user_id, "su": site_url, "lim": limit}).fetchall()
+    return [{
+        "query_text": q, "clicks": int(clk), "impressions": int(imp),
+        "ctr": round(float(ctr or 0), 4), "avg_position": round(float(pos or 0), 1),
+    } for q, clk, imp, ctr, pos in rows]
+
+
+def _detect_gsc_growing_queries(user_id: str, site_url: str) -> list:
+    anchor = date.today() - timedelta(days=3)
+    recent_start, recent_end = anchor - timedelta(days=30), anchor
+    prior_start, prior_end = anchor - timedelta(days=60), anchor - timedelta(days=30)
+    with engine.connect() as conn:
+        recent_rows = conn.execute(text(
+            "SELECT query_text, SUM(clicks) FROM search_queries WHERE user_id=:uid AND site_url=:su "
+            "AND query_date BETWEEN :s AND :e GROUP BY query_text"
+        ), {"uid": user_id, "su": site_url, "s": recent_start.isoformat(), "e": recent_end.isoformat()}).fetchall()
+        prior_rows = conn.execute(text(
+            "SELECT query_text, SUM(clicks) FROM search_queries WHERE user_id=:uid AND site_url=:su "
+            "AND query_date BETWEEN :s AND :e GROUP BY query_text"
+        ), {"uid": user_id, "su": site_url, "s": prior_start.isoformat(), "e": prior_end.isoformat()}).fetchall()
+    prior_map = {q: int(c or 0) for q, c in prior_rows}
+    out = []
+    for query_text, recent_clicks in ((q, int(c or 0)) for q, c in recent_rows):
+        if recent_clicks < 5:   # floor to exclude noise
+            continue
+        prior_clicks = prior_map.get(query_text, 0)
+        pct_change = 1.0 if prior_clicks == 0 else (recent_clicks - prior_clicks) / prior_clicks
+        if pct_change >= 0.3:   # 30%+ growth
+            out.append({"query_text": query_text, "recent_clicks": recent_clicks, "prior_clicks": prior_clicks,
+                        "pct_change": round(pct_change, 3)})
+    out.sort(key=lambda x: x["pct_change"], reverse=True)
+    return out[:25]
+
+
+@app.get("/search-console/queries")
+async def search_console_queries(request: Request, tab: str = "top", limit: int = 25):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    site_url, err = _gsc_get_selected_property(uid)
+    if err:
+        return err
+
+    limit = max(1, min(limit, 100))
+    if tab == "growing":
+        rows = _detect_gsc_growing_queries(uid, site_url)[:limit]
+    elif tab == "declining":
+        rows = _detect_gsc_declining_queries(uid, site_url)[:limit]
+    elif tab == "opportunity":
+        rows = _detect_gsc_low_ctr_queries(uid, site_url)[:limit]
+    else:
+        rows = _list_gsc_top_queries(uid, site_url, limit)
+
+    return {"success": True, "tab": tab, "site_url": site_url, "queries": rows}
+
+
+@app.get("/search-console/pages")
+async def search_console_pages(request: Request, limit: int = 25):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        return {"success": False, "error": "Not authenticated"}
+    site_url, err = _gsc_get_selected_property(uid)
+    if err:
+        return err
+
+    limit = max(1, min(limit, 100))
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT page_url, SUM(clicks) clk, SUM(impressions) imp,
+                   CAST(SUM(clicks) AS REAL)/NULLIF(SUM(impressions),0) ctr, AVG(position) pos
+            FROM search_pages WHERE user_id=:uid AND site_url=:su
+            GROUP BY page_url ORDER BY clk DESC LIMIT :lim
+        """), {"uid": uid, "su": site_url, "lim": limit}).fetchall()
+    pages = [{
+        "page_url": p, "clicks": int(clk), "impressions": int(imp),
+        "ctr": round(float(ctr or 0), 4), "avg_position": round(float(pos or 0), 1),
+    } for p, clk, imp, ctr, pos in rows]
+    return {"success": True, "site_url": site_url, "pages": pages}
+
+
 # ── Unified connected-accounts status ─────────────────────────────────────────
 @app.get("/connected-accounts")
 async def connected_accounts(request: Request):
@@ -19121,9 +19211,26 @@ async def connected_accounts(request: Request):
         m_connected = False
         m_info = {}
 
+    # Search Console — no global/legacy fallback (unlike Google Ads/Meta above,
+    # there's no pre-existing global connection to preserve for this integration).
+    s_connected = False
+    s_info = {}
+    if uid:
+        with engine.connect() as conn:
+            s_row = conn.execute(text(
+                "SELECT selected_site_url, connected_at, revoked FROM search_console_tokens WHERE user_id=:uid"
+            ), {"uid": uid}).fetchone()
+        s_connected = bool(s_row and not s_row[2])
+        s_info = {
+            "site_url": s_row[0],
+            "connected_at": s_row[1],
+            "pending_account_selection": s_connected and not s_row[0],
+        } if s_connected else {}
+
     return {
         "google_ads": {"connected": g_connected, **g_info},
         "meta_ads":   {"connected": m_connected, **m_info},
+        "search_console": {"connected": s_connected, **s_info},
     }
 
 
