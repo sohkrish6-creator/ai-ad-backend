@@ -33,6 +33,7 @@ import hmac
 import hashlib
 import base64
 import uuid
+from zoneinfo import ZoneInfo
 
 try:
     import jwt as _pyjwt
@@ -21225,7 +21226,7 @@ CREATE TABLE IF NOT EXISTS voice_agents (
 CREATE TABLE IF NOT EXISTS voice_calls (
     id                 BIGSERIAL PRIMARY KEY,
     user_id            TEXT NOT NULL,
-    prospect_id        BIGINT NOT NULL,
+    prospect_id        BIGINT,
     script_id          BIGINT,
     agent_id           BIGINT,
     vapi_call_id       TEXT UNIQUE,
@@ -21547,13 +21548,13 @@ def _get_or_create_voice_settings(user_id: str) -> dict:
         row = conn.execute(text(
             "SELECT calling_window_start, calling_window_end, calling_days_json, timezone, compliance_mode, "
             "cooldown_days, max_call_attempts_same_day, blended_rate_per_minute_micros, "
-            "avg_estimated_call_duration_seconds, default_voice_agent_id, updated_at "
+            "avg_estimated_call_duration_seconds, default_voice_agent_id, updated_at, call_mode "
             "FROM voice_settings WHERE user_id=:uid"
         ), {"uid": user_id}).fetchone()
     if row:
         cols = ["calling_window_start", "calling_window_end", "calling_days_json", "timezone", "compliance_mode",
                 "cooldown_days", "max_call_attempts_same_day", "blended_rate_per_minute_micros",
-                "avg_estimated_call_duration_seconds", "default_voice_agent_id", "updated_at"]
+                "avg_estimated_call_duration_seconds", "default_voice_agent_id", "updated_at", "call_mode"]
         settings = dict(zip(cols, row))
         try:
             settings["calling_days"] = json.loads(settings.pop("calling_days_json") or "[]")
@@ -22266,7 +22267,7 @@ async def voice_outreach_delete_dnc(dnc_id: int, request: Request):
 _VOICE_SETTINGS_PATCHABLE = (
     "calling_window_start", "calling_window_end", "timezone", "compliance_mode",
     "cooldown_days", "max_call_attempts_same_day", "blended_rate_per_minute_micros",
-    "avg_estimated_call_duration_seconds", "default_voice_agent_id",
+    "avg_estimated_call_duration_seconds", "default_voice_agent_id", "call_mode",
 )
 
 
@@ -22281,6 +22282,11 @@ class VoiceSettingsPatchRequest(BaseModel):
     blended_rate_per_minute_micros:      int | None = None
     avg_estimated_call_duration_seconds: int | None = None
     default_voice_agent_id:              int | None = None
+    call_mode:                           str | None = None
+
+
+def _voice_is_vapi_configured() -> bool:
+    return bool(VAPI_API_KEY and VAPI_PHONE_NUMBER_ID)
 
 
 @app.get("/voice-outreach/settings")
@@ -22288,7 +22294,9 @@ async def voice_outreach_get_settings(request: Request):
     uid = getattr(request.state, "user_id", "")
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return {"success": True, "settings": _get_or_create_voice_settings(uid)}
+    settings = _get_or_create_voice_settings(uid)
+    settings["vapi_configured"] = _voice_is_vapi_configured()
+    return {"success": True, "settings": settings}
 
 
 @app.patch("/voice-outreach/settings")
@@ -22298,17 +22306,27 @@ async def voice_outreach_patch_settings(payload: VoiceSettingsPatchRequest, requ
         raise HTTPException(status_code=401, detail="Not authenticated")
     _get_or_create_voice_settings(uid)  # ensure a row exists first
 
+    if payload.call_mode is not None:
+        if payload.call_mode not in ("dry_run", "live"):
+            raise HTTPException(status_code=400, detail="call_mode must be 'dry_run' or 'live'")
+        if payload.call_mode == "live" and not _voice_is_vapi_configured():
+            raise HTTPException(status_code=400, detail="Cannot enable live calling — Vapi credentials are not configured on this server yet")
+
     updates = {k: v for k, v in payload.model_dump().items() if v is not None and k in _VOICE_SETTINGS_PATCHABLE}
     if payload.calling_days is not None:
         updates["calling_days_json"] = json.dumps(payload.calling_days)
     if not updates:
-        return {"success": True, "settings": _get_or_create_voice_settings(uid)}
+        settings = _get_or_create_voice_settings(uid)
+        settings["vapi_configured"] = _voice_is_vapi_configured()
+        return {"success": True, "settings": settings}
 
     updates["updated_at"] = datetime.utcnow().isoformat()
     sets = ", ".join(f"{k}=:{k}" for k in updates)
     with engine.begin() as conn:
         conn.execute(text(f"UPDATE voice_settings SET {sets} WHERE user_id=:uid"), {**updates, "uid": uid})
-    return {"success": True, "settings": _get_or_create_voice_settings(uid)}
+    settings = _get_or_create_voice_settings(uid)
+    settings["vapi_configured"] = _voice_is_vapi_configured()
+    return {"success": True, "settings": settings}
 
 
 @app.get("/voice-outreach/agents")
@@ -22327,3 +22345,588 @@ async def voice_outreach_list_agents(request: Request):
         )).fetchall()
     cols = ["id", "name", "personality", "language", "vapi_assistant_id", "is_active", "is_default"]
     return {"success": True, "agents": [dict(zip(cols, r)) for r in rows]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI VOICE OUTREACH — PHASE 2 (calling pipeline)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  No BullMQ/Redis exists anywhere in this codebase (confirmed again this
+#  session). "Concurrency-limited queue with dial spacing" is translated onto
+#  the same asyncio.create_task() + DB-backed-row pattern every other
+#  background job here uses (gads_import_jobs, voice_batches) — a module-level
+#  asyncio.Semaphore bounds true concurrency across all in-flight call tasks
+#  in this single FastAPI process, and a shared last-dial-timestamp box under
+#  a lock enforces global dial spacing. voice_calls rows ARE the job queue;
+#  there's no separate queue table.
+#
+#  No real Vapi credentials exist yet. VOICE_CALL_MODE defaults to dry_run:
+#  the full pipeline runs (gates, status transitions, a synthetic transcript,
+#  a REAL signed HTTP POST to our own webhook, full downstream analysis/CRM/
+#  follow-ups) with zero external calls and zero cost. Flipping to live is a
+#  config change only — the dispatch branch in _process_voice_call is the
+#  only place mode is checked.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VAPI_API_KEY                    = os.getenv("VAPI_API_KEY", "")
+VAPI_PHONE_NUMBER_ID             = os.getenv("VAPI_PHONE_NUMBER_ID", "")
+VAPI_WEBHOOK_SECRET              = os.getenv("VAPI_WEBHOOK_SECRET", "")
+VAPI_WEBHOOK_SIGNATURE_HEADER    = os.getenv("VAPI_WEBHOOK_SIGNATURE_HEADER", "x-vapi-signature")
+VOICE_CALL_MODE_DEFAULT          = os.getenv("VOICE_CALL_MODE", "dry_run")
+VAPI_MAX_CONCURRENT_CALLS        = int(os.getenv("VAPI_MAX_CONCURRENT_CALLS", "2"))
+DIAL_INTERVAL_MS                 = int(os.getenv("DIAL_INTERVAL_MS", "3000"))
+DRY_RUN_CALL_SECONDS             = int(os.getenv("DRY_RUN_CALL_SECONDS", "10"))
+# Loopback, not the public URL — reaches this same running process locally in
+# both dev and on Render (whose proxy forwards to this port), so the dry-run
+# webhook POST is a real HTTP round trip without depending on public DNS.
+_VOICE_SELF_BASE_URL             = f"http://127.0.0.1:{os.getenv('PORT', '8000')}"
+
+_VOICE_CALL_SEMAPHORE = asyncio.Semaphore(VAPI_MAX_CONCURRENT_CALLS)
+_VOICE_DIAL_LOCK = asyncio.Lock()
+_voice_last_dial_at = {"ts": 0.0}
+
+# Additive-only migration, same precedent as gads_oauth_tokens (main.py, "Add
+# per-user columns... if this is an existing deployment") — Phase 1's tables
+# already exist in Render's Postgres, so new columns must be ALTERed in, not
+# just added to the CREATE TABLE string.
+for _vtbl, _vcol, _vtype in [
+    ("voice_calls", "is_dry_run", "BOOLEAN DEFAULT FALSE"),
+    ("voice_transcripts", "is_synthetic", "BOOLEAN DEFAULT FALSE"),
+    ("voice_settings", "call_mode", "TEXT DEFAULT 'dry_run'"),
+]:
+    try:
+        with engine.begin() as _vmc:
+            _vmc.execute(text(f"ALTER TABLE {_vtbl} ADD COLUMN {_vcol} {_vtype}"))
+    except Exception:
+        pass  # column already exists
+
+# voice_calls.prospect_id must be nullable for test calls (no real prospect
+# involved) — Postgres-only syntax (SQLite has no ALTER COLUMN, but fresh
+# sqlite creates already get a nullable column from the DDL string above, so
+# this is a no-op there rather than an error worth logging).
+try:
+    with engine.begin() as _vpc:
+        _vpc.execute(text("ALTER TABLE voice_calls ALTER COLUMN prospect_id DROP NOT NULL"))
+except Exception:
+    pass
+
+
+def _voice_effective_call_mode(settings: dict) -> str:
+    return settings.get("call_mode") or VOICE_CALL_MODE_DEFAULT
+
+
+def _voice_in_calling_window(settings: dict) -> tuple:
+    """Real IST (or per-tenant timezone) check against calling_window_start/
+    end + calling_days — re-run at execution time, not just at enqueue time,
+    since a job that sat in the queue near the window edge could otherwise
+    dial after hours."""
+    tz = ZoneInfo(settings.get("timezone") or "Asia/Kolkata")
+    now_local = datetime.now(tz)
+    day_key = now_local.strftime("%a").lower()
+    if day_key not in (settings.get("calling_days") or []):
+        return False, f"outside_calling_days:{day_key}"
+    try:
+        start_t = datetime.strptime(settings.get("calling_window_start") or "10:00", "%H:%M").time()
+        end_t = datetime.strptime(settings.get("calling_window_end") or "19:00", "%H:%M").time()
+    except ValueError:
+        start_t, end_t = datetime.strptime("10:00", "%H:%M").time(), datetime.strptime("19:00", "%H:%M").time()
+    now_t = now_local.time()
+    if not (start_t <= now_t <= end_t):
+        return False, f"outside_calling_window:{now_t.strftime('%H:%M')}"
+    return True, ""
+
+
+def _voice_check_call_gates(user_id: str, phone_e164, last_contacted_at, settings: dict) -> dict:
+    """Combines Phase 1's _voice_check_gates (phone/DNC/cooldown) with the
+    calling-window check — the single gate function the dispatcher and
+    confirm-and-call both call, so a job re-checked at execution time can
+    never dial outside the window even if it was enqueued inside it."""
+    result = _voice_check_gates(user_id, phone_e164, last_contacted_at, settings)
+    in_window, window_reason = _voice_in_calling_window(settings)
+    if not in_window:
+        result["blocked"] = True
+        result["reasons"].append(window_reason)
+    return result
+
+
+def _voice_calls_update(call_id: int, **fields):
+    sets = ", ".join(f"{k}=:{k}" for k in fields)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE voice_calls SET {sets} WHERE id=:call_id"), {**fields, "call_id": call_id})
+
+
+def _voice_build_assistant_overrides(prospect: dict, script: dict, disclosure_line: str) -> dict:
+    """Vapi's real per-call personalization mechanism is assistantOverrides.
+    variableValues against {{variable}} placeholders in the ONE persistent
+    per-personality base assistant's prompt — never a new assistant per call."""
+    return {
+        "variableValues": {
+            "business_name":  prospect.get("business_name", ""),
+            "disclosure_line": disclosure_line,
+            "opening":        script.get("opening", ""),
+            "rapport":        script.get("rapport", ""),
+            "pain_point":     script.get("pain_point", ""),
+            "value_prop":     script.get("value_prop", ""),
+            "social_proof":   script.get("social_proof", ""),
+            "meeting_close":  script.get("meeting_close", ""),
+            "follow_up":      script.get("follow_up", ""),
+        }
+    }
+
+
+async def _vapi_create_call(vapi_assistant_id: str, phone_e164: str, overrides: dict) -> dict:
+    """Real Vapi outbound-call API (verified against current Vapi docs):
+    POST https://api.vapi.ai/call, Bearer auth, {assistantId, assistantOverrides,
+    phoneNumberId, customer:{number}}. Untestable without real credentials —
+    correctness here matters because the design goal is that flipping
+    VOICE_CALL_MODE to 'live' is a config change, not a code change."""
+    async with httpx.AsyncClient(timeout=20) as client_:
+        resp = await client_.post(
+            "https://api.vapi.ai/call",
+            headers={"Authorization": f"Bearer {VAPI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "assistantId": vapi_assistant_id,
+                "assistantOverrides": overrides,
+                "phoneNumberId": VAPI_PHONE_NUMBER_ID,
+                "customer": {"number": phone_e164},
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _sign_vapi_webhook(payload_bytes: bytes) -> str:
+    return hmac.new(VAPI_WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256).hexdigest()
+
+
+def _verify_vapi_webhook_signature(payload_bytes: bytes, signature: str) -> bool:
+    if not VAPI_WEBHOOK_SECRET or not signature:
+        return False
+    return hmac.compare_digest(signature, _sign_vapi_webhook(payload_bytes))
+
+
+# Canned synthetic-prospect reactions for dry-run calls — sampled so a batch
+# of test calls exercises every downstream classification path (including a
+# dedicated opt_out line so the auto-DNC-insert path in Phase 3 is genuinely
+# testable, not just theoretically reachable).
+_VOICE_SYNTHETIC_REACTIONS = {
+    "interested": {
+        "ended_reason": "customer-ended-call",
+        "lines": [
+            "Oh interesting, tell me more about that.",
+            "Okay that actually sounds useful for us.",
+            "Can you send me more details or set up a time to talk properly?",
+        ],
+    },
+    "callback": {
+        "ended_reason": "customer-ended-call",
+        "lines": [
+            "I'm a bit busy right now, can you call back later?",
+            "Yeah give me a call tomorrow, this isn't a good time today.",
+        ],
+    },
+    "not_interested": {
+        "ended_reason": "customer-ended-call",
+        "lines": [
+            "No thank you, we're not looking for this right now.",
+            "Not interested, but thanks for calling.",
+        ],
+    },
+    "opt_out": {
+        "ended_reason": "customer-ended-call",
+        "lines": [
+            "Please stop calling this number and take us off your list.",
+        ],
+    },
+    "voicemail": {
+        "ended_reason": "voicemail",
+        "lines": [],
+    },
+}
+
+
+async def _simulate_dry_run_call(call_id: int):
+    """Advances status on a compressed timer, assembles a synthetic
+    transcript from the prospect's real current script, then performs a REAL
+    signed HTTP POST to our own webhook endpoint — a genuine round trip
+    through signature verification + idempotency, not a direct function
+    call, per the spec's explicit dry-run requirement. The posted payload
+    contains ONLY fields a real Vapi end-of-call-report would contain (no
+    private _is_dry_run marker) — the webhook processor determines dry-run
+    status by looking up voice_calls.is_dry_run on the matched row, exactly
+    the same lookup path live mode will use."""
+    with engine.connect() as conn:
+        call_row = conn.execute(text(
+            "SELECT user_id, prospect_id, script_id FROM voice_calls WHERE id=:id"
+        ), {"id": call_id}).fetchone()
+    if not call_row:
+        return
+    user_id, prospect_id, script_id = call_row
+
+    business_name = "your business"
+    if prospect_id:
+        with engine.connect() as conn:
+            prow = conn.execute(text("SELECT business_name FROM voice_prospects WHERE id=:id"), {"id": prospect_id}).fetchone()
+        if prow:
+            business_name = prow[0]
+
+    script = {}
+    if script_id:
+        with engine.connect() as conn:
+            srow = conn.execute(text(
+                "SELECT opening, rapport, pain_point, value_prop, social_proof, meeting_close, disclosure_line "
+                "FROM voice_scripts WHERE id=:id"
+            ), {"id": script_id}).fetchone()
+        if srow:
+            script = dict(zip(["opening", "rapport", "pain_point", "value_prop", "social_proof", "meeting_close", "disclosure_line"], srow))
+    disclosure_line = script.get("disclosure_line") or _voice_disclosure_line(business_name)
+
+    step = max(DRY_RUN_CALL_SECONDS * 0.2, 0.5)
+    await asyncio.sleep(step)
+    _voice_calls_update(call_id, status="dialing")
+    await asyncio.sleep(step)
+    _voice_calls_update(call_id, status="connected")
+    await asyncio.sleep(step)
+    _voice_calls_update(call_id, status="talking")
+
+    reaction_key = random.choice(list(_VOICE_SYNTHETIC_REACTIONS.keys()))
+    reaction = _VOICE_SYNTHETIC_REACTIONS[reaction_key]
+
+    agent_lines = [l for l in [disclosure_line, script.get("opening", ""), script.get("pain_point", ""), script.get("value_prop", "")] if l]
+    turns = []
+    for i, line in enumerate(agent_lines):
+        turns.append({"turn": len(turns), "role": "agent", "text": line})
+        if i < len(reaction["lines"]):
+            turns.append({"turn": len(turns), "role": "customer", "text": reaction["lines"][i]})
+    for extra in reaction["lines"][len(agent_lines):]:
+        turns.append({"turn": len(turns), "role": "customer", "text": extra})
+
+    await asyncio.sleep(step)
+
+    duration_seconds = max(15, len(turns) * 8)
+    ended_at = datetime.utcnow().isoformat()
+    vapi_call_id = f"dryrun_{uuid.uuid4().hex}"
+    transcript_text = "\n".join(f"{t['role'].upper()}: {t['text']}" for t in turns)
+
+    _voice_calls_update(
+        call_id, status="ended", ended_at=ended_at, duration_seconds=duration_seconds,
+        outcome=reaction_key, vapi_call_id=vapi_call_id,
+    )
+
+    payload = {
+        "message": {
+            "type": "end-of-call-report",
+            "call": {"id": vapi_call_id, "status": "ended"},
+            "transcript": transcript_text,
+            "artifact": {"messages": turns},
+            "endedReason": reaction["ended_reason"],
+            "durationSeconds": duration_seconds,
+            "cost": 0,
+            "recordingUrl": None,
+            "startedAt": ended_at,
+            "endedAt": ended_at,
+        },
+    }
+    body = json.dumps(payload).encode()
+    signature = _sign_vapi_webhook(body)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client_:
+            await client_.post(
+                f"{_VOICE_SELF_BASE_URL}/voice-outreach/call-webhook",
+                content=body,
+                headers={"Content-Type": "application/json", VAPI_WEBHOOK_SIGNATURE_HEADER: signature},
+            )
+    except Exception as _we:
+        logger.error(f"[VOICE-DRYRUN] self-webhook POST failed for call {call_id}: {_we}")
+
+
+async def _live_dispatch_call(call_id: int, phone_e164: str):
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT vc.script_id, vc.agent_id, vp.business_name "
+            "FROM voice_calls vc LEFT JOIN voice_prospects vp ON vp.id = vc.prospect_id WHERE vc.id=:id"
+        ), {"id": call_id}).fetchone()
+    if not row:
+        raise RuntimeError("call row missing")
+    script_id, agent_id, business_name = row
+
+    script = {}
+    if script_id:
+        with engine.connect() as conn:
+            srow = conn.execute(text(
+                "SELECT opening, rapport, pain_point, value_prop, social_proof, meeting_close, follow_up, disclosure_line "
+                "FROM voice_scripts WHERE id=:id"
+            ), {"id": script_id}).fetchone()
+        if srow:
+            script = dict(zip(["opening", "rapport", "pain_point", "value_prop", "social_proof", "meeting_close", "follow_up", "disclosure_line"], srow))
+    disclosure_line = script.get("disclosure_line") or _voice_disclosure_line(business_name or "your business")
+
+    vapi_assistant_id = None
+    if agent_id:
+        with engine.connect() as conn:
+            arow = conn.execute(text("SELECT vapi_assistant_id FROM voice_agents WHERE id=:id"), {"id": agent_id}).fetchone()
+        vapi_assistant_id = arow[0] if arow else None
+    if not vapi_assistant_id:
+        with engine.connect() as conn:
+            arow = conn.execute(text(
+                "SELECT vapi_assistant_id FROM voice_agents WHERE is_default=TRUE AND user_id IS NULL LIMIT 1"
+            )).fetchone()
+        vapi_assistant_id = arow[0] if arow else None
+    if not vapi_assistant_id:
+        raise RuntimeError("no vapi_assistant_id configured for the selected voice agent")
+
+    overrides = _voice_build_assistant_overrides({"business_name": business_name or ""}, script, disclosure_line)
+    result = await _vapi_create_call(vapi_assistant_id, phone_e164, overrides)
+    vapi_call_id = result.get("id") or result.get("callId") or ""
+    _voice_calls_update(call_id, status="dialing", vapi_call_id=vapi_call_id, dialed_number=phone_e164)
+    # Status advances only via the real webhook from here — this task's job
+    # is done once dispatch succeeds. See the plan's note on live-mode
+    # concurrency: the semaphore is only held for the dispatch call itself
+    # in live mode (Vapi's own account limits bound true phone-line
+    # concurrency once a call is handed off), not the full call duration.
+
+
+async def _delayed_requeue(call_id: int, delay_seconds: float):
+    await asyncio.sleep(delay_seconds)
+    asyncio.create_task(_process_voice_call(call_id))
+
+
+async def _process_voice_call(call_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT user_id, prospect_id, status, retry_count, is_test, dialed_number FROM voice_calls WHERE id=:id"
+        ), {"id": call_id}).fetchone()
+    if not row:
+        return
+    user_id, prospect_id, status, retry_count, is_test, dialed_number = row
+    if status != "queued":
+        return  # already processed/processing — idempotent guard against duplicate dispatch
+
+    settings = _get_or_create_voice_settings(user_id)
+
+    async with _VOICE_CALL_SEMAPHORE:
+        async with _VOICE_DIAL_LOCK:
+            elapsed_ms = (time.time() - _voice_last_dial_at["ts"]) * 1000
+            if elapsed_ms < DIAL_INTERVAL_MS:
+                await asyncio.sleep((DIAL_INTERVAL_MS - elapsed_ms) / 1000)
+            _voice_last_dial_at["ts"] = time.time()
+
+        if is_test:
+            phone_e164 = dialed_number
+        else:
+            with engine.connect() as conn:
+                prow = conn.execute(text(
+                    "SELECT phone_e164, last_contacted_at, approval_status FROM voice_prospects WHERE id=:id AND user_id=:uid"
+                ), {"id": prospect_id, "uid": user_id}).fetchone()
+            if not prow or prow[2] != "approved":
+                _voice_calls_update(call_id, status="failed", error="prospect no longer approved", ended_at=datetime.utcnow().isoformat())
+                return
+            phone_e164, last_contacted_at, _ = prow
+            gate = _voice_check_call_gates(user_id, phone_e164, last_contacted_at, settings)
+            if gate["blocked"]:
+                _voice_calls_update(call_id, status="failed", error=f"blocked: {', '.join(gate['reasons'])}", ended_at=datetime.utcnow().isoformat())
+                return
+
+        mode = _voice_effective_call_mode(settings)
+        _voice_calls_update(call_id, is_dry_run=(mode == "dry_run"))
+
+        try:
+            if mode == "dry_run":
+                await _simulate_dry_run_call(call_id)
+            else:
+                await _live_dispatch_call(call_id, phone_e164)
+        except Exception as _pe:
+            if retry_count < 2:
+                delay = 30.0 * (retry_count + 1)
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "UPDATE voice_calls SET status='queued', retry_count=retry_count+1, error=:err WHERE id=:id"
+                    ), {"err": str(_pe), "id": call_id})
+                asyncio.create_task(_delayed_requeue(call_id, delay))
+            else:
+                _voice_calls_update(call_id, status="failed", error=str(_pe), ended_at=datetime.utcnow().isoformat())
+
+
+def _start_voice_call_job(call_id: int):
+    asyncio.create_task(_process_voice_call(call_id))
+
+
+class VoiceConfirmAndCallRequest(BaseModel):
+    batch_id: str
+    approved_prospect_ids: list
+
+
+@app.post("/voice-outreach/confirm-and-call")
+async def voice_outreach_confirm_and_call(payload: VoiceConfirmAndCallRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    settings = _get_or_create_voice_settings(uid)
+    now = datetime.utcnow().isoformat()
+    results = []
+    for pid in payload.approved_prospect_ids:
+        with engine.connect() as conn:
+            prow = conn.execute(text(
+                "SELECT approval_status, phone_e164, last_contacted_at, script_id, batch_id "
+                "FROM voice_prospects WHERE id=:id AND user_id=:uid"
+            ), {"id": pid, "uid": uid}).fetchone()
+        if not prow:
+            results.append({"prospect_id": pid, "enqueued": False, "reason": "not_found"})
+            continue
+        approval_status, phone_e164, last_contacted_at, script_id, batch_id = prow
+        if batch_id != payload.batch_id:
+            results.append({"prospect_id": pid, "enqueued": False, "reason": "batch_mismatch"})
+            continue
+        if approval_status != "approved":
+            results.append({"prospect_id": pid, "enqueued": False, "reason": "not_approved"})
+            continue
+        gate = _voice_check_call_gates(uid, phone_e164, last_contacted_at, settings)
+        if gate["blocked"]:
+            results.append({"prospect_id": pid, "enqueued": False, "reason": ", ".join(gate["reasons"])})
+            continue
+        with engine.begin() as conn:
+            call_id = conn.execute(text(
+                "INSERT INTO voice_calls (user_id, prospect_id, script_id, agent_id, dialed_number, status, created_at) "
+                "VALUES (:uid, :pid, :sid, :aid, :phone, 'queued', :ts) RETURNING id"
+            ), {
+                "uid": uid, "pid": pid, "sid": script_id, "aid": settings.get("default_voice_agent_id"),
+                "phone": phone_e164, "ts": now,
+            }).scalar()
+        _start_voice_call_job(call_id)
+        results.append({"prospect_id": pid, "enqueued": True, "call_id": call_id})
+    return {"success": True, "results": results}
+
+
+class VoiceTestCallRequest(BaseModel):
+    phone: str = ""
+    agent_id: int | None = None
+
+
+@app.post("/voice-outreach/test-call")
+async def voice_outreach_test_call(payload: VoiceTestCallRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    phone_e164 = _normalize_phone_e164(payload.phone) if payload.phone else None
+    if not phone_e164:
+        raise HTTPException(status_code=400, detail="A valid phone number is required for a test call")
+    settings = _get_or_create_voice_settings(uid)
+    agent_id = payload.agent_id or settings.get("default_voice_agent_id")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        call_id = conn.execute(text(
+            "INSERT INTO voice_calls (user_id, prospect_id, agent_id, dialed_number, status, is_test, created_at) "
+            "VALUES (:uid, NULL, :aid, :phone, 'queued', TRUE, :ts) RETURNING id"
+        ), {"uid": uid, "aid": agent_id, "phone": phone_e164, "ts": now}).scalar()
+    _start_voice_call_job(call_id)
+    return {"success": True, "call_id": call_id}
+
+
+_VOICE_CALL_COLS = [
+    "id", "user_id", "prospect_id", "script_id", "agent_id", "vapi_call_id", "caller_number", "dialed_number",
+    "status", "outcome", "duration_seconds", "is_test", "retry_count", "scheduled_at", "started_at", "ended_at",
+    "error", "created_at", "is_dry_run",
+]
+
+
+@app.get("/voice-outreach/calls")
+async def voice_outreach_list_calls(request: Request, status: str = "", needs_review: bool = False):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    query = f"SELECT {', '.join('vc.' + c for c in _VOICE_CALL_COLS)}, vp.business_name FROM voice_calls vc LEFT JOIN voice_prospects vp ON vp.id = vc.prospect_id WHERE vc.user_id=:uid"
+    params = {"uid": uid}
+    if status:
+        query += " AND vc.status=:status"
+        params["status"] = status
+    if needs_review:
+        query += " AND vc.id IN (SELECT call_id FROM voice_analysis WHERE needs_human_review=TRUE)"
+    query += " ORDER BY vc.created_at DESC"
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+    calls = []
+    for r in rows:
+        call = dict(zip(_VOICE_CALL_COLS, r[:-1]))
+        call["business_name"] = r[-1]
+        calls.append(call)
+    return {"success": True, "calls": calls}
+
+
+@app.get("/voice-outreach/calls/{call_id}")
+async def voice_outreach_get_call(call_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_VOICE_CALL_COLS)} FROM voice_calls WHERE id=:id AND user_id=:uid"
+        ), {"id": call_id, "uid": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Call not found")
+        call = dict(zip(_VOICE_CALL_COLS, row))
+
+        prospect = None
+        if call["prospect_id"]:
+            prow = conn.execute(text(
+                "SELECT id, business_name, address, phone_e164, lead_id FROM voice_prospects WHERE id=:id"
+            ), {"id": call["prospect_id"]}).fetchone()
+            if prow:
+                prospect = dict(zip(["id", "business_name", "address", "phone_e164", "lead_id"], prow))
+
+        trow = conn.execute(text(
+            "SELECT transcript_text, transcript_json, recording_url, is_synthetic, received_at "
+            "FROM voice_transcripts WHERE call_id=:id"
+        ), {"id": call_id}).fetchone()
+        transcript = None
+        if trow:
+            transcript = dict(zip(["transcript_text", "transcript_json", "recording_url", "is_synthetic", "received_at"], trow))
+            try:
+                transcript["transcript_json"] = json.loads(transcript["transcript_json"] or "[]")
+            except Exception:
+                transcript["transcript_json"] = []
+
+        arow = conn.execute(text(
+            "SELECT id, extracted_json, classification, classification_confidence, sentiment, opt_out_requested, "
+            "needs_human_review, reviewed_by, reviewed_at FROM voice_analysis WHERE call_id=:id"
+        ), {"id": call_id}).fetchone()
+        analysis = None
+        if arow:
+            analysis = dict(zip(
+                ["id", "extracted_json", "classification", "classification_confidence", "sentiment",
+                 "opt_out_requested", "needs_human_review", "reviewed_by", "reviewed_at"], arow
+            ))
+            try:
+                analysis["extracted"] = json.loads(analysis.pop("extracted_json") or "{}")
+            except Exception:
+                analysis["extracted"] = {}
+
+        frows = conn.execute(text(
+            "SELECT id, channel, draft_content, status, approved_by, approved_at, sent_at, created_at "
+            "FROM voice_followups WHERE call_id=:id ORDER BY created_at DESC"
+        ), {"id": call_id}).fetchall()
+        followups = [dict(zip(["id", "channel", "draft_content", "status", "approved_by", "approved_at", "sent_at", "created_at"], f)) for f in frows]
+
+        crm = None
+        if prospect and prospect.get("lead_id"):
+            lrow = conn.execute(text("SELECT id, name, phone, email, status FROM leads WHERE id=:id"), {"id": prospect["lead_id"]}).fetchone()
+            if lrow:
+                notes = conn.execute(text(
+                    "SELECT id, note_text, source, created_by, created_at FROM lead_notes WHERE lead_id=:id ORDER BY created_at DESC"
+                ), {"id": prospect["lead_id"]}).fetchall()
+                events = conn.execute(text(
+                    "SELECT id, event_type, event_data_json, source, created_at FROM lead_timeline_events WHERE lead_id=:id ORDER BY created_at DESC"
+                ), {"id": prospect["lead_id"]}).fetchall()
+                crm = {
+                    "lead": dict(zip(["id", "name", "phone", "email", "status"], lrow)),
+                    "notes": [dict(zip(["id", "note_text", "source", "created_by", "created_at"], n)) for n in notes],
+                    "timeline": [dict(zip(["id", "event_type", "event_data", "source", "created_at"], e)) for e in events],
+                }
+                for ev in crm["timeline"]:
+                    try:
+                        ev["event_data"] = json.loads(ev["event_data"] or "{}")
+                    except Exception:
+                        ev["event_data"] = {}
+
+    return {
+        "success": True, "call": call, "prospect": prospect, "transcript": transcript,
+        "analysis": analysis, "followups": followups, "crm": crm,
+    }
