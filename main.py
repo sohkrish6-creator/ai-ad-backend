@@ -21155,6 +21155,13 @@ async def serve_website_admin_panel():
 #  mid-build migration, but Phase 1 never inserts rows into them.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Fix 6 (bug-fix pass): Phase 1 originally hardcoded gpt-4o for qualification
+# scoring; the spec targeted gpt-4o-mini (~15x cheaper), and Phase 3's
+# conversation analysis already runs on mini. Configurable so the default can
+# be deliberately confirmed or reverted based on real score-quality
+# comparison, not silently assumed.
+QUALIFICATION_MODEL = os.getenv("QUALIFICATION_MODEL", "gpt-4o-mini")
+
 _VOICE_DDL = """
 CREATE TABLE IF NOT EXISTS voice_batches (
     id                TEXT PRIMARY KEY,
@@ -21812,7 +21819,7 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
         return [{"role": "user", "content": prompt}]
 
     result = await _call_gpt_json_with_retry(
-        _build_messages, model="gpt-4o", max_tokens=3500, temperature=0.3, retries=1,
+        _build_messages, model=QUALIFICATION_MODEL, max_tokens=3500, temperature=0.3, retries=1,
         label="voice-outreach batch scoring",
     )
     return _fix_rs(result.get("prospects", []))
