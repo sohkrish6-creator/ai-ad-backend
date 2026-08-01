@@ -18321,12 +18321,13 @@ def _gsc_date_range():
     return start, end
 
 
-def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, user_id: str) -> list:
-    dim_key = "query" if kind == "query" else "page"
+def _gsc_query_search_analytics(service, site_url: str, dims: list, start: date, end: date,
+                                 kind: str, user_id: str) -> list:
+    """One searchanalytics().query() call (paginated) for a given dimension set."""
     body = {
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "dimensions": ["date", dim_key, "country", "device"],
+        "dimensions": dims,
         "rowLimit": 25000,
         "startRow": 0,
         "dataState": "final",
@@ -18334,16 +18335,16 @@ def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, u
     logger.info(f"[GSC-SYNC] searchanalytics().query kind={kind!r} siteUrl={site_url!r} body={json.dumps(body)}")
 
     all_rows = []
-    for page_num in range(4):   # safety cap: 4 pages = 100k rows max per property per kind
+    for page_num in range(4):   # safety cap: 4 pages = 100k rows max per property per kind/dim-set
         try:
             resp = service.searchanalytics().query(siteUrl=site_url, body=body).execute()
         except Exception as _api_e:
             # googleapiclient raises HttpError for non-2xx responses — surface the raw
             # error body instead of letting it look like a silent "0 rows" result.
-            logger.error(f"[GSC-SYNC] API call FAILED kind={kind!r} siteUrl={site_url!r} page={page_num}: {_api_e}")
+            logger.error(f"[GSC-SYNC] API call FAILED kind={kind!r} dims={dims} siteUrl={site_url!r} page={page_num}: {_api_e}")
             raise
         page = resp.get("rows", []) or []
-        logger.info(f"[GSC-SYNC] response kind={kind!r} page={page_num} rows_returned={len(page)} "
+        logger.info(f"[GSC-SYNC] response kind={kind!r} dims={dims} page={page_num} rows_returned={len(page)} "
                     f"responseAggregationType={resp.get('responseAggregationType')!r}")
         if not page:
             break
@@ -18352,16 +18353,17 @@ def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, u
             break
         body["startRow"] += body["rowLimit"]
 
-    logger.info(f"[GSC-SYNC] kind={kind!r} siteUrl={site_url!r} TOTAL raw rows from API: {len(all_rows)}")
+    logger.info(f"[GSC-SYNC] kind={kind!r} dims={dims} siteUrl={site_url!r} TOTAL raw rows from API: {len(all_rows)}")
     now = datetime.utcnow().isoformat()
     out = []
     for r in all_rows:
         keys = r.get("keys", [])
-        if len(keys) < 4:
+        if len(keys) < len(dims):
             continue
         row = {
             "user_id": user_id, "site_url": site_url, "query_date": keys[0],
-            "country": keys[2], "device": keys[3],
+            "country": keys[2] if len(keys) > 2 else "ALL",
+            "device": keys[3] if len(keys) > 3 else "ALL",
             "impressions": int(r.get("impressions", 0)), "clicks": int(r.get("clicks", 0)),
             "ctr": float(r.get("ctr", 0.0)), "position": float(r.get("position", 0.0)),
             "synced_at": now,
@@ -18372,6 +18374,36 @@ def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, u
             row["page_url"] = keys[1]
         out.append(row)
     return out
+
+
+def _gsc_fetch_rows(service, site_url: str, kind: str, start: date, end: date, user_id: str) -> list:
+    """Fetches query or page rows, retrying with a coarser dimension set if the
+    full breakdown comes back empty.
+
+    Real bug found in production: query+country+device+date returned 0 rows for
+    a low-traffic site (13 total clicks) while page+country+device+date returned
+    real data for the same window. This matches Google's documented Search
+    Console data-anonymization behavior — very small per-bucket samples get
+    omitted from reports to avoid identifying individual searchers, and this
+    hits the query dimension harder than the page dimension (a search query can
+    be more identifying of a specific person than which page they viewed). The
+    fix is to retry with fewer simultaneous dimensions (larger buckets) rather
+    than concluding there's genuinely no data."""
+    dim_key = "query" if kind == "query" else "page"
+    dimension_attempts = [
+        ["date", dim_key, "country", "device"],
+        ["date", dim_key],
+    ]
+    for i, dims in enumerate(dimension_attempts):
+        rows = _gsc_query_search_analytics(service, site_url, dims, start, end, kind, user_id)
+        if rows:
+            if i > 0:
+                logger.warning(f"[GSC-SYNC] kind={kind!r} recovered {len(rows)} rows using coarser "
+                                f"dims={dims} after full dims returned 0 (likely GSC anonymization on thin data)")
+            return rows
+        logger.warning(f"[GSC-SYNC] kind={kind!r} dims={dims} returned 0 rows"
+                        + (" — trying coarser dimensions" if i < len(dimension_attempts) - 1 else " at any dimensionality"))
+    return []
 
 
 def _write_gsc_sync_data(user_id: str, site_url: str, query_rows: list, page_rows: list):
@@ -18852,9 +18884,35 @@ async def search_console_health_score(request: Request):
 # in real thresholds, never a fabricated numeric "Opportunity Score".
 _GSC_OPPORTUNITY_THRESHOLDS = {
     "low_ctr_min_impressions": 200, "low_ctr_ceiling": 0.02,
-    "page_4_10_min_impressions": 100,
+    # Page-2-adjacent opportunity band. Was literally 4-10 — too narrow: real
+    # production data (sohscape.com) had a page at position 11.6, 111 impressions,
+    # 9% CTR that's exactly the kind of "not page-1-dominant, worth pushing"
+    # candidate this detector exists to catch, but 11.6 fell just outside the old
+    # range. Google's results page break to "page 2" around position 11, so 4-15
+    # covers "not top-3" through "just off page 1" without stretching into
+    # positions so deep they're not a realistic near-term win.
+    "page_position_min": 4, "page_position_max": 15,
+    "page_min_impressions": 100,
     "declining_min_prior_clicks": 10, "declining_drop_ratio": 0.7,
 }
+
+
+def _normalize_gsc_page_url(page_url: str) -> str:
+    """Merges www/non-www + trailing-slash variants of the same logical page.
+    Real bug found in production: the same page indexed under both
+    https://www.example.com/about and https://example.com/about showed as two
+    separate rows, splitting its real combined clicks/impressions in half.
+    Merging them here is the display-time fix; a separate fragmentation flag
+    (see search_console_pages) surfaces this as a real technical-SEO finding
+    rather than silently hiding it."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(page_url)
+        netloc = parsed.netloc[4:] if parsed.netloc.startswith("www.") else parsed.netloc
+        path = parsed.path.rstrip("/") or "/"
+        return f"{parsed.scheme}://{netloc}{path}"
+    except Exception:
+        return page_url
 
 
 def _gsc_rate_by_impressions(imp: int, high: int, medium: int) -> str:
@@ -18883,21 +18941,42 @@ def _detect_gsc_low_ctr_queries(user_id: str, site_url: str) -> list:
     } for q, imp, clk, ctr, pos in rows]
 
 
-def _detect_gsc_position_4_10_pages(user_id: str, site_url: str) -> list:
+def _detect_gsc_position_4_15_pages(user_id: str, site_url: str) -> list:
     t = _GSC_OPPORTUNITY_THRESHOLDS
+    # Fetch raw per-(date,country,device) rows rather than pre-aggregating by
+    # page_url in SQL, so www/non-www variants can be merged BEFORE filtering —
+    # merging after a SQL GROUP BY would miss cases where neither variant alone
+    # clears the impression threshold but their real combined total does.
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT page_url, AVG(position) pos, SUM(impressions) imp, SUM(clicks) clk
+            SELECT page_url, position, impressions, clicks
             FROM search_pages WHERE user_id=:uid AND site_url=:su
-            GROUP BY page_url
-            HAVING AVG(position) BETWEEN 4 AND 10 AND SUM(impressions) >= :min_imp
-            ORDER BY imp DESC LIMIT 25
-        """), {"uid": user_id, "su": site_url, "min_imp": t["page_4_10_min_impressions"]}).fetchall()
-    return [{
-        "page_url": p, "avg_position": round(float(pos or 0), 1),
-        "impressions": int(imp), "clicks": int(clk),
-        "rating": _gsc_rate_by_impressions(imp, 500, 200),
-    } for p, pos, imp, clk in rows]
+        """), {"uid": user_id, "su": site_url}).fetchall()
+
+    merged = {}
+    for page_url, pos, imp, clk in rows:
+        norm = _normalize_gsc_page_url(page_url)
+        m = merged.setdefault(norm, {"impressions": 0, "clicks": 0, "_weighted_pos": 0.0})
+        imp_i = int(imp or 0)
+        m["impressions"] += imp_i
+        m["clicks"] += int(clk or 0)
+        m["_weighted_pos"] += float(pos or 0) * imp_i
+
+    out = []
+    for page_url, m in merged.items():
+        imp = m["impressions"]
+        if imp < t["page_min_impressions"]:
+            continue
+        avg_pos = (m["_weighted_pos"] / imp) if imp else 0
+        if not (t["page_position_min"] <= avg_pos <= t["page_position_max"]):
+            continue
+        out.append({
+            "page_url": page_url, "avg_position": round(avg_pos, 1),
+            "impressions": imp, "clicks": m["clicks"],
+            "rating": _gsc_rate_by_impressions(imp, 500, 200),
+        })
+    out.sort(key=lambda x: x["impressions"], reverse=True)
+    return out[:25]
 
 
 def _detect_gsc_declining_queries(user_id: str, site_url: str) -> list:
@@ -18966,18 +19045,33 @@ async def search_console_opportunities(request: Request, url: str = "", industry
     if err:
         return err
 
+    # Significance is computed from whichever of search_queries/search_pages has
+    # MORE signal, not search_queries alone — position_4_15_pages is entirely
+    # page-based and doesn't need query data, so gating the whole opportunities
+    # response on query-table sufficiency was needlessly pessimistic whenever the
+    # query-dimension fetch came back thinner than the page-dimension fetch.
     with engine.connect() as conn:
-        days_row = conn.execute(text(
+        q_days_row = conn.execute(text(
             "SELECT COUNT(DISTINCT query_date) FROM search_queries WHERE user_id=:uid AND site_url=:su"
         ), {"uid": uid, "su": site_url}).fetchone()
-        totals_row = conn.execute(text(
+        q_totals_row = conn.execute(text(
             "SELECT COALESCE(SUM(clicks),0), COALESCE(SUM(impressions),0) "
             "FROM search_queries WHERE user_id=:uid AND site_url=:su"
         ), {"uid": uid, "su": site_url}).fetchone()
-    sufficiency = _check_gsc_data_sufficiency(int(days_row[0] or 0), int(totals_row[0] or 0), int(totals_row[1] or 0))
+        p_days_row = conn.execute(text(
+            "SELECT COUNT(DISTINCT query_date) FROM search_pages WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+        p_totals_row = conn.execute(text(
+            "SELECT COALESCE(SUM(clicks),0), COALESCE(SUM(impressions),0) "
+            "FROM search_pages WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+    days_of_data = max(int(q_days_row[0] or 0), int(p_days_row[0] or 0))
+    total_clicks = max(int(q_totals_row[0] or 0), int(p_totals_row[0] or 0))
+    total_impressions = max(int(q_totals_row[1] or 0), int(p_totals_row[1] or 0))
+    sufficiency = _check_gsc_data_sufficiency(days_of_data, total_clicks, total_impressions)
 
     low_ctr_queries = _detect_gsc_low_ctr_queries(uid, site_url)
-    position_4_10_pages = _detect_gsc_position_4_10_pages(uid, site_url)
+    position_4_15_pages = _detect_gsc_position_4_15_pages(uid, site_url)
     declining_queries = _detect_gsc_declining_queries(uid, site_url)
 
     if url:
@@ -18991,7 +19085,7 @@ async def search_console_opportunities(request: Request, url: str = "", industry
         "site_url": site_url,
         "opportunities": {
             "low_ctr_queries": low_ctr_queries,
-            "position_4_10_pages": position_4_10_pages,
+            "position_4_15_pages": position_4_15_pages,
             "declining_queries": declining_queries,
         },
     }
@@ -19226,18 +19320,51 @@ async def search_console_pages(request: Request, limit: int = 25):
         return err
 
     limit = max(1, min(limit, 100))
+    # Grouped by raw page_url first (not normalized) so fragmentation across
+    # www/non-www variants can be detected, then merged for display — a merged
+    # row with no visible note would silently hide a real technical-SEO issue
+    # (missing canonical/redirect setup), not just clean up the table.
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT page_url, SUM(clicks) clk, SUM(impressions) imp,
-                   CAST(SUM(clicks) AS REAL)/NULLIF(SUM(impressions),0) ctr, AVG(position) pos
+            SELECT page_url, SUM(clicks) clk, SUM(impressions) imp, AVG(position) pos
             FROM search_pages WHERE user_id=:uid AND site_url=:su
-            GROUP BY page_url ORDER BY clk DESC LIMIT :lim
-        """), {"uid": uid, "su": site_url, "lim": limit}).fetchall()
-    pages = [{
-        "page_url": p, "clicks": int(clk), "impressions": int(imp),
-        "ctr": round(float(ctr or 0), 4), "avg_position": round(float(pos or 0), 1),
-    } for p, clk, imp, ctr, pos in rows]
-    return {"success": True, "site_url": site_url, "pages": pages}
+            GROUP BY page_url
+        """), {"uid": uid, "su": site_url}).fetchall()
+
+    merged = {}
+    fragmented_groups = []
+    for page_url, clk, imp, pos in rows:
+        norm = _normalize_gsc_page_url(page_url)
+        m = merged.setdefault(norm, {"page_url": norm, "clicks": 0, "impressions": 0, "_weighted_pos": 0.0, "variants": set()})
+        imp_i = int(imp or 0)
+        m["clicks"] += int(clk or 0)
+        m["impressions"] += imp_i
+        m["_weighted_pos"] += float(pos or 0) * imp_i
+        m["variants"].add(page_url)
+
+    pages = []
+    for m in merged.values():
+        imp = m["impressions"]
+        if len(m["variants"]) > 1:
+            fragmented_groups.append({"normalized_url": m["page_url"], "variants": sorted(m["variants"])})
+        pages.append({
+            "page_url": m["page_url"], "clicks": m["clicks"], "impressions": imp,
+            "ctr": round(m["clicks"] / imp, 4) if imp else 0,
+            "avg_position": round(m["_weighted_pos"] / imp, 1) if imp else 0,
+        })
+    pages.sort(key=lambda p: p["clicks"], reverse=True)
+    pages = pages[:limit]
+
+    result = {"success": True, "site_url": site_url, "pages": pages}
+    if fragmented_groups:
+        result["www_fragmentation_detected"] = True
+        result["fragmentation_note"] = (
+            "Your site's www and non-www versions are being indexed separately by Google — this "
+            "suggests a missing canonical tag or redirect setup, which is itself worth fixing for SEO. "
+            "Clicks/impressions for the affected pages have been combined above for display."
+        )
+        result["fragmented_pages"] = fragmented_groups[:10]
+    return result
 
 
 # ── Unified connected-accounts status ─────────────────────────────────────────
