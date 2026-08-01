@@ -22481,6 +22481,137 @@ def _voice_calls_update(call_id: int, **fields):
         conn.execute(text(f"UPDATE voice_calls SET {sets} WHERE id=:call_id"), {**fields, "call_id": call_id})
 
 
+# ── Durability & single-instance guard (bug-fix pass) ──────────────────────────
+#  A plain asyncio.Semaphore is process-local — it caps concurrency within
+#  one Python process but gives zero protection if Render ever runs more
+#  than one instance of this service (each instance would enforce its own
+#  cap independently, doubling — or worse — the real concurrent-call limit).
+#  A DB-level advisory lock makes "which instance is allowed to actively
+#  dial right now" a fact the database itself arbitrates, not something each
+#  instance decides for itself.
+
+_VOICE_DIALER_LOCK_KEY = 872341001  # arbitrary fixed int, unique to this lock's purpose
+_VOICE_MAX_CALL_DURATION_SECONDS = int(os.getenv("VOICE_MAX_CALL_DURATION_SECONDS", "600"))
+
+_voice_dialer_leader_conn = None
+_voice_is_dialer_leader = False
+
+
+def _voice_try_acquire_dialer_leadership() -> bool:
+    """Non-blocking leadership check via pg_try_advisory_lock, held on a
+    single dedicated raw DBAPI connection for the process's lifetime (NOT a
+    pooled SQLAlchemy connection — those get recycled/closed under normal
+    pool churn, which would silently drop the lock without us knowing).
+    No-op (always leader) on SQLite, which is single-process by
+    construction — there is no horizontal-scaling risk to guard against
+    locally. Cheap to call on every dial attempt, so a non-leader instance
+    naturally recovers leadership once the old leader's connection closes
+    (e.g. it crashed or redeployed) without needing a separate retry loop."""
+    global _voice_dialer_leader_conn, _voice_is_dialer_leader
+    if _is_sqlite:
+        return True
+    if _voice_is_dialer_leader:
+        return True
+    try:
+        if _voice_dialer_leader_conn is None:
+            _voice_dialer_leader_conn = engine.raw_connection()
+        cur = _voice_dialer_leader_conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_VOICE_DIALER_LOCK_KEY,))
+        got = bool(cur.fetchone()[0])
+        cur.close()
+        _voice_dialer_leader_conn.commit()
+        _voice_is_dialer_leader = got
+        return got
+    except Exception as _le:
+        logger.warning(f"[VOICE-LOCK] advisory-lock leadership check failed, refusing to dial defensively: {_le}")
+        try:
+            if _voice_dialer_leader_conn:
+                _voice_dialer_leader_conn.close()
+        except Exception:
+            pass
+        _voice_dialer_leader_conn = None
+        return False
+
+
+def _vapi_get_call_status_sync(vapi_call_id: str):
+    """GET https://api.vapi.ai/call/{id} — used only during startup
+    reconciliation (which runs at plain module-import time, before any
+    event loop exists, matching this file's established convention of doing
+    startup work as bare top-level statements) to try to resolve a call's
+    true outcome after an interrupted restart. Sync (not the async
+    _vapi_create_call pattern) for exactly that reason. Untested against
+    real Vapi responses — no live credentials exist yet — same caveat as
+    the rest of the live-mode code."""
+    if not VAPI_API_KEY:
+        return None
+    try:
+        import httpx as _httpx_sync
+        resp = _httpx_sync.get(
+            f"https://api.vapi.ai/call/{vapi_call_id}",
+            headers={"Authorization": f"Bearer {VAPI_API_KEY}"}, timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as _ge:
+        logger.warning(f"[VOICE-RECONCILE] Vapi call-status lookup failed for {vapi_call_id}: {_ge}")
+    return None
+
+
+def _voice_reconcile_stuck_calls():
+    """Runs once at module-import time (startup). A call legitimately
+    cannot still be dialing/connected/talking after
+    VOICE_MAX_CALL_DURATION_SECONDS of real wall-clock time — that only
+    happens if the process died mid-call. Never left silently looking
+    'live' forever; and per the no-auto-call principle, still-queued calls
+    are surfaced (via the log line + GET /voice-outreach/calls' stale_queued
+    flag) but NEVER auto-resumed — that requires an explicit
+    POST /voice-outreach/calls/resume."""
+    cutoff = (datetime.utcnow() - timedelta(seconds=_VOICE_MAX_CALL_DURATION_SECONDS)).isoformat()
+    with engine.connect() as conn:
+        stuck = conn.execute(text(
+            "SELECT id, vapi_call_id, is_dry_run FROM voice_calls "
+            "WHERE status IN ('dialing', 'connected', 'talking') "
+            "AND started_at IS NOT NULL AND started_at < :cutoff"
+        ), {"cutoff": cutoff}).fetchall()
+
+    for call_id, vapi_call_id, is_dry_run in stuck:
+        resolved = False
+        if vapi_call_id and not is_dry_run and _voice_is_vapi_configured():
+            info = _vapi_get_call_status_sync(vapi_call_id)
+            if info and info.get("status"):
+                _voice_calls_update(
+                    call_id, status=("ended" if info["status"] == "ended" else "unknown_interrupted"),
+                    outcome=info.get("endedReason"),
+                    error="Resolved via Vapi call-status lookup after a server restart.",
+                    ended_at=datetime.utcnow().isoformat(),
+                )
+                resolved = True
+        if not resolved:
+            _voice_calls_update(
+                call_id, status="unknown_interrupted", ended_at=datetime.utcnow().isoformat(),
+                error=(
+                    "Process restarted mid-call and the outcome could not be confirmed"
+                    + ("" if vapi_call_id else " (no vapi_call_id was ever recorded)")
+                    + " — verify manually before re-contacting this prospect."
+                ),
+            )
+        logger.warning(f"[VOICE-RECONCILE] call {call_id} reconciled at startup (resolved_via_vapi={resolved})")
+
+    with engine.connect() as conn:
+        queued_count = conn.execute(text("SELECT COUNT(*) FROM voice_calls WHERE status='queued'")).scalar()
+    if queued_count:
+        logger.warning(
+            f"[VOICE-RECONCILE] {queued_count} call(s) left in 'queued' status from before this restart — "
+            "NOT auto-resumed, held for explicit resume via POST /voice-outreach/calls/resume"
+        )
+
+
+try:
+    _voice_reconcile_stuck_calls()
+except Exception as _rce:
+    logger.warning(f"[VOICE-RECONCILE] startup reconciliation failed (non-fatal): {_rce}")
+
+
 def _voice_build_assistant_overrides(prospect: dict, script: dict, disclosure_line: str) -> dict:
     """Vapi's real per-call personalization mechanism is assistantOverrides.
     variableValues against {{variable}} placeholders in the ONE persistent
@@ -22607,9 +22738,13 @@ async def _simulate_dry_run_call(call_id: int):
             script = dict(zip(["opening", "rapport", "pain_point", "value_prop", "social_proof", "meeting_close", "disclosure_line"], srow))
     disclosure_line = script.get("disclosure_line") or _voice_disclosure_line(business_name)
 
+    # status='dialing' + started_at are already persisted by the atomic claim
+    # in _process_voice_call BEFORE this function is ever called — every
+    # subsequent transition here is written BEFORE its corresponding sleep,
+    # not after, so a kill mid-sleep always leaves the DB reflecting the
+    # phase actually in progress (reconciliation-safe), never a phase that
+    # already finished.
     step = max(DRY_RUN_CALL_SECONDS * 0.2, 0.5)
-    await asyncio.sleep(step)
-    _voice_calls_update(call_id, status="dialing")
     await asyncio.sleep(step)
     _voice_calls_update(call_id, status="connected")
     await asyncio.sleep(step)
@@ -22701,10 +22836,17 @@ async def _live_dispatch_call(call_id: int, phone_e164: str):
     if not vapi_assistant_id:
         raise RuntimeError("no vapi_assistant_id configured for the selected voice agent")
 
+    # status='dialing' + started_at are already persisted by the atomic claim
+    # in _process_voice_call BEFORE this function runs — so even if the
+    # process dies right here, before _vapi_create_call returns, the DB
+    # already correctly reflects "this call was being dialed" rather than
+    # lagging behind reality (reconciliation picks up anything stuck this
+    # way, though without a vapi_call_id yet it can't resolve the outcome
+    # via Vapi's API — a known, honestly-scoped gap, not silently assumed away).
     overrides = _voice_build_assistant_overrides({"business_name": business_name or ""}, script, disclosure_line)
     result = await _vapi_create_call(vapi_assistant_id, phone_e164, overrides)
     vapi_call_id = result.get("id") or result.get("callId") or ""
-    _voice_calls_update(call_id, status="dialing", vapi_call_id=vapi_call_id, dialed_number=phone_e164)
+    _voice_calls_update(call_id, vapi_call_id=vapi_call_id, dialed_number=phone_e164)
     # Status advances only via the real webhook from here — this task's job
     # is done once dispatch succeeds. See the plan's note on live-mode
     # concurrency: the semaphore is only held for the dispatch call itself
@@ -22718,19 +22860,42 @@ async def _delayed_requeue(call_id: int, delay_seconds: float):
 
 
 async def _process_voice_call(call_id: int):
-    with engine.connect() as conn:
-        row = conn.execute(text(
-            "SELECT user_id, prospect_id, status, retry_count, is_test, dialed_number FROM voice_calls WHERE id=:id"
-        ), {"id": call_id}).fetchone()
-    if not row:
-        return
-    user_id, prospect_id, status, retry_count, is_test, dialed_number = row
-    if status != "queued":
-        return  # already processed/processing — idempotent guard against duplicate dispatch
-
-    settings = _get_or_create_voice_settings(user_id)
-
+    # The claim happens INSIDE the semaphore (not before it) so a call
+    # blocked on a full concurrency cap still visibly sits at 'queued' —
+    # matching Phase 2's verified "at most N calls actively dialing at once"
+    # behavior — rather than every enqueued call jumping straight to
+    # 'dialing' the instant it's created regardless of whether a slot is
+    # actually free. The durability guarantee this fix cares about (status
+    # persisted before the REAL dial action) only requires the claim to
+    # land before _simulate_dry_run_call/_live_dispatch_call runs, not
+    # before the in-process queueing wait.
     async with _VOICE_CALL_SEMAPHORE:
+        now_iso = datetime.utcnow().isoformat()
+        # Atomic claim — a compare-and-swap UPDATE, not a read-then-branch
+        # check (TOCTOU-unsafe the moment more than one process/instance can
+        # touch this row). status='dialing' + started_at become true in the
+        # DB BEFORE any real dial attempt begins, not after, so a crash
+        # mid-dial always leaves the row reflecting reality.
+        with engine.begin() as conn:
+            claim = conn.execute(text(
+                "UPDATE voice_calls SET status='dialing', started_at=:ts WHERE id=:id AND status='queued' "
+                "RETURNING user_id, prospect_id, retry_count, is_test, dialed_number"
+            ), {"id": call_id, "ts": now_iso})
+            claimed_row = claim.fetchone()
+        if not claimed_row:
+            return  # already claimed/processed by someone else — safe no-op
+        user_id, prospect_id, retry_count, is_test, dialed_number = claimed_row
+
+        if not _voice_try_acquire_dialer_leadership():
+            # This instance isn't the dialer leader right now — release the
+            # claim back to 'queued' rather than leaving it stuck at
+            # 'dialing' with nobody actually dialing it, and retry shortly.
+            _voice_calls_update(call_id, status="queued", started_at=None)
+            asyncio.create_task(_delayed_requeue(call_id, 5.0))
+            return
+
+        settings = _get_or_create_voice_settings(user_id)
+
         async with _VOICE_DIAL_LOCK:
             elapsed_ms = (time.time() - _voice_last_dial_at["ts"]) * 1000
             if elapsed_ms < DIAL_INTERVAL_MS:
@@ -22766,7 +22931,7 @@ async def _process_voice_call(call_id: int):
                 delay = 30.0 * (retry_count + 1)
                 with engine.begin() as conn:
                     conn.execute(text(
-                        "UPDATE voice_calls SET status='queued', retry_count=retry_count+1, error=:err WHERE id=:id"
+                        "UPDATE voice_calls SET status='queued', retry_count=retry_count+1, error=:err, started_at=NULL WHERE id=:id"
                     ), {"err": str(_pe), "id": call_id})
                 asyncio.create_task(_delayed_requeue(call_id, delay))
             else:
@@ -22871,11 +23036,43 @@ async def voice_outreach_list_calls(request: Request, status: str = "", needs_re
     with engine.connect() as conn:
         rows = conn.execute(text(query), params).fetchall()
     calls = []
+    now = datetime.utcnow()
     for r in rows:
         call = dict(zip(_VOICE_CALL_COLS, r[:-1]))
         call["business_name"] = r[-1]
+        # A call sitting in 'queued' for more than a minute almost certainly
+        # means the process that would have dialed it restarted (queued
+        # calls are never auto-resumed, per the no-auto-call principle) —
+        # surface that so the UI can offer an explicit resume action rather
+        # than the user wondering why nothing is happening.
+        stale = False
+        if call["status"] == "queued" and call.get("created_at"):
+            try:
+                age = (now - datetime.fromisoformat(call["created_at"])).total_seconds()
+                stale = age > 60
+            except ValueError:
+                pass
+        call["stale_queued"] = stale
         calls.append(call)
     return {"success": True, "calls": calls}
+
+
+@app.post("/voice-outreach/calls/resume")
+async def voice_outreach_resume_calls(request: Request):
+    """Explicit resume for calls left in 'queued' status by an interrupted
+    restart — never automatic. Re-validates nothing extra here; the normal
+    _process_voice_call claim + gate re-check handles that exactly as it
+    would for a freshly-enqueued call."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id FROM voice_calls WHERE user_id=:uid AND status='queued'"
+        ), {"uid": uid}).fetchall()
+    for (call_id,) in rows:
+        _start_voice_call_job(call_id)
+    return {"success": True, "resumed": len(rows)}
 
 
 @app.get("/voice-outreach/calls/{call_id}")
