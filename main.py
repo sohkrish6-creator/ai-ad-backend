@@ -21491,27 +21491,79 @@ def _normalize_phone_e164(raw: Optional[str], region: str = "IN") -> Optional[st
     return None
 
 
-async def _fetch_homepage_html_safe(url: str, timeout: float = 8.0) -> str:
-    """Best-effort homepage fetch for weakness detection. Never raises —
-    returns '' on any failure (timeout, DNS, non-2xx, etc.), which itself
-    becomes the 'website_unreachable' signal downstream."""
+_VOICE_BOT_CHALLENGE_MARKERS = (
+    "checking your browser", "cf-browser-verification", "attention required! | cloudflare",
+    "please verify you are a human", "verify you are human", "captcha", "just a moment...",
+    "ddos protection by", "px-captcha", "are you a robot", "perimeterx",
+)
+
+
+def _voice_looks_like_bot_challenge(html: str) -> bool:
+    lower = html.lower()
+    return any(m in lower for m in _VOICE_BOT_CHALLENGE_MARKERS)
+
+
+async def _fetch_homepage_html_safe(url: str, timeout: float = 8.0) -> dict:
+    """Best-effort homepage fetch for weakness detection. Never raises.
+    Returns {'html': str, 'fetch_status': 'ok'|'unverifiable'|'unreachable',
+    'detail': str}.
+
+    Fix 3 (bug-fix pass): 403/429/bot-challenge/timeout/TLS errors used to
+    all collapse into a single fabricated 'website_unreachable' weakness —
+    which is how a real enterprise site behind Cloudflare/Akamai bot
+    protection (e.g. The Taj Mahal Palace) ended up flagged as having a
+    broken website. 'unverifiable' means the site is very likely fine and we
+    simply couldn't confirm its content — it is NEVER treated as a weakness
+    signal. Only 'unreachable' (confirmed DNS failure, or a persistent 5xx
+    across a retry with backoff) is."""
     if not url:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client_:
-            resp = await client_.get(url, headers={"User-Agent": "Mozilla/5.0 (AdsohBot)"})
-            if resp.status_code >= 400:
-                return ""
-            return resp.text[:200_000]
-    except Exception:
-        return ""
+        return {"html": "", "fetch_status": "ok", "detail": ""}
+
+    last_detail = ""
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client_:
+                resp = await client_.get(url, headers={"User-Agent": "Mozilla/5.0 (AdsohBot)"})
+        except httpx.ConnectError as _ce:
+            msg = str(_ce).lower()
+            dns_markers = ("nodename nor servname", "name or service not known", "getaddrinfo failed",
+                           "temporary failure in name resolution", "no address associated with hostname")
+            if any(m in msg for m in dns_markers):
+                return {"html": "", "fetch_status": "unreachable", "detail": f"DNS resolution failed: {_ce}"}
+            return {"html": "", "fetch_status": "unverifiable", "detail": f"connection failed: {_ce}"}
+        except httpx.TimeoutException:
+            return {"html": "", "fetch_status": "unverifiable", "detail": "request timed out"}
+        except Exception as _fe:
+            # TLS/SSL errors and anything else unclassified — the safer
+            # default is 'unverifiable' (never penalize a business for a
+            # fetch-layer failure that doesn't actually confirm the site is
+            # gone), not 'unreachable'.
+            return {"html": "", "fetch_status": "unverifiable", "detail": f"{type(_fe).__name__}: {_fe}"}
+
+        if resp.status_code in (403, 429):
+            return {"html": "", "fetch_status": "unverifiable", "detail": f"HTTP {resp.status_code}"}
+        if resp.status_code >= 500:
+            last_detail = f"HTTP {resp.status_code}"
+            if attempt == 0:
+                await asyncio.sleep(1.5)
+                continue
+            return {"html": "", "fetch_status": "unreachable", "detail": f"persistent {last_detail} after retry"}
+        if resp.status_code >= 400:
+            return {"html": "", "fetch_status": "unverifiable", "detail": f"HTTP {resp.status_code}"}
+
+        body = resp.text[:200_000]
+        if _voice_looks_like_bot_challenge(body):
+            return {"html": "", "fetch_status": "unverifiable", "detail": "bot-challenge page detected (HTTP 200)"}
+        return {"html": body, "fetch_status": "ok", "detail": ""}
+
+    return {"html": "", "fetch_status": "unreachable", "detail": last_detail or "unknown fetch failure"}
 
 
 _VOICE_TRACKING_MARKERS = ("gtag(", "gtag.js", "fbq(", "googletagmanager.com/gtm.js", "connect.facebook.net")
 _VOICE_CTA_PHRASES = ("book now", "contact us", "call now", "get a quote", "enquire", "whatsapp us", "order now")
 
 
-def _detect_voice_weaknesses(prospect: dict, html: str) -> tuple:
+def _detect_voice_weaknesses(prospect: dict, fetch_result: dict) -> tuple:
     """Real detected signals only — every weakness maps to an actual checked
     condition with evidence, never fabricated. Evidence shape mirrors the real
     precedent in gather_bi_data()'s extract_evidence() (type/value/confidence/
@@ -21532,6 +21584,13 @@ def _detect_voice_weaknesses(prospect: dict, html: str) -> tuple:
         weaknesses.append(w_type)
         evidence.append({"type": w_type, "value": value, "confidence": confidence, "page": page, "detected_at": now})
 
+    def _add_evidence_only(w_type: str, value, confidence: float, page: str):
+        # Recorded for audit (Fix 3 explicitly asks the error class + raw
+        # evidence be visible on the prospect) but NEVER added to
+        # `weaknesses` — must not count toward opportunity score or render
+        # as a weakness chip.
+        evidence.append({"type": w_type, "value": value, "confidence": confidence, "page": page, "detected_at": now})
+
     website = (prospect.get("website") or "").strip()
     rating = prospect.get("google_rating")
     total_reviews = prospect.get("total_reviews") or 0
@@ -21547,8 +21606,14 @@ def _detect_voice_weaknesses(prospect: dict, html: str) -> tuple:
         _add("inactive_listing", f"business_status={business_status}", 0.90, "google_places")
 
     if website:
-        if not html:
-            _add("website_unreachable", f"fetch failed or timed out for {website}", 0.60, "homepage")
+        fetch_status = fetch_result.get("fetch_status", "ok")
+        detail = fetch_result.get("detail", "")
+        html = fetch_result.get("html", "")
+
+        if fetch_status == "unreachable":
+            _add("site_unreachable", f"{detail} for {website}", 0.85, "homepage")
+        elif fetch_status == "unverifiable":
+            _add_evidence_only("site_unverifiable", f"{detail} for {website}", 0.99, "homepage")
         else:
             html_lower = html.lower()
             if not any(m in html_lower for m in _VOICE_TRACKING_MARKERS):
@@ -21800,15 +21865,16 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             })
 
         _voice_batch_update(batch_id, current_step="Fetching homepages", progress_pct=35)
+        _empty_fetch = {"html": "", "fetch_status": "ok", "detail": ""}
         homepages = await _gather_in_chunks(
-            [_fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result="") for p in enriched],
+            [_fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result=_empty_fetch) for p in enriched],
             chunk_size=10,
         )
 
         _voice_batch_update(batch_id, current_step="Detecting weaknesses", progress_pct=45)
         for i, p in enumerate(enriched):
-            html = homepages[i] if isinstance(homepages[i], str) else ""
-            weaknesses, evidence = _detect_voice_weaknesses(p, html)
+            fetch_result = homepages[i] if isinstance(homepages[i], dict) else _empty_fetch
+            weaknesses, evidence = _detect_voice_weaknesses(p, fetch_result)
             p["weaknesses"] = weaknesses
             p["evidence"] = evidence
 
@@ -21894,6 +21960,117 @@ def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: in
     return batch_id
 
 
+# Matches the established HOT(>75)/WARM(50-75)/COLD(<50) cutoff already used
+# in the scoring prompt itself — reused here as "opportunity too low to
+# still warrant a pre-existing human approval" rather than inventing a
+# second, unrelated threshold.
+_VOICE_OPPORTUNITY_REVERT_THRESHOLD = 50
+
+
+async def _voice_rescore_existing_prospects(user_id: str) -> dict:
+    """Fix 3 (bug-fix pass): one-time, user-triggered re-run of weakness
+    detection + scoring for every prospect that hasn't been called yet,
+    using the corrected fetch-failure classification (site_unverifiable is
+    no longer fabricated into a weakness). Never automatic — GPT rescoring
+    costs real money, so this only runs when explicitly requested, same
+    discipline as batch-build/confirm-and-call. Never touches a prospect
+    that already has any voice_calls row (called or in-flight) — rescoring
+    a business already spoken to means nothing."""
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT vp.id, vp.batch_id, vp.business_name, vp.address, vp.website, vp.google_rating, "
+            "vp.total_reviews, vp.business_status, vp.opportunity_score, vp.approval_status, vb.industry, vb.city "
+            "FROM voice_prospects vp JOIN voice_batches vb ON vb.id = vp.batch_id "
+            "WHERE vp.user_id=:uid AND vp.id NOT IN "
+            "(SELECT prospect_id FROM voice_calls WHERE prospect_id IS NOT NULL)"
+        ), {"uid": user_id}).fetchall()
+
+    by_batch = {}
+    for r in rows:
+        by_batch.setdefault(r[1], []).append(r)
+
+    prospects_rescored = 0
+    score_changed = 0
+    reverted_to_pending = 0
+    batches_touched = set()
+    now = datetime.utcnow().isoformat()
+
+    for batch_id, batch_rows in by_batch.items():
+        industry, city = batch_rows[0][10], batch_rows[0][11]
+        search_scope = city or "India"
+
+        prospects = []
+        for (pid, _bid, business_name, address, website, google_rating, total_reviews,
+             business_status, old_score, approval_status, _ind, _city) in batch_rows:
+            fetch_result = await _fetch_homepage_html_safe(website) if website else {"html": "", "fetch_status": "ok", "detail": ""}
+            weaknesses, evidence = _detect_voice_weaknesses({
+                "website": website, "google_rating": google_rating,
+                "total_reviews": total_reviews, "business_status": business_status,
+            }, fetch_result)
+            prospects.append({
+                "id": pid, "business_name": business_name, "address": address, "website": website,
+                "google_rating": google_rating, "total_reviews": total_reviews, "business_status": business_status,
+                "weaknesses": weaknesses, "evidence": evidence, "old_score": old_score,
+                "approval_status": approval_status,
+            })
+
+        SCORE_BATCH_SIZE = 15
+        score_batches = [prospects[i:i + SCORE_BATCH_SIZE] for i in range(0, len(prospects), SCORE_BATCH_SIZE)]
+        batch_results = await asyncio.gather(*[_score_voice_prospect_batch(industry, search_scope, b) for b in score_batches])
+        scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
+
+        with engine.begin() as conn:
+            for p in prospects:
+                new = scores_by_name.get(p["business_name"], {})
+                new_score = new.get("opportunity_score")
+                old_score = p["old_score"]
+                confidences = [e.get("confidence", 0) for e in p["evidence"]]
+                new_confidence = int(round(100 * (sum(confidences) / len(confidences)))) if confidences else 50
+
+                changed = new_score is not None and old_score is not None and abs(new_score - old_score) >= 5
+                note, revert = None, False
+                if changed:
+                    note = f"Rescored {now[:10]}: opportunity_score changed {old_score}→{new_score} after site-fetch classification fix."
+                    if p["approval_status"] == "approved" and new_score is not None and new_score < _VOICE_OPPORTUNITY_REVERT_THRESHOLD:
+                        revert = True
+                        note += " Reverted to pending review — score dropped below threshold."
+
+                conn.execute(text(
+                    "UPDATE voice_prospects SET weaknesses_json=:w, evidence_json=:e, opportunity_score=:score, "
+                    "business_score=:bscore, confidence_score=:conf, priority=:prio, reason=:reason, "
+                    "estimated_roi=:roi, estimated_call_success=:succ, rescore_note=:note, "
+                    "approval_status=:appr, approved_by=CASE WHEN :revert THEN NULL ELSE approved_by END, "
+                    "approved_at=CASE WHEN :revert THEN NULL ELSE approved_at END, updated_at=:ts WHERE id=:id"
+                ), {
+                    "w": json.dumps(p["weaknesses"]), "e": json.dumps(p["evidence"]),
+                    "score": new.get("opportunity_score", old_score), "bscore": new.get("business_score"),
+                    "conf": new_confidence, "prio": new.get("priority"), "reason": new.get("reason"),
+                    "roi": new.get("estimated_roi"), "succ": new.get("estimated_call_success"),
+                    "note": note, "appr": ("pending" if revert else p["approval_status"]),
+                    "revert": revert, "ts": now, "id": p["id"],
+                })
+                prospects_rescored += 1
+                if changed:
+                    score_changed += 1
+                    batches_touched.add(batch_id)
+                if revert:
+                    reverted_to_pending += 1
+
+    return {
+        "prospects_rescored": prospects_rescored, "score_changed": score_changed,
+        "reverted_to_pending": reverted_to_pending, "batches_affected": len(batches_touched),
+    }
+
+
+@app.post("/voice-outreach/rescore-existing")
+async def voice_outreach_rescore_existing(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    result = await _voice_rescore_existing_prospects(uid)
+    return {"success": True, **result}
+
+
 class VoiceBatchBuildRequest(BaseModel):
     industry:      str
     city:          str = ""
@@ -21924,7 +22101,7 @@ _VOICE_PROSPECT_COLS = [
     "weaknesses_json", "evidence_json", "dnc_status", "dnd_scrub_status", "cooldown_status",
     "cooldown_until", "last_contacted_at", "missing_phone", "gate_blocked", "gate_block_reasons_json",
     "approval_status", "approved_by", "approved_at", "rejected_reason", "script_id", "lead_id",
-    "created_at", "updated_at",
+    "created_at", "updated_at", "rescore_note",
 ]
 
 
@@ -22419,6 +22596,7 @@ for _vtbl, _vcol, _vtype in [
     ("voice_calls", "is_dry_run", "BOOLEAN DEFAULT FALSE"),
     ("voice_transcripts", "is_synthetic", "BOOLEAN DEFAULT FALSE"),
     ("voice_settings", "call_mode", "TEXT DEFAULT 'dry_run'"),
+    ("voice_prospects", "rescore_note", "TEXT"),  # Fix 3: visible "rescored after fix" note in the Review UI
 ]:
     try:
         with engine.begin() as _vmc:
