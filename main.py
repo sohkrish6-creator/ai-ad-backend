@@ -21867,6 +21867,32 @@ def _voice_apply_enterprise_filter(enriched: list, name_counts: dict, settings: 
     return admitted, filtered
 
 
+_VOICE_PRIORITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _voice_cap_priority(priority, confidence_score) -> str:
+    """Fix 5 (bug-fix pass): a low-confidence evidence signal must never
+    still produce a 'High' priority prospect — confidence < 70% caps at
+    Medium, confidence < 50% caps at Low, regardless of what the
+    qualification model itself returned. Only ever caps DOWN, never raises
+    a priority the model gave a lower rating than the cap would allow.
+    Applied both at fresh scoring time and every time a prospect is
+    rescored, so it can't drift out of sync between the two call sites."""
+    priority = (priority or "").strip().lower()
+    if priority not in _VOICE_PRIORITY_RANK:
+        return priority
+    confidence_score = confidence_score if confidence_score is not None else 100
+    if confidence_score < 50:
+        cap = "low"
+    elif confidence_score < 70:
+        cap = "medium"
+    else:
+        cap = "high"
+    if _VOICE_PRIORITY_RANK[priority] > _VOICE_PRIORITY_RANK[cap]:
+        return cap
+    return priority
+
+
 async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int):
     now = datetime.utcnow().isoformat()
     _voice_batch_update(batch_id, status="running", started_at=now, current_step="Searching Google Places", progress_pct=5)
@@ -21983,7 +22009,8 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "google_rating": p["google_rating"], "total_reviews": p["total_reviews"],
                 "business_status": p["business_status"],
                 "opportunity_score": score.get("opportunity_score"), "business_score": score.get("business_score"),
-                "confidence_score": confidence_score, "priority": score.get("priority"),
+                "confidence_score": confidence_score,
+                "priority": _voice_cap_priority(score.get("priority"), confidence_score),
                 "reason": score.get("reason"), "estimated_roi": score.get("estimated_roi"),
                 "estimated_call_success": score.get("estimated_call_success"),
                 "weaknesses_json": json.dumps(p["weaknesses"]), "evidence_json": json.dumps(p["evidence"]),
@@ -22120,7 +22147,8 @@ async def _voice_rescore_existing_prospects(user_id: str) -> dict:
                 ), {
                     "w": json.dumps(p["weaknesses"]), "e": json.dumps(p["evidence"]),
                     "score": new.get("opportunity_score", old_score), "bscore": new.get("business_score"),
-                    "conf": new_confidence, "prio": new.get("priority"), "reason": new.get("reason"),
+                    "conf": new_confidence, "prio": _voice_cap_priority(new.get("priority"), new_confidence),
+                    "reason": new.get("reason"),
                     "roi": new.get("estimated_roi"), "succ": new.get("estimated_call_success"),
                     "note": note, "appr": ("pending" if revert else p["approval_status"]),
                     "revert": revert, "ts": now, "id": p["id"],
