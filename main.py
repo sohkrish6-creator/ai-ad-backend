@@ -126,6 +126,15 @@ _PUBLIC_PATH_PREFIXES = (
 # so it must bypass both regardless of HTTP method (it's a POST).
 _LOGIN_PATH = "/admin/website/login"
 
+# Inbound webhooks authenticate via their own payload signature (HMAC,
+# verified inside the handler against VAPI_WEBHOOK_SECRET) — the caller
+# (Vapi, or our own dry-run self-POST) has no Supabase JWT to present, so
+# this bypasses the auth gate the same way _LOGIN_PATH does, regardless of
+# HTTP method.
+_WEBHOOK_PATHS = {
+    "/voice-outreach/call-webhook",
+}
+
 # Service/automation endpoints (e.g. n8n) that authenticate with X-API-Key only —
 # they have no Supabase user session to attach a JWT to, so once ADSOH_API_KEY
 # has verified the caller, the JWT gate below is skipped for these paths.
@@ -252,7 +261,7 @@ async def auth_middleware(request: Request, call_next):
         request.method == "GET" and (
             _norm_path in _PUBLIC_PATHS or _norm_path.startswith(_PUBLIC_PATH_PREFIXES)
         )
-    ) or _norm_path == _LOGIN_PATH
+    ) or _norm_path == _LOGIN_PATH or _norm_path in _WEBHOOK_PATHS
     logger.info(f"[AUTH] method={request.method} raw_path={_raw_path!r} norm_path={_norm_path!r} is_public={_is_public} public_paths={_PUBLIC_PATHS}")
 
     # 1. X-API-Key (existing gate, unchanged behaviour) — for /admin/website/*
@@ -22929,4 +22938,501 @@ async def voice_outreach_get_call(call_id: int, request: Request):
     return {
         "success": True, "call": call, "prospect": prospect, "transcript": transcript,
         "analysis": analysis, "followups": followups, "crm": crm,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI VOICE OUTREACH — PHASE 3 (webhook, analysis, CRM, follow-ups, analytics, learning)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CRM ANSWER (investigated before writing any code here, not decided
+#  silently): lead_notes/lead_timeline_events are NOT duplicates of anything
+#  — the only pre-existing CRM structure anywhere in this codebase is the
+#  flat `leads` table (no notes/timeline capability at all). They stay and
+#  become the real integration point below. PUT /leads/{id} has NO user_id
+#  ownership filter and accepts any free-text status — never called from
+#  here; all writes go through _voice_crm_sync with proper user_id scoping.
+#  Real lead statuses are New/Contacted/Converted/Lost (not the spec's
+#  Won/Closed/Customer) — this module only ever sets 'Contacted', and only
+#  advancing from 'New', never 'Converted'/'Lost' (human-only decisions).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/voice-outreach/call-webhook")
+async def voice_outreach_call_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get(VAPI_WEBHOOK_SIGNATURE_HEADER, "")
+    if not _verify_vapi_webhook_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    message = payload.get("message", {}) or {}
+    if message.get("type") != "end-of-call-report":
+        return {"success": True, "ignored": True}
+
+    vapi_call_id = (message.get("call") or {}).get("id", "")
+    if not vapi_call_id:
+        raise HTTPException(status_code=400, detail="Missing call id in payload")
+
+    # Idempotency — a duplicate delivery of the same call is a no-op, not an
+    # error, per the spec's explicit requirement (unique on vapi_call_id).
+    with engine.connect() as conn:
+        existing = conn.execute(text(
+            "SELECT id FROM voice_transcripts WHERE vapi_call_id=:vid"
+        ), {"vid": vapi_call_id}).fetchone()
+    if existing:
+        return {"success": True, "duplicate": True}
+
+    # Respond 200 immediately; everything else happens in the background —
+    # translates "processing in a BullMQ job" onto the same asyncio pattern
+    # every other background task in this module uses.
+    asyncio.create_task(_process_call_webhook_payload(vapi_call_id, message))
+    return {"success": True}
+
+
+async def _process_call_webhook_payload(vapi_call_id: str, message: dict):
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT id, user_id, prospect_id, is_test, is_dry_run FROM voice_calls WHERE vapi_call_id=:vid"
+        ), {"vid": vapi_call_id}).fetchone()
+    if not row:
+        logger.warning(f"[VOICE-WEBHOOK] no voice_calls row for vapi_call_id={vapi_call_id!r} — dropping")
+        return
+    call_id, user_id, prospect_id, is_test, is_dry_run = row
+
+    duration = int(message.get("durationSeconds") or 0)
+    ended_reason = message.get("endedReason", "") or ""
+    recording_url = message.get("recordingUrl")
+    transcript_text = message.get("transcript", "") or ""
+    transcript_turns = (message.get("artifact") or {}).get("messages") or []
+    now = datetime.utcnow().isoformat()
+
+    _voice_calls_update(call_id, status="ended", duration_seconds=duration, ended_at=now, error=None)
+
+    settings = _get_or_create_voice_settings(user_id)
+    # Duration x the tenant's blended rate, not Vapi's cost sub-schema — more
+    # robust than depending on undocumented cost-breakdown field names we
+    # haven't observed in a real delivery yet, and works identically for
+    # dry-run (which has no real cost at all) and live.
+    total_micros = int(round((duration / 60) * settings["blended_rate_per_minute_micros"])) if duration else 0
+    month = now[:7]
+    connected = 0 if ended_reason == "voicemail" else 1
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO voice_transcripts (call_id, vapi_call_id, user_id, transcript_text, transcript_json, "
+            "recording_url, is_synthetic, received_at) VALUES (:cid, :vid, :uid, :txt, :tj, :rec, :syn, :ts)"
+        ), {
+            "cid": call_id, "vid": vapi_call_id, "uid": user_id, "txt": transcript_text,
+            "tj": json.dumps(transcript_turns), "rec": recording_url, "syn": bool(is_dry_run), "ts": now,
+        })
+        conn.execute(text(
+            "INSERT INTO voice_costs (call_id, prospect_id, user_id, cost_type, total_micros, currency, created_at) "
+            "VALUES (:cid, :pid, :uid, 'actual', :tot, 'INR', :ts)"
+        ), {"cid": call_id, "pid": prospect_id, "uid": user_id, "tot": total_micros, "ts": now})
+        conn.execute(text(
+            "INSERT INTO voice_usage (user_id, month, calls_count, minutes_used, total_cost_micros, connected_count, updated_at) "
+            "VALUES (:uid, :month, 1, :mins, :tot, :conn, :ts) "
+            "ON CONFLICT(user_id, month) DO UPDATE SET calls_count=voice_usage.calls_count+1, "
+            "minutes_used=voice_usage.minutes_used+:mins, total_cost_micros=voice_usage.total_cost_micros+:tot, "
+            "connected_count=voice_usage.connected_count+:conn, updated_at=:ts"
+        ), {"uid": user_id, "month": month, "mins": duration / 60, "tot": total_micros, "conn": connected, "ts": now})
+
+    if is_test:
+        return  # no real prospect to analyze/sync/follow-up for a test call
+
+    try:
+        await _analyze_voice_transcript(call_id)
+    except Exception as _ae:
+        logger.error(f"[VOICE-WEBHOOK] analysis failed for call {call_id}: {_ae}\n{_traceback.format_exc()}")
+
+
+_VOICE_CLASSIFICATIONS = [
+    "Interested", "Callback Requested", "Not Interested", "Wrong Contact",
+    "Voicemail", "Busy", "Unknown",
+]
+
+
+async def _analyze_voice_transcript(call_id: int):
+    """GPT-4o-mini via Phase 1's _call_gpt_json_with_retry — this IS the
+    truncation-safe retry pattern the spec asks to reuse from Prospect
+    Discovery (confirmed in Phase 1 that Prospect Discovery itself has no
+    such retry; the real reusable infra is the one Phase 1 built)."""
+    with engine.connect() as conn:
+        trow = conn.execute(text(
+            "SELECT vt.transcript_text, vt.transcript_json, vc.user_id "
+            "FROM voice_transcripts vt JOIN voice_calls vc ON vc.id = vt.call_id WHERE vt.call_id=:id"
+        ), {"id": call_id}).fetchone()
+    if not trow:
+        return
+    transcript_text, transcript_json, user_id = trow
+    try:
+        turns = json.loads(transcript_json or "[]")
+    except Exception:
+        turns = []
+    numbered = "\n".join(f"[{t.get('turn')}] {t.get('role', '').upper()}: {t.get('text', '')}" for t in turns) or transcript_text
+
+    def _build_messages(correction):
+        prompt = (
+            "You are analyzing a REAL sales phone call transcript for a B2B outreach team. The transcript below "
+            "has numbered turns in [brackets] — cite the exact turn number(s) as evidence for every field you "
+            "extract. If a field genuinely isn't discussed, its value must be null (or an empty list) and "
+            "excerpt_turn_indices must be an empty list — never guess or infer information the transcript doesn't "
+            "actually contain.\n\n"
+            f"TRANSCRIPT:\n{numbered}\n\n"
+            + (f"{correction}\n\n" if correction else "") +
+            "Return JSON with this exact shape — every extracted field as "
+            '{"value": ..., "confidence": 0.0-1.0, "excerpt_turn_indices": [int, ...]}:\n'
+            "{\n"
+            '  "decision_maker": {"value": true_or_false_or_null, "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "company_name": {"value": "string_or_null", "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "pain_points": {"value": ["..."], "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "needs": {"value": ["..."], "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "budget": {"value": "string_or_null", "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "timeline": {"value": "string_or_null", "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "current_marketing": {"value": "string_or_null", "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "objections": {"value": ["..."], "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "competitors": {"value": ["..."], "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "interest_level": {"value": "high_or_medium_or_low_or_null", "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "meeting_requested": {"value": true_or_false, "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "callback_requested": {"value": true_or_false, "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "email_requested": {"value": true_or_false, "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "opt_out_requested": {"value": true_or_false, "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "sentiment": {"value": "positive_or_neutral_or_negative", "confidence": 0.0, "excerpt_turn_indices": []},\n'
+            '  "classification": "one_of: Interested, Callback Requested, Not Interested, Wrong Contact, Voicemail, Busy, Unknown",\n'
+            '  "classification_confidence": 0.0\n'
+            "}\nReturn ONLY valid JSON, no markdown."
+        )
+        return [{"role": "user", "content": prompt}]
+
+    extracted = await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o-mini", max_tokens=1800, temperature=0.2, retries=1,
+        label=f"voice-outreach call analysis (call {call_id})",
+    )
+
+    classification = extracted.pop("classification", "Unknown")
+    if classification not in _VOICE_CLASSIFICATIONS:
+        classification = "Unknown"
+    classification_confidence = float(extracted.pop("classification_confidence", 0) or 0)
+    sentiment = (extracted.get("sentiment") or {}).get("value") or "neutral"
+    opt_out = bool((extracted.get("opt_out_requested") or {}).get("value"))
+    needs_review = classification_confidence < 0.80
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO voice_analysis (call_id, user_id, extracted_json, classification, classification_confidence, "
+            "sentiment, opt_out_requested, needs_human_review, created_at) "
+            "VALUES (:cid, :uid, :ext, :cls, :conf, :sent, :opt, :nr, :ts)"
+        ), {
+            "cid": call_id, "uid": user_id, "ext": json.dumps(extracted), "cls": classification,
+            "conf": classification_confidence, "sent": sentiment, "opt": opt_out, "nr": needs_review, "ts": now,
+        })
+
+    # Opt-out -> automatic DNC insert. The one unreviewed automated write in
+    # this module, exactly as specified.
+    if opt_out:
+        with engine.connect() as conn:
+            crow = conn.execute(text("SELECT dialed_number FROM voice_calls WHERE id=:id"), {"id": call_id}).fetchone()
+        phone = crow[0] if crow else None
+        if phone:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO voice_dnc_list (user_id, phone_e164, reason, source_call_id, added_by, created_at) "
+                    "VALUES (:uid, :phone, 'opt_out_on_call', :cid, 'system', :ts) "
+                    "ON CONFLICT (user_id, phone_e164) DO UPDATE SET reason='opt_out_on_call', source_call_id=:cid"
+                ), {"uid": user_id, "phone": phone, "cid": call_id, "ts": now})
+
+    # CRM sync always runs (a factual log that contact happened) — follow-up
+    # drafting is gated on review for low-confidence calls, per the spec's
+    # "review unlocks downstream follow-up drafts."
+    await _voice_crm_sync(call_id, classification, extracted, user_id)
+    if not needs_review:
+        await _voice_generate_followup_drafts(call_id, classification, extracted, user_id)
+
+
+async def _voice_crm_sync(call_id: int, classification: str, extracted: dict, user_id: str):
+    with engine.connect() as conn:
+        call_row = conn.execute(text(
+            "SELECT prospect_id, dialed_number, duration_seconds, outcome FROM voice_calls WHERE id=:id"
+        ), {"id": call_id}).fetchone()
+    if not call_row or not call_row[0]:
+        return  # test call / no linked prospect — nothing real to sync
+    prospect_id, phone, duration, outcome = call_row
+
+    with engine.connect() as conn:
+        prow = conn.execute(text("SELECT business_name, lead_id FROM voice_prospects WHERE id=:id"), {"id": prospect_id}).fetchone()
+    if not prow:
+        return
+    business_name, lead_id = prow
+    now = datetime.utcnow().isoformat()
+
+    with engine.begin() as conn:
+        if not lead_id:
+            existing = conn.execute(text(
+                "SELECT id FROM leads WHERE user_id=:uid AND phone=:phone"
+            ), {"uid": user_id, "phone": phone}).fetchone()
+            if existing:
+                lead_id = existing[0]
+            else:
+                lead_id = conn.execute(text(
+                    "INSERT INTO leads (name, phone, source, status, user_id, created_at) "
+                    "VALUES (:name, :phone, 'voice_outreach', 'New', :uid, :ts) RETURNING id"
+                ), {"name": business_name, "phone": phone, "uid": user_id, "ts": now}).scalar()
+            conn.execute(text("UPDATE voice_prospects SET lead_id=:lid WHERE id=:pid"), {"lid": lead_id, "pid": prospect_id})
+
+        # Never Converted/Lost (human-only) — only Contacted, only advancing from New.
+        # Deliberately NOT the unscoped PUT /leads/{id} (no ownership filter there).
+        conn.execute(text("UPDATE leads SET status='Contacted' WHERE id=:lid AND status='New'"), {"lid": lead_id})
+
+        pain_points = (extracted.get("pain_points") or {}).get("value") or []
+        interest = (extracted.get("interest_level") or {}).get("value")
+        note_text = (
+            f"Voice outreach call — classification: {classification}"
+            + (f", interest: {interest}" if interest else "") + f". Duration: {duration or 0}s."
+            + (f" Pain points: {', '.join(pain_points)}." if pain_points else "")
+        )
+        conn.execute(text(
+            "INSERT INTO lead_notes (lead_id, user_id, note_text, source, created_by, created_at) "
+            "VALUES (:lid, :uid, :note, 'voice_outreach', 'system', :ts)"
+        ), {"lid": lead_id, "uid": user_id, "note": note_text, "ts": now})
+        conn.execute(text(
+            "INSERT INTO lead_timeline_events (lead_id, user_id, event_type, event_data_json, source, created_at) "
+            "VALUES (:lid, :uid, 'voice_call', :data, 'voice_outreach', :ts)"
+        ), {"lid": lead_id, "uid": user_id, "data": json.dumps({
+            "call_id": call_id, "classification": classification, "duration_seconds": duration, "outcome": outcome,
+        }), "ts": now})
+
+
+_VOICE_FOLLOWUP_CHANNEL_BY_SIGNAL = {
+    "meeting_requested": "meeting_invite",
+    "callback_requested": "sms",
+    "email_requested": "email",
+}
+
+
+async def _voice_generate_followup_drafts(call_id: int, classification: str, extracted: dict, user_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT vc.prospect_id, vp.business_name FROM voice_calls vc "
+            "LEFT JOIN voice_prospects vp ON vp.id = vc.prospect_id WHERE vc.id=:id"
+        ), {"id": call_id}).fetchone()
+    if not row or not row[0]:
+        return
+    prospect_id, business_name = row
+
+    channels = [ch for field, ch in _VOICE_FOLLOWUP_CHANNEL_BY_SIGNAL.items() if (extracted.get(field) or {}).get("value")]
+    if classification == "Interested" and "email" not in channels:
+        channels.append("email")
+    if not channels:
+        return
+
+    pain_points = (extracted.get("pain_points") or {}).get("value") or []
+    needs = (extracted.get("needs") or {}).get("value") or []
+
+    def _build_messages(correction):
+        prompt = (
+            f"Write short, human-sounding follow-up message drafts for {business_name or 'this prospect'} after a "
+            f"real sales phone call classified as '{classification}'. Real detected pain points: "
+            f"{', '.join(pain_points) or 'none noted'}. Real detected needs: {', '.join(needs) or 'none noted'}. "
+            "Do not fabricate details the call didn't actually surface — these are DRAFTS a human reviews before "
+            "anything is sent.\n" + (f"{correction}\n" if correction else "") +
+            "Return JSON:\n{\n" + ",\n".join(f'  "{c}": "draft text"' for c in channels) + "\n}\nReturn ONLY valid JSON."
+        )
+        return [{"role": "user", "content": prompt}]
+
+    drafts = await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o-mini", max_tokens=800, temperature=0.4, retries=1,
+        label=f"voice-outreach follow-up drafts (call {call_id})",
+    )
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        for channel in channels:
+            content = drafts.get(channel)
+            if not content:
+                continue
+            conn.execute(text(
+                "INSERT INTO voice_followups (call_id, prospect_id, user_id, channel, draft_content, status, created_at) "
+                "VALUES (:cid, :pid, :uid, :ch, :content, 'draft', :ts)"
+            ), {"cid": call_id, "pid": prospect_id, "uid": user_id, "ch": channel, "content": content, "ts": now})
+
+
+class VoiceAnalysisReviewRequest(BaseModel):
+    classification: str
+
+
+@app.post("/voice-outreach/analysis/{analysis_id}/review")
+async def voice_outreach_review_analysis(analysis_id: int, payload: VoiceAnalysisReviewRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if payload.classification not in _VOICE_CLASSIFICATIONS:
+        raise HTTPException(status_code=400, detail=f"classification must be one of {_VOICE_CLASSIFICATIONS}")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT call_id, extracted_json FROM voice_analysis WHERE id=:id AND user_id=:uid"
+        ), {"id": analysis_id, "uid": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        call_id, extracted_json = row
+        conn.execute(text(
+            "UPDATE voice_analysis SET classification=:cls, needs_human_review=FALSE, reviewed_by=:uid, reviewed_at=:ts WHERE id=:id"
+        ), {"cls": payload.classification, "uid": uid, "ts": now, "id": analysis_id})
+    try:
+        extracted = json.loads(extracted_json or "{}")
+    except Exception:
+        extracted = {}
+    await _voice_generate_followup_drafts(call_id, payload.classification, extracted, uid)
+    return {"success": True}
+
+
+class VoiceFollowupEditRequest(BaseModel):
+    draft_content: str
+
+
+@app.patch("/voice-outreach/followups/{followup_id}")
+async def voice_outreach_edit_followup(followup_id: int, payload: VoiceFollowupEditRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.begin() as conn:
+        result = conn.execute(text(
+            "UPDATE voice_followups SET draft_content=:content WHERE id=:id AND user_id=:uid AND status='draft'"
+        ), {"content": payload.draft_content, "id": followup_id, "uid": uid})
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Follow-up not found or not editable")
+    return {"success": True}
+
+
+@app.post("/voice-outreach/followups/{followup_id}/approve")
+async def voice_outreach_approve_followup(followup_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        result = conn.execute(text(
+            "UPDATE voice_followups SET status='approved', approved_by=:uid, approved_at=:ts "
+            "WHERE id=:id AND user_id=:uid AND status='draft'"
+        ), {"uid": uid, "ts": now, "id": followup_id})
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Follow-up not found or not in draft status")
+    return {"success": True}
+
+
+@app.get("/voice-outreach/analytics")
+async def voice_outreach_analytics(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        calls = conn.execute(text(
+            "SELECT id, status, outcome, duration_seconds FROM voice_calls WHERE user_id=:uid AND is_test=FALSE AND is_dry_run=FALSE"
+        ), {"uid": uid}).fetchall()
+        cost_total = conn.execute(text(
+            "SELECT COALESCE(SUM(vco.total_micros), 0) FROM voice_costs vco "
+            "JOIN voice_calls vc ON vc.id = vco.call_id WHERE vco.user_id=:uid AND vc.is_test=FALSE AND vc.is_dry_run=FALSE"
+        ), {"uid": uid}).scalar()
+        analysis_rows = conn.execute(text(
+            "SELECT va.classification, va.sentiment, va.needs_human_review, va.extracted_json FROM voice_analysis va "
+            "JOIN voice_calls vc ON vc.id = va.call_id WHERE va.user_id=:uid AND vc.is_test=FALSE AND vc.is_dry_run=FALSE"
+        ), {"uid": uid}).fetchall()
+
+    total = len(calls)
+    ended = [c for c in calls if c[1] == "ended"]
+    connected = [c for c in ended if c[2] != "voicemail"]
+    total_minutes = round(sum((c[3] or 0) for c in calls) / 60, 1)
+
+    classifications = {}
+    sentiments = {"positive": 0, "neutral": 0, "negative": 0}
+    needs_review_count = 0
+    meetings = 0
+    for cls, sent, needs_review, extracted_json in analysis_rows:
+        classifications[cls] = classifications.get(cls, 0) + 1
+        if sent in sentiments:
+            sentiments[sent] += 1
+        if needs_review:
+            needs_review_count += 1
+        try:
+            ext = json.loads(extracted_json or "{}")
+            if (ext.get("meeting_requested") or {}).get("value"):
+                meetings += 1
+        except Exception:
+            pass
+
+    callback_count = classifications.get("Callback Requested", 0)
+    analyzed_total = len(analysis_rows)
+
+    return {
+        "success": True,
+        "total_calls": total,
+        "connected_pct": round(100 * len(connected) / total, 1) if total else 0,
+        "avg_duration_seconds": round(sum((c[3] or 0) for c in ended) / len(ended), 1) if ended else 0,
+        "sentiment_split": sentiments,
+        "callback_pct": round(100 * callback_count / analyzed_total, 1) if analyzed_total else 0,
+        "meetings_booked": meetings,
+        "minutes_used": total_minutes,
+        "total_cost_inr": round((cost_total or 0) / 1_000_000, 2),
+        "human_review_pct": round(100 * needs_review_count / analyzed_total, 1) if analyzed_total else 0,
+        "classification_breakdown": classifications,
+        "note": "Excludes is_test and is_dry_run calls throughout.",
+    }
+
+
+@app.get("/voice-outreach/learning-insights")
+async def voice_outreach_learning_insights(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT vb.industry, va2.personality, vc.duration_seconds, va.classification, va.extracted_json "
+            "FROM voice_calls vc "
+            "JOIN voice_analysis va ON va.call_id = vc.id "
+            "LEFT JOIN voice_prospects vp ON vp.id = vc.prospect_id "
+            "LEFT JOIN voice_batches vb ON vb.id = vp.batch_id "
+            "LEFT JOIN voice_agents va2 ON va2.id = vc.agent_id "
+            "WHERE vc.user_id=:uid AND vc.is_test=FALSE AND vc.is_dry_run=FALSE"
+        ), {"uid": uid}).fetchall()
+
+    buckets = {}
+    objection_counts = {}
+    for industry, personality, duration, classification, extracted_json in rows:
+        key = f"{industry or 'unknown'} / {personality or 'unassigned'}"
+        b = buckets.setdefault(key, {"calls": 0, "positive": 0, "meetings": 0, "total_duration": 0})
+        b["calls"] += 1
+        b["total_duration"] += duration or 0
+        if classification in ("Interested", "Callback Requested"):
+            b["positive"] += 1
+        try:
+            ext = json.loads(extracted_json or "{}")
+            if (ext.get("meeting_requested") or {}).get("value"):
+                b["meetings"] += 1
+            for o in (ext.get("objections") or {}).get("value") or []:
+                objection_counts[o] = objection_counts.get(o, 0) + 1
+        except Exception:
+            pass
+
+    recommendations = []
+    for key, b in buckets.items():
+        if b["calls"] < 3:
+            continue  # too few calls for the rate to mean anything
+        recommendations.append({
+            "segment": key, "calls": b["calls"],
+            "conversion_rate": round(b["positive"] / b["calls"], 2),
+            "meeting_rate": round(b["meetings"] / b["calls"], 2),
+            "avg_duration_seconds": round(b["total_duration"] / b["calls"], 1),
+        })
+    recommendations.sort(key=lambda r: r["conversion_rate"], reverse=True)
+    common_objections = sorted(objection_counts.items(), key=lambda x: -x[1])[:10]
+
+    return {
+        "success": True,
+        "segments": recommendations,
+        "common_objections": [{"objection": o, "count": c} for o, c in common_objections],
+        "note": "Recommendations only — never auto-applied. Excludes is_test and is_dry_run calls.",
     }
