@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from PIL import Image
 import io
 import bcrypt
+import phonenumbers
 from openai import OpenAI
 import httpx
 from datetime import datetime, date, timedelta
@@ -21105,3 +21106,1224 @@ async def delete_website_admin_user(user_id: int, caller: dict = Depends(_requir
 @app.get("/admin-panel/website-admin.html")
 async def serve_website_admin_panel():
     return FileResponse("static/website-admin.html")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AI VOICE OUTREACH — PHASE 1 (schema, batch builder, qualification, versioned
+#  scripts, review screen with compliance gates). NO LIVE CALLING IN THIS PHASE —
+#  zero Vapi API calls, nothing that costs money or touches a real phone.
+#
+#  Isolation: user_id (no tenant_id/RLS anywhere in this codebase — matches the
+#  established single-user-per-account model used by every other table).
+#
+#  DEFERRED TO PHASE 2 (real Vapi calls, base-assistant+overrides architecture,
+#  asyncio-queue with concurrency/rate limiting mirroring gads_import_jobs,
+#  calling-window enforcement at dial time, Test Call) AND PHASE 3 (signature-
+#  verified idempotent webhook, transcript storage, GPT-4o-mini conversation
+#  analysis with confidence-gated fields, opt-out-to-DNC automation, CRM writes,
+#  follow-up drafts, analytics, learning engine) — schema for those phases is
+#  created now (voice_calls/voice_transcripts/voice_analysis/voice_followups/
+#  voice_costs/voice_usage) so those endpoints have somewhere to write without a
+#  mid-build migration, but Phase 1 never inserts rows into them.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_VOICE_DDL = """
+CREATE TABLE IF NOT EXISTS voice_batches (
+    id                TEXT PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    industry          TEXT NOT NULL,
+    city              TEXT DEFAULT '',
+    max_prospects     INTEGER DEFAULT 15,
+    status            TEXT NOT NULL DEFAULT 'queued',
+    progress_pct      INTEGER DEFAULT 0,
+    current_step      TEXT,
+    total_found       INTEGER DEFAULT 0,
+    total_qualified   INTEGER DEFAULT 0,
+    error             TEXT,
+    started_at        TEXT,
+    finished_at       TEXT,
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_prospects (
+    id                        BIGSERIAL PRIMARY KEY,
+    batch_id                  TEXT NOT NULL,
+    user_id                   TEXT NOT NULL,
+    place_id                  TEXT,
+    business_name             TEXT NOT NULL,
+    address                   TEXT,
+    phone_raw                 TEXT,
+    phone_e164                TEXT,
+    website                   TEXT,
+    google_rating             REAL,
+    total_reviews             INTEGER DEFAULT 0,
+    business_status           TEXT,
+    opportunity_score         INTEGER,
+    business_score            INTEGER,
+    confidence_score          INTEGER,
+    priority                  TEXT,
+    reason                    TEXT,
+    estimated_roi             TEXT,
+    estimated_call_success    TEXT,
+    weaknesses_json           TEXT,
+    evidence_json             TEXT,
+    dnc_status                TEXT DEFAULT 'unknown',
+    dnd_scrub_status          TEXT DEFAULT 'not_checked',
+    cooldown_status           TEXT DEFAULT 'clear',
+    cooldown_until            TEXT,
+    last_contacted_at         TEXT,
+    missing_phone             BOOLEAN DEFAULT FALSE,
+    gate_blocked              BOOLEAN DEFAULT FALSE,
+    gate_block_reasons_json   TEXT,
+    approval_status           TEXT DEFAULT 'pending',
+    approved_by               TEXT,
+    approved_at               TEXT,
+    rejected_reason           TEXT,
+    script_id                 BIGINT,
+    lead_id                   INTEGER,
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT
+);
+
+CREATE TABLE IF NOT EXISTS voice_scripts (
+    id                        BIGSERIAL PRIMARY KEY,
+    prospect_id               BIGINT NOT NULL,
+    user_id                   TEXT NOT NULL,
+    version                   INTEGER NOT NULL DEFAULT 1,
+    is_current                BOOLEAN DEFAULT TRUE,
+    script_template_id        TEXT,
+    disclosure_line           TEXT NOT NULL,
+    opening                   TEXT,
+    rapport                   TEXT,
+    discovery_questions_json  TEXT,
+    pain_point                TEXT,
+    value_prop                TEXT,
+    social_proof               TEXT,
+    objection_handling_json    TEXT,
+    meeting_close               TEXT,
+    follow_up                    TEXT,
+    variables_json                 TEXT,
+    edited_by_user                  BOOLEAN DEFAULT FALSE,
+    source                            TEXT DEFAULT 'outreach_ai',
+    created_at                         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_agents (
+    id                 BIGSERIAL PRIMARY KEY,
+    user_id            TEXT,
+    name               TEXT NOT NULL,
+    personality        TEXT NOT NULL,
+    language           TEXT NOT NULL,
+    vapi_assistant_id  TEXT,
+    voice_id           TEXT,
+    is_active          BOOLEAN DEFAULT TRUE,
+    is_default         BOOLEAN DEFAULT FALSE,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS voice_calls (
+    id                 BIGSERIAL PRIMARY KEY,
+    user_id            TEXT NOT NULL,
+    prospect_id        BIGINT NOT NULL,
+    script_id          BIGINT,
+    agent_id           BIGINT,
+    vapi_call_id       TEXT UNIQUE,
+    caller_number      TEXT,
+    dialed_number      TEXT,
+    status             TEXT DEFAULT 'queued',
+    outcome            TEXT,
+    duration_seconds   INTEGER DEFAULT 0,
+    is_test            BOOLEAN DEFAULT FALSE,
+    retry_count        INTEGER DEFAULT 0,
+    scheduled_at       TEXT,
+    started_at         TEXT,
+    ended_at           TEXT,
+    error              TEXT,
+    created_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_transcripts (
+    id                 BIGSERIAL PRIMARY KEY,
+    call_id            BIGINT NOT NULL UNIQUE,
+    vapi_call_id       TEXT UNIQUE,
+    user_id            TEXT NOT NULL,
+    transcript_text    TEXT,
+    transcript_json    TEXT,
+    recording_url      TEXT,
+    received_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_analysis (
+    id                          BIGSERIAL PRIMARY KEY,
+    call_id                     BIGINT NOT NULL UNIQUE,
+    user_id                     TEXT NOT NULL,
+    extracted_json               TEXT,
+    classification              TEXT,
+    classification_confidence   REAL,
+    sentiment                   TEXT,
+    opt_out_requested           BOOLEAN DEFAULT FALSE,
+    needs_human_review          BOOLEAN DEFAULT FALSE,
+    reviewed_by                 TEXT,
+    reviewed_at                 TEXT,
+    created_at                  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_followups (
+    id             BIGSERIAL PRIMARY KEY,
+    call_id        BIGINT NOT NULL,
+    prospect_id    BIGINT NOT NULL,
+    user_id        TEXT NOT NULL,
+    channel        TEXT NOT NULL,
+    draft_content  TEXT,
+    status         TEXT DEFAULT 'draft',
+    approved_by    TEXT,
+    approved_at    TEXT,
+    sent_at        TEXT,
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_costs (
+    id                 BIGSERIAL PRIMARY KEY,
+    call_id            BIGINT,
+    prospect_id        BIGINT,
+    user_id            TEXT NOT NULL,
+    cost_type          TEXT NOT NULL,
+    telephony_micros   BIGINT DEFAULT 0,
+    tts_micros         BIGINT DEFAULT 0,
+    llm_micros         BIGINT DEFAULT 0,
+    vapi_fee_micros    BIGINT DEFAULT 0,
+    total_micros       BIGINT DEFAULT 0,
+    currency           TEXT DEFAULT 'INR',
+    created_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_usage (
+    id                 BIGSERIAL PRIMARY KEY,
+    user_id            TEXT NOT NULL,
+    month              TEXT NOT NULL,
+    calls_count        INTEGER DEFAULT 0,
+    minutes_used       REAL DEFAULT 0,
+    total_cost_micros  BIGINT DEFAULT 0,
+    connected_count    INTEGER DEFAULT 0,
+    meetings_booked    INTEGER DEFAULT 0,
+    updated_at         TEXT,
+    UNIQUE(user_id, month)
+);
+
+CREATE TABLE IF NOT EXISTS voice_dnc_list (
+    id             BIGSERIAL PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    phone_e164     TEXT NOT NULL,
+    reason         TEXT,
+    source_call_id BIGINT,
+    added_by       TEXT,
+    created_at     TEXT NOT NULL,
+    UNIQUE(user_id, phone_e164)
+);
+
+CREATE TABLE IF NOT EXISTS voice_settings (
+    id                                     BIGSERIAL PRIMARY KEY,
+    user_id                                TEXT UNIQUE NOT NULL,
+    calling_window_start                   TEXT DEFAULT '10:00',
+    calling_window_end                     TEXT DEFAULT '19:00',
+    calling_days_json                      TEXT DEFAULT '["mon","tue","wed","thu","fri","sat"]',
+    timezone                               TEXT DEFAULT 'Asia/Kolkata',
+    compliance_mode                        TEXT DEFAULT 'strict',
+    cooldown_days                          INTEGER DEFAULT 7,
+    max_call_attempts_same_day             INTEGER DEFAULT 1,
+    blended_rate_per_minute_micros         BIGINT DEFAULT 3000000,
+    avg_estimated_call_duration_seconds    INTEGER DEFAULT 180,
+    default_voice_agent_id                 BIGINT,
+    updated_at                             TEXT
+);
+"""
+
+
+def _create_voice_tables():
+    ddl = _VOICE_DDL
+    if _is_sqlite:
+        ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.connect() as conn:
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+        conn.commit()
+    with engine.connect() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_voice_prospects_batch ON voice_prospects(batch_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_voice_prospects_user ON voice_prospects(user_id, approval_status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_voice_calls_prospect ON voice_calls(prospect_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_voice_batches_user ON voice_batches(user_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_voice_scripts_prospect ON voice_scripts(prospect_id, is_current)"))
+        conn.commit()
+    logger.info("[VOICE] voice_* tables ready")
+
+
+# 9 global presets (3 personalities x 3 languages) — user_id=NULL means a
+# shared default preset, not per-user. vapi_assistant_id stays NULL until
+# Phase 2 actually creates the Vapi assistants and backfills these rows.
+_VOICE_AGENT_PRESETS = [
+    (personality, language)
+    for personality in ("Professional", "Friendly", "Premium")
+    for language in ("Hindi", "English", "Hinglish")
+]
+
+
+def _seed_default_voice_agents():
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        existing = conn.execute(text(
+            "SELECT COUNT(*) FROM voice_agents WHERE user_id IS NULL"
+        )).scalar()
+        if existing and existing >= len(_VOICE_AGENT_PRESETS):
+            return
+        for personality, language in _VOICE_AGENT_PRESETS:
+            name = f"{personality} — {language}"
+            already = conn.execute(text(
+                "SELECT 1 FROM voice_agents WHERE user_id IS NULL AND personality=:p AND language=:l"
+            ), {"p": personality, "l": language}).fetchone()
+            if already:
+                continue
+            conn.execute(text(
+                "INSERT INTO voice_agents (name, personality, language, is_active, is_default, created_at) "
+                "VALUES (:name, :p, :l, TRUE, :is_default, :ts)"
+            ), {
+                "name": name, "p": personality, "l": language,
+                "is_default": (personality == "Professional" and language == "Hinglish"),
+                "ts": now,
+            })
+    logger.info("[VOICE] voice_agents presets seeded")
+
+
+try:
+    _create_voice_tables()
+    _seed_default_voice_agents()
+except Exception as _ve:
+    logger.warning(f"[VOICE] Table create/seed failed: {_ve}")
+
+
+_CRM_EXT_DDL = """
+CREATE TABLE IF NOT EXISTS lead_notes (
+    id          BIGSERIAL PRIMARY KEY,
+    lead_id     INTEGER NOT NULL,
+    user_id     TEXT NOT NULL,
+    note_text   TEXT NOT NULL,
+    source      TEXT DEFAULT 'manual',
+    created_by  TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lead_timeline_events (
+    id               BIGSERIAL PRIMARY KEY,
+    lead_id          INTEGER NOT NULL,
+    user_id          TEXT NOT NULL,
+    event_type       TEXT NOT NULL,
+    event_data_json  TEXT,
+    source           TEXT DEFAULT 'manual',
+    created_at       TEXT NOT NULL
+);
+"""
+
+
+def _create_crm_ext_tables():
+    ddl = _CRM_EXT_DDL
+    if _is_sqlite:
+        ddl = ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.connect() as conn:
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            conn.execute(text(stmt))
+        conn.commit()
+    with engine.connect() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lead_notes_lead ON lead_notes(lead_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lead_timeline_lead ON lead_timeline_events(lead_id)"))
+        conn.commit()
+    logger.info("[CRM-EXT] lead_notes/lead_timeline_events ready")
+
+
+try:
+    _create_crm_ext_tables()
+except Exception as _ce:
+    logger.warning(f"[CRM-EXT] Table create failed: {_ce}")
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _normalize_phone_e164(raw: Optional[str], region: str = "IN") -> Optional[str]:
+    """Real E.164 validation via Google's libphonenumber — no phone-number
+    handling of any kind existed anywhere in this codebase before this module
+    (LeadModel.phone is untyped free text). Returns None for anything that
+    doesn't parse to a genuinely valid, dialable number — never guesses."""
+    if not raw:
+        return None
+    try:
+        p = phonenumbers.parse(raw, region)
+        if phonenumbers.is_valid_number(p):
+            return phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.E164)
+    except phonenumbers.NumberParseException:
+        pass
+    return None
+
+
+async def _fetch_homepage_html_safe(url: str, timeout: float = 8.0) -> str:
+    """Best-effort homepage fetch for weakness detection. Never raises —
+    returns '' on any failure (timeout, DNS, non-2xx, etc.), which itself
+    becomes the 'website_unreachable' signal downstream."""
+    if not url:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client_:
+            resp = await client_.get(url, headers={"User-Agent": "Mozilla/5.0 (AdsohBot)"})
+            if resp.status_code >= 400:
+                return ""
+            return resp.text[:200_000]
+    except Exception:
+        return ""
+
+
+_VOICE_TRACKING_MARKERS = ("gtag(", "gtag.js", "fbq(", "googletagmanager.com/gtm.js", "connect.facebook.net")
+_VOICE_CTA_PHRASES = ("book now", "contact us", "call now", "get a quote", "enquire", "whatsapp us", "order now")
+
+
+def _detect_voice_weaknesses(prospect: dict, html: str) -> tuple:
+    """Real detected signals only — every weakness maps to an actual checked
+    condition with evidence, never fabricated. Evidence shape mirrors the real
+    precedent in gather_bi_data()'s extract_evidence() (type/value/confidence/
+    page), plus a detected_at timestamp for this module's audit needs (that
+    field doesn't exist on the original precedent — deliberate small addition).
+
+    Explicitly NOT attempted here (no real signal available, cut rather than
+    faked): "no Google Ads" (Tavily text is unverified prose, not an ad-network
+    API result), "inactive Instagram"/"no recent content" (no social API
+    integrated), "no WhatsApp" (no WhatsApp Business API check exists),
+    "no landing pages" (needs a real sitemap crawl + page classification, a
+    genuine future feature, not a copy-paste)."""
+    now = datetime.utcnow().isoformat()
+    weaknesses = []
+    evidence = []
+
+    def _add(w_type: str, value, confidence: float, page: str):
+        weaknesses.append(w_type)
+        evidence.append({"type": w_type, "value": value, "confidence": confidence, "page": page, "detected_at": now})
+
+    website = (prospect.get("website") or "").strip()
+    rating = prospect.get("google_rating")
+    total_reviews = prospect.get("total_reviews") or 0
+    business_status = (prospect.get("business_status") or "").upper()
+
+    if not website:
+        _add("no_website", "no website field on Google Business listing", 0.98, "google_places")
+    if rating is not None and total_reviews >= 5 and rating < 3.5:
+        _add("poor_reviews", f"rating={rating} across {total_reviews} reviews", 0.95, "google_places")
+    if total_reviews < 20:
+        _add("low_review_count", f"{total_reviews} total reviews", 0.95, "google_places")
+    if business_status and business_status != "OPERATIONAL":
+        _add("inactive_listing", f"business_status={business_status}", 0.90, "google_places")
+
+    if website:
+        if not html:
+            _add("website_unreachable", f"fetch failed or timed out for {website}", 0.60, "homepage")
+        else:
+            html_lower = html.lower()
+            if not any(m in html_lower for m in _VOICE_TRACKING_MARKERS):
+                _add("missing_tracking", "no GA/GTM/Meta Pixel script tags found in page source", 0.75, "homepage")
+
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+            title_text = title_match.group(1).strip() if title_match else ""
+            if not title_text:
+                _add("weak_seo_title", "missing or empty <title> tag", 0.70, "homepage")
+
+            desc_match = re.search(r'<meta[^>]+name=["\']description["\'][^>]*content=["\'](.*?)["\']', html, re.I | re.S)
+            desc_text = desc_match.group(1).strip() if desc_match else ""
+            if not desc_text or len(desc_text) < 20:
+                _add("weak_seo_meta", f"meta description length={len(desc_text)} chars", 0.70, "homepage")
+
+            if not any(p in html_lower for p in _VOICE_CTA_PHRASES):
+                _add("no_cta", "no recognizable call-to-action phrase found on homepage", 0.55, "homepage")
+
+    return weaknesses, evidence
+
+
+def _get_or_create_voice_settings(user_id: str) -> dict:
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT calling_window_start, calling_window_end, calling_days_json, timezone, compliance_mode, "
+            "cooldown_days, max_call_attempts_same_day, blended_rate_per_minute_micros, "
+            "avg_estimated_call_duration_seconds, default_voice_agent_id, updated_at "
+            "FROM voice_settings WHERE user_id=:uid"
+        ), {"uid": user_id}).fetchone()
+    if row:
+        cols = ["calling_window_start", "calling_window_end", "calling_days_json", "timezone", "compliance_mode",
+                "cooldown_days", "max_call_attempts_same_day", "blended_rate_per_minute_micros",
+                "avg_estimated_call_duration_seconds", "default_voice_agent_id", "updated_at"]
+        settings = dict(zip(cols, row))
+        try:
+            settings["calling_days"] = json.loads(settings.pop("calling_days_json") or "[]")
+        except Exception:
+            settings["calling_days"] = []
+        return settings
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO voice_settings (user_id, updated_at) VALUES (:uid, :ts) "
+            "ON CONFLICT(user_id) DO NOTHING"
+        ), {"uid": user_id, "ts": now})
+    return _get_or_create_voice_settings(user_id)
+
+
+def _voice_check_gates(user_id: str, phone_e164: Optional[str], last_contacted_at: Optional[str], settings: dict) -> dict:
+    """The single gate-checking function — called BOTH when a batch is built
+    (writing a snapshot into voice_prospects.gate_blocked) AND again, freshly,
+    inside PATCH prospects/:id before allowing approval. The approval-time call
+    is the one that actually matters: never trust the stale build-time snapshot,
+    matching the module's 'never trust the client, re-validate server-side'
+    discipline even in Phase 1 where approval (not dialing) is the highest-
+    stakes write. dnd_scrub_status is intentionally NOT checked here — no real
+    TRAI DLT/DND registry integration exists yet, and fabricating a pass would
+    be worse than leaving it visibly 'not_checked' in the UI."""
+    reasons = []
+    if not phone_e164:
+        reasons.append("missing_phone")
+    else:
+        with engine.connect() as conn:
+            hit = conn.execute(text(
+                "SELECT 1 FROM voice_dnc_list WHERE user_id=:uid AND phone_e164=:p"
+            ), {"uid": user_id, "p": phone_e164}).fetchone()
+        if hit:
+            reasons.append("dnc")
+    if last_contacted_at:
+        cooldown_days = settings.get("cooldown_days", 7)
+        try:
+            last_dt = datetime.fromisoformat(last_contacted_at)
+            if (datetime.utcnow() - last_dt).days < cooldown_days:
+                reasons.append("cooldown")
+        except ValueError:
+            pass
+    return {"blocked": bool(reasons), "reasons": reasons}
+
+
+async def _call_gpt_json_with_retry(build_messages_fn, model: str = "gpt-4o", max_tokens: int = 3500,
+                                     temperature: float = 0.3, retries: int = 1, label: str = "") -> dict:
+    """New shared infrastructure — confirmed via exhaustive grep that NO
+    retry-on-JSON-parse-failure pattern exists anywhere else in this 21,000+
+    line codebase (every other json.loads(gpt_response) call site has zero
+    retry on JSONDecodeError). Wraps the existing _retry_openai_call (transport-
+    error retry only) with a genuine parse-failure retry: on JSONDecodeError,
+    re-calls with a correction message telling GPT its last response was
+    invalid JSON, up to `retries` more times, before giving up."""
+    last_err = None
+    correction = None
+    for attempt in range(retries + 1):
+        messages = build_messages_fn(correction)
+
+        def _call():
+            return client.chat.completions.create(
+                model=model, messages=messages, max_tokens=max_tokens,
+                temperature=temperature, response_format={"type": "json_object"},
+            ).choices[0].message.content
+
+        raw = await _retry_openai_call(_call, label=f"{label} (json attempt {attempt + 1}/{retries + 1})")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            last_err = e
+            logger.warning(f"[JSON-RETRY] {label} attempt {attempt + 1} invalid JSON: {e} — raw[:300]={raw[:300]!r}")
+            correction = (
+                f"Your previous response was not valid JSON and failed to parse (error: {e}). "
+                "Return ONLY a valid JSON object matching the exact schema requested — no markdown, "
+                "no code fences, no explanatory text outside the JSON object."
+            )
+    raise last_err
+
+
+# Fixed, non-editable disclosure line — every voice agent's opening MUST
+# include business identity + AI-assistant disclosure + recording notice.
+# Users can edit every other part of a pitch; this line is never accepted
+# from a request body (see POST /voice-outreach/scripts/:id/versions below,
+# which has no field for it in its Pydantic model at all).
+def _voice_disclosure_line(business_name: str, caller_business_name: str = "Adsoh") -> str:
+    return (
+        f"Hi, this is an AI assistant calling on behalf of {caller_business_name} "
+        f"about {business_name} — this call may be recorded for quality purposes."
+    )
+
+
+# ── Batch pipeline (build-batch → discover → detect → score → gate → save) ────
+
+def _voice_batch_update(batch_id: str, **fields):
+    sets = ", ".join(f"{k}=:{k}" for k in fields)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE voice_batches SET {sets} WHERE id=:batch_id"), {**fields, "batch_id": batch_id})
+
+
+async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: list) -> list:
+    """Scores REAL detected weaknesses, never invents new ones — each prospect
+    dict already carries its own weaknesses/evidence from _detect_voice_weaknesses
+    (pure Python, ran before this call). GPT's job here is judgment (how big an
+    opportunity, how likely to convert, a grounded reason sentence), not
+    discovery. Mirrors prospect_discovery's per-batch scoring shape/precedent
+    (main.py _score_batch) but keyed to this module's own fields."""
+    biz_lines = ""
+    for i, p in enumerate(batch):
+        biz_lines += (
+            "\n---\n"
+            f"Business {i + 1}: {p['business_name']}\n"
+            f"Address: {p['address']}\n"
+            f"Website: {p['website'] or 'NONE'}\n"
+            f"Google Rating: {p['google_rating'] if p['google_rating'] is not None else 'no rating'} "
+            f"({p['total_reviews']} reviews)\n"
+            f"Status: {p['business_status'] or 'unknown'}\n"
+            f"Detected weaknesses (REAL, already verified — do not add others): "
+            f"{', '.join(p['weaknesses']) or 'none detected'}\n"
+        )
+
+    def _build_messages(correction):
+        prompt = (
+            f"You are a B2B sales prioritization expert for an AI voice-calling outreach team targeting "
+            f"{industry} businesses in {search_scope}.\n\n"
+            "For each business below, REAL weaknesses were already detected from its Google Business listing "
+            "and homepage (not your job — use ONLY the weaknesses listed for that business to justify your "
+            "scoring and reason text; never claim a weakness that isn't listed for it).\n"
+            + biz_lines +
+            "\nSCORING RULES:\n"
+            "- opportunity_score (0-100): how strong a sales opportunity this business is — weigh both how "
+            "many/severe its detected weaknesses are AND its real scale (review_count/rating). An established "
+            "business with a real weakness is a bigger opportunity than a tiny one with the same weakness.\n"
+            "- business_score (0-100): how mature/established this business appears from its reviews, rating, "
+            "and listing status — independent of the weaknesses found.\n"
+            "- priority: 'high' if opportunity_score > 75, 'medium' if 50-75, 'low' if under 50.\n"
+            "- estimated_roi: a realistic monthly INR revenue-gain estimate from fixing the detected weaknesses, "
+            "scaled to this business's real size (use 'RS' for the rupee symbol) — never reuse the same figure "
+            "across businesses of different scale.\n"
+            "- estimated_call_success: a realistic percentage string for how likely this business is to answer "
+            "and meaningfully engage with a cold outreach call, based on its type/size/data completeness.\n"
+            "- reason: ONE specific sentence citing this business's actual detected weakness(es) — never generic.\n"
+            + (f"\n{correction}\n" if correction else "") +
+            "\nReturn JSON:\n"
+            "{\n"
+            '  "prospects": [\n'
+            "    {\n"
+            '      "business_name": "exact name from data",\n'
+            '      "opportunity_score": 85,\n'
+            '      "business_score": 60,\n'
+            '      "priority": "high",\n'
+            '      "reason": "specific sentence citing a real detected weakness",\n'
+            '      "estimated_roi": "RS 20,000/month",\n'
+            '      "estimated_call_success": "45%"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            f"Return ONLY valid JSON. Score all {len(batch)} businesses."
+        )
+        return [{"role": "user", "content": prompt}]
+
+    result = await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o", max_tokens=3500, temperature=0.3, retries=1,
+        label="voice-outreach batch scoring",
+    )
+    return _fix_rs(result.get("prospects", []))
+
+
+async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int):
+    now = datetime.utcnow().isoformat()
+    _voice_batch_update(batch_id, status="running", started_at=now, current_step="Searching Google Places", progress_pct=5)
+    try:
+        search_scope = city or "India"
+        search_terms_list = _get_search_terms(industry)
+
+        async def _fetch_term(term: str):
+            return await fetch_google_places(term, search_scope, max_results=max_prospects)
+
+        term_results = await asyncio.gather(*[_fetch_term(t) for t in search_terms_list])
+        raw_places, seen_place_ids = [], set()
+        for places in term_results:
+            for p in places:
+                pid = p.get("place_id")
+                if pid and pid in seen_place_ids:
+                    continue
+                if pid:
+                    seen_place_ids.add(pid)
+                raw_places.append(p)
+
+        total_found = len(raw_places)
+        _voice_batch_update(batch_id, current_step="Enriching business details", progress_pct=20, total_found=total_found)
+
+        top_places = raw_places[:max_prospects]
+        places_with_id = [p for p in top_places if p.get("place_id")]
+        details_list = await _gather_in_chunks(
+            [fetch_place_details(p["place_id"]) for p in places_with_id], chunk_size=15
+        )
+        details_by_id = {
+            places_with_id[i]["place_id"]: d
+            for i, d in enumerate(details_list) if isinstance(d, dict)
+        }
+
+        enriched = []
+        for place in top_places:
+            det = details_by_id.get(place.get("place_id"), {})
+            enriched.append({
+                "place_id":         place.get("place_id", ""),
+                "business_name":    det.get("name") or place.get("name", ""),
+                "address":          det.get("formatted_address") or place.get("address", ""),
+                "phone_raw":        det.get("formatted_phone_number", ""),
+                "website":          det.get("website") or place.get("website", ""),
+                "google_rating":    det.get("rating") if det.get("rating") is not None else place.get("rating"),
+                "total_reviews":    det.get("user_ratings_total") or place.get("user_ratings_total", 0),
+                "business_status":  place.get("business_status", ""),
+            })
+
+        _voice_batch_update(batch_id, current_step="Fetching homepages", progress_pct=35)
+        homepages = await _gather_in_chunks(
+            [_fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result="") for p in enriched],
+            chunk_size=10,
+        )
+
+        _voice_batch_update(batch_id, current_step="Detecting weaknesses", progress_pct=45)
+        for i, p in enumerate(enriched):
+            html = homepages[i] if isinstance(homepages[i], str) else ""
+            weaknesses, evidence = _detect_voice_weaknesses(p, html)
+            p["weaknesses"] = weaknesses
+            p["evidence"] = evidence
+
+        _voice_batch_update(batch_id, current_step="Scoring & qualifying prospects", progress_pct=60)
+        SCORE_BATCH_SIZE = 15
+        score_batches = [enriched[i:i + SCORE_BATCH_SIZE] for i in range(0, len(enriched), SCORE_BATCH_SIZE)]
+        batch_results = await asyncio.gather(
+            *[_score_voice_prospect_batch(industry, search_scope, b) for b in score_batches]
+        )
+        scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
+
+        _voice_batch_update(batch_id, current_step="Normalizing phone numbers & compliance gates", progress_pct=80)
+        settings = _get_or_create_voice_settings(user_id)
+
+        rows = []
+        total_qualified = 0
+        ts = datetime.utcnow().isoformat()
+        for p in enriched:
+            score = scores_by_name.get(p["business_name"], {})
+            phone_e164 = _normalize_phone_e164(p["phone_raw"])
+            gate = _voice_check_gates(user_id, phone_e164, None, settings)
+            confidences = [e.get("confidence", 0) for e in p["evidence"]]
+            confidence_score = int(round(100 * (sum(confidences) / len(confidences)))) if confidences else 50
+            if not gate["blocked"]:
+                total_qualified += 1
+            rows.append({
+                "batch_id": batch_id, "user_id": user_id, "place_id": p["place_id"],
+                "business_name": p["business_name"], "address": p["address"],
+                "phone_raw": p["phone_raw"], "phone_e164": phone_e164, "website": p["website"],
+                "google_rating": p["google_rating"], "total_reviews": p["total_reviews"],
+                "business_status": p["business_status"],
+                "opportunity_score": score.get("opportunity_score"), "business_score": score.get("business_score"),
+                "confidence_score": confidence_score, "priority": score.get("priority"),
+                "reason": score.get("reason"), "estimated_roi": score.get("estimated_roi"),
+                "estimated_call_success": score.get("estimated_call_success"),
+                "weaknesses_json": json.dumps(p["weaknesses"]), "evidence_json": json.dumps(p["evidence"]),
+                "dnc_status": "listed" if "dnc" in gate["reasons"] else "clear",
+                "cooldown_status": "cooling_down" if "cooldown" in gate["reasons"] else "clear",
+                "missing_phone": not phone_e164, "gate_blocked": gate["blocked"],
+                "gate_block_reasons_json": json.dumps(gate["reasons"]),
+                "created_at": ts, "updated_at": ts,
+            })
+
+        _voice_batch_update(batch_id, current_step="Saving prospects", progress_pct=92)
+        if rows:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO voice_prospects (batch_id, user_id, place_id, business_name, address, "
+                    "phone_raw, phone_e164, website, google_rating, total_reviews, business_status, "
+                    "opportunity_score, business_score, confidence_score, priority, reason, estimated_roi, "
+                    "estimated_call_success, weaknesses_json, evidence_json, dnc_status, cooldown_status, "
+                    "missing_phone, gate_blocked, gate_block_reasons_json, created_at, updated_at) "
+                    "VALUES (:batch_id, :user_id, :place_id, :business_name, :address, "
+                    ":phone_raw, :phone_e164, :website, :google_rating, :total_reviews, :business_status, "
+                    ":opportunity_score, :business_score, :confidence_score, :priority, :reason, :estimated_roi, "
+                    ":estimated_call_success, :weaknesses_json, :evidence_json, :dnc_status, :cooldown_status, "
+                    ":missing_phone, :gate_blocked, :gate_block_reasons_json, :created_at, :updated_at)"
+                ), rows)
+
+        finished = datetime.utcnow().isoformat()
+        _voice_batch_update(
+            batch_id, status="succeeded", current_step="Done", progress_pct=100, finished_at=finished,
+            total_found=total_found, total_qualified=total_qualified,
+        )
+        logger.info(f"[VOICE-BATCH] {batch_id} succeeded: found={total_found} saved={len(rows)} qualified={total_qualified}")
+    except Exception as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[VOICE-BATCH] {batch_id} failed: {_e}\n{tb}")
+        _voice_batch_update(batch_id, status="failed", error=str(_e), finished_at=datetime.utcnow().isoformat())
+
+
+def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: int) -> str:
+    batch_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO voice_batches (id, user_id, industry, city, max_prospects, status, progress_pct, "
+            "current_step, created_at) VALUES (:id, :uid, :industry, :city, :max_prospects, 'queued', 0, "
+            "'Queued', :ts)"
+        ), {"id": batch_id, "uid": user_id, "industry": industry, "city": city,
+            "max_prospects": max_prospects, "ts": now})
+    asyncio.create_task(_run_voice_batch_job(batch_id, user_id, industry, city, max_prospects))
+    return batch_id
+
+
+class VoiceBatchBuildRequest(BaseModel):
+    industry:      str
+    city:          str = ""
+    max_prospects: int = 15
+
+
+@app.post("/voice-outreach/build-batch")
+async def voice_outreach_build_batch(payload: VoiceBatchBuildRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    industry = (payload.industry or "").strip()
+    if not industry:
+        raise HTTPException(status_code=400, detail="industry is required")
+    max_prospects = max(5, min(payload.max_prospects, 50))
+    batch_id = _start_voice_batch(uid, industry, (payload.city or "").strip(), max_prospects)
+    return {"success": True, "batch_id": batch_id, "status": "queued"}
+
+
+_VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "status", "progress_pct",
+                     "current_step", "total_found", "total_qualified", "error", "started_at",
+                     "finished_at", "created_at"]
+
+_VOICE_PROSPECT_COLS = [
+    "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
+    "website", "google_rating", "total_reviews", "business_status", "opportunity_score", "business_score",
+    "confidence_score", "priority", "reason", "estimated_roi", "estimated_call_success",
+    "weaknesses_json", "evidence_json", "dnc_status", "dnd_scrub_status", "cooldown_status",
+    "cooldown_until", "last_contacted_at", "missing_phone", "gate_blocked", "gate_block_reasons_json",
+    "approval_status", "approved_by", "approved_at", "rejected_reason", "script_id", "lead_id",
+    "created_at", "updated_at",
+]
+
+
+def _voice_parse_prospect_row(row) -> dict:
+    p = dict(zip(_VOICE_PROSPECT_COLS, row))
+    for k in ("weaknesses_json", "evidence_json", "gate_block_reasons_json"):
+        target = k.replace("_json", "")
+        try:
+            p[target] = json.loads(p.pop(k) or "[]")
+        except Exception:
+            p[target] = []
+    return p
+
+
+@app.get("/voice-outreach/batches")
+async def voice_outreach_list_batches(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT {', '.join(_VOICE_BATCH_COLS)} FROM voice_batches WHERE user_id=:uid ORDER BY created_at DESC"
+        ), {"uid": uid}).fetchall()
+    return {"success": True, "batches": [dict(zip(_VOICE_BATCH_COLS, r)) for r in rows]}
+
+
+@app.get("/voice-outreach/batches/{batch_id}")
+async def voice_outreach_get_batch(batch_id: str, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_VOICE_BATCH_COLS)} FROM voice_batches WHERE id=:id AND user_id=:uid"
+        ), {"id": batch_id, "uid": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        batch = dict(zip(_VOICE_BATCH_COLS, row))
+
+        stale = False
+        if batch["status"] == "running" and batch["started_at"]:
+            started = datetime.fromisoformat(batch["started_at"])
+            if datetime.utcnow() - started > timedelta(minutes=20):
+                stale = True
+                now = datetime.utcnow().isoformat()
+                err_msg = "stale/orphaned (server likely restarted mid-batch)"
+                conn.execute(text(
+                    "UPDATE voice_batches SET status='failed', error=:err, finished_at=:ts WHERE id=:id"
+                ), {"err": err_msg, "ts": now, "id": batch_id})
+                batch["status"] = "failed"
+                batch["error"] = err_msg
+                batch["finished_at"] = now
+        batch["stale"] = stale
+
+        prospect_rows = conn.execute(text(
+            f"SELECT {', '.join(_VOICE_PROSPECT_COLS)} FROM voice_prospects "
+            "WHERE batch_id=:id AND user_id=:uid ORDER BY opportunity_score DESC NULLS LAST, id ASC"
+            if not _is_sqlite else
+            f"SELECT {', '.join(_VOICE_PROSPECT_COLS)} FROM voice_prospects "
+            "WHERE batch_id=:id AND user_id=:uid ORDER BY opportunity_score DESC, id ASC"
+        ), {"id": batch_id, "uid": uid}).fetchall()
+        prospects = [_voice_parse_prospect_row(r) for r in prospect_rows]
+
+    return {"success": True, "batch": batch, "prospects": prospects}
+
+
+# ── Review Screen actions (approve/reject) ────────────────────────────────────
+
+def _voice_apply_prospect_action(uid: str, prospect_id: int, action: str, reason: str, settings: dict) -> dict:
+    """Shared by both the single PATCH and the bulk-action endpoint. Approval
+    ALWAYS re-runs _voice_check_gates against fresh state here — the
+    gate_blocked/gate_block_reasons_json columns on the row are only a
+    build-time snapshot (DNC entries and cooldown windows can change between
+    when a batch was built and when a human clicks Approve), so trusting the
+    stored snapshot at the highest-stakes Phase 1 write would be exactly the
+    kind of client-trusting shortcut the whole module's safety model forbids."""
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT phone_e164, last_contacted_at, approval_status FROM voice_prospects "
+            "WHERE id=:id AND user_id=:uid"
+        ), {"id": prospect_id, "uid": uid}).fetchone()
+        if not row:
+            return {"id": prospect_id, "ok": False, "error": "not_found"}
+        phone_e164, last_contacted_at, current_status = row
+
+        if action == "approve":
+            gate = _voice_check_gates(uid, phone_e164, last_contacted_at, settings)
+            if gate["blocked"]:
+                return {"id": prospect_id, "ok": False, "error": "gate_blocked", "reasons": gate["reasons"]}
+            conn.execute(text(
+                "UPDATE voice_prospects SET approval_status='approved', approved_by=:uid, approved_at=:ts, "
+                "gate_blocked=FALSE, gate_block_reasons_json='[]', updated_at=:ts WHERE id=:id"
+            ), {"uid": uid, "ts": now, "id": prospect_id})
+            return {"id": prospect_id, "ok": True, "approval_status": "approved"}
+        else:
+            conn.execute(text(
+                "UPDATE voice_prospects SET approval_status='rejected', rejected_reason=:reason, updated_at=:ts "
+                "WHERE id=:id"
+            ), {"reason": reason, "ts": now, "id": prospect_id})
+            return {"id": prospect_id, "ok": True, "approval_status": "rejected"}
+
+
+class VoiceProspectActionRequest(BaseModel):
+    action: str  # "approve" | "reject"
+    reason: str = ""
+
+
+@app.patch("/voice-outreach/prospects/{prospect_id}")
+async def voice_outreach_update_prospect(prospect_id: int, payload: VoiceProspectActionRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    action = (payload.action or "").strip().lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    settings = _get_or_create_voice_settings(uid)
+    result = _voice_apply_prospect_action(uid, prospect_id, action, (payload.reason or "").strip(), settings)
+    if not result["ok"]:
+        if result["error"] == "not_found":
+            raise HTTPException(status_code=404, detail="Prospect not found")
+        raise HTTPException(status_code=400, detail=f"Cannot approve — blocked by: {', '.join(result['reasons'])}")
+    return {"success": True, **result}
+
+
+class VoiceProspectBulkActionRequest(BaseModel):
+    prospect_ids:          list = []
+    action:                str
+    reason:                str = ""
+    all_eligible_in_batch: str = ""
+
+
+@app.post("/voice-outreach/prospects/bulk-action")
+async def voice_outreach_bulk_action(payload: VoiceProspectBulkActionRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    action = (payload.action or "").strip().lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+
+    ids = list(payload.prospect_ids or [])
+    if payload.all_eligible_in_batch:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id FROM voice_prospects WHERE batch_id=:b AND user_id=:uid AND "
+                "approval_status='pending' AND gate_blocked=FALSE"
+            ), {"b": payload.all_eligible_in_batch, "uid": uid}).fetchall()
+        ids = [r[0] for r in rows]
+
+    settings = _get_or_create_voice_settings(uid)
+    reason = (payload.reason or "").strip()
+    results = [_voice_apply_prospect_action(uid, pid, action, reason, settings) for pid in ids]
+    return {
+        "success": True,
+        "succeeded": [r["id"] for r in results if r["ok"]],
+        "failed":    [r for r in results if not r["ok"]],
+    }
+
+
+# ── Script versioning (reuses Outreach AI's memory + gate UX, adds versioning) ─
+
+_VOICE_SCRIPT_FIELDS = [
+    "opening", "rapport", "pain_point", "value_prop", "social_proof", "meeting_close", "follow_up",
+]
+
+
+class VoiceScriptVersionRequest(BaseModel):
+    source:        str  = "generate"  # "generate" | "edit"
+    url:           str  = ""
+    industry:      str  = ""
+    city:          str  = ""
+    edited_fields: dict = {}
+    # deliberately NO disclosure_line field — structurally impossible to submit
+
+
+@app.post("/voice-outreach/scripts/{prospect_id}/versions")
+async def voice_outreach_create_script_version(prospect_id: int, payload: VoiceScriptVersionRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT business_name, weaknesses_json, evidence_json FROM voice_prospects WHERE id=:id AND user_id=:uid"
+        ), {"id": prospect_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+    business_name, weaknesses_json, evidence_json = row
+    weaknesses = json.loads(weaknesses_json or "[]")
+    evidence = json.loads(evidence_json or "[]")
+    disclosure_line = _voice_disclosure_line(business_name)
+
+    source = (payload.source or "generate").strip().lower()
+    if source not in ("generate", "edit"):
+        raise HTTPException(status_code=400, detail="source must be 'generate' or 'edit'")
+
+    if source == "edit":
+        fields = payload.edited_fields or {}
+        script = {k: fields.get(k, "") for k in _VOICE_SCRIPT_FIELDS}
+        script["discovery_questions"] = fields.get("discovery_questions") or []
+        script["objection_handling"] = fields.get("objection_handling") or []
+        script["variables"] = fields.get("variables") or {}
+        edited_by_user = True
+        script_template_id = None
+    else:
+        # Same memory + "no memory yet" UX as /outreach-ai (main.py:5689) — the
+        # memory here is the CALLING business's own Marketing Brain data (their
+        # positioning/UVP/offer), reused to personalize how THEY pitch, exactly
+        # like outreach_ai already does for text outreach.
+        memory, norm_key = get_memory_with_city_fallback(
+            (payload.url or "").strip(), (payload.industry or "").strip(), (payload.city or "").strip()
+        )
+        if not memory:
+            return {
+                "success": False, "memory_used": False,
+                "message": "No memory found for this business. Run Marketing Brain first with the same URL + industry to build memory.",
+            }
+        _bm = memory.get("business", {})
+        _ofm = memory.get("offer", {})
+        offer_data = _ofm.get("offer_data") or {}
+        if isinstance(offer_data, str):
+            try:
+                offer_data = json.loads(offer_data)
+            except Exception:
+                offer_data = {}
+
+        weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in evidence) or "- none detected"
+
+        def _build_messages(correction):
+            prompt = (
+                f"You are writing a phone-call pitch script for an AI voice agent calling on behalf of "
+                f"{_bm.get('business_name', 'this business')} (UVP: {_bm.get('uvp', '')}, "
+                f"positioning: {_bm.get('positioning', '')}) to reach {business_name}, a prospect business.\n\n"
+                f"REAL detected weaknesses for {business_name} (cite these specifically — never invent others):\n"
+                f"{weakness_lines}\n\n"
+                "Write a natural, human-sounding phone pitch (not written for a webpage — this is SPOKEN dialogue). "
+                "Every field must reference the prospect's ACTUAL detected weakness(es) above, not a generic pitch.\n"
+                + (f"\n{correction}\n" if correction else "") +
+                "\nReturn JSON:\n"
+                "{\n"
+                '  "opening": "1-2 spoken sentences after the disclosure line, warm and specific",\n'
+                '  "rapport": "1 short rapport-building line",\n'
+                '  "discovery_questions": ["question 1", "question 2"],\n'
+                '  "pain_point": "1-2 sentences naming their real detected weakness conversationally",\n'
+                '  "value_prop": "1-2 sentences on how we help with THAT specific weakness",\n'
+                '  "social_proof": "1 short sentence, no fabricated numbers/client names",\n'
+                '  "objection_handling": [{"objection": "...", "response": "..."}],\n'
+                '  "meeting_close": "1-2 sentences asking for a meeting/callback",\n'
+                '  "follow_up": "1 sentence describing what happens if they say maybe/no"\n'
+                "}\nReturn ONLY valid JSON."
+            )
+            return [{"role": "user", "content": prompt}]
+
+        script = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=1500, temperature=0.4, retries=1,
+            label=f"voice-outreach script generation (prospect {prospect_id})",
+        )
+        edited_by_user = False
+        script_template_id = norm_key
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE voice_scripts SET is_current=FALSE WHERE prospect_id=:pid AND user_id=:uid"
+        ), {"pid": prospect_id, "uid": uid})
+        next_version = conn.execute(text(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM voice_scripts WHERE prospect_id=:pid AND user_id=:uid"
+        ), {"pid": prospect_id, "uid": uid}).scalar()
+        new_id = conn.execute(text(
+            "INSERT INTO voice_scripts (prospect_id, user_id, version, is_current, script_template_id, "
+            "disclosure_line, opening, rapport, discovery_questions_json, pain_point, value_prop, social_proof, "
+            "objection_handling_json, meeting_close, follow_up, variables_json, edited_by_user, source, created_at) "
+            "VALUES (:pid, :uid, :version, TRUE, :tpl, :disclosure, :opening, :rapport, :dq, :pain, :value, :social, "
+            ":obj, :close, :followup, :vars, :edited, :source, :ts) RETURNING id"
+        ), {
+            "pid": prospect_id, "uid": uid, "version": next_version, "tpl": script_template_id,
+            "disclosure": disclosure_line, "opening": script.get("opening", ""), "rapport": script.get("rapport", ""),
+            "dq": json.dumps(script.get("discovery_questions", [])), "pain": script.get("pain_point", ""),
+            "value": script.get("value_prop", ""), "social": script.get("social_proof", ""),
+            "obj": json.dumps(script.get("objection_handling", [])), "close": script.get("meeting_close", ""),
+            "followup": script.get("follow_up", ""), "vars": json.dumps(script.get("variables", {})),
+            "edited": edited_by_user, "source": source, "ts": now,
+        }).scalar()
+        conn.execute(text(
+            "UPDATE voice_prospects SET script_id=:sid, updated_at=:ts WHERE id=:pid AND user_id=:uid"
+        ), {"sid": new_id, "ts": now, "pid": prospect_id, "uid": uid})
+
+    return {
+        "success": True, "script_id": new_id, "version": next_version, "disclosure_line": disclosure_line,
+        "script": script, "weaknesses": weaknesses,
+    }
+
+
+# ── DNC list ────────────────────────────────────────────────────────────────
+
+class VoiceDncAddRequest(BaseModel):
+    phone:  str
+    reason: str = ""
+
+
+@app.get("/voice-outreach/dnc")
+async def voice_outreach_list_dnc(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, phone_e164, reason, source_call_id, added_by, created_at FROM voice_dnc_list "
+            "WHERE user_id=:uid ORDER BY created_at DESC"
+        ), {"uid": uid}).fetchall()
+    cols = ["id", "phone_e164", "reason", "source_call_id", "added_by", "created_at"]
+    return {"success": True, "dnc_list": [dict(zip(cols, r)) for r in rows]}
+
+
+@app.post("/voice-outreach/dnc")
+async def voice_outreach_add_dnc(payload: VoiceDncAddRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    phone_e164 = _normalize_phone_e164(payload.phone)
+    if not phone_e164:
+        raise HTTPException(status_code=400, detail="phone is not a valid, dialable number")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO voice_dnc_list (user_id, phone_e164, reason, added_by, created_at) "
+            "VALUES (:uid, :phone, :reason, :uid, :ts) "
+            "ON CONFLICT (user_id, phone_e164) DO UPDATE SET reason=:reason"
+        ), {"uid": uid, "phone": phone_e164, "reason": (payload.reason or "").strip(), "ts": now})
+        # Retroactively re-gate any still-pending prospect sharing this number
+        # — a DNC entry added after a batch was built must still block it.
+        blocked_rows = conn.execute(text(
+            "SELECT id, gate_block_reasons_json FROM voice_prospects WHERE user_id=:uid AND phone_e164=:phone "
+            "AND approval_status='pending'"
+        ), {"uid": uid, "phone": phone_e164}).fetchall()
+        for pid, reasons_json in blocked_rows:
+            try:
+                reasons = json.loads(reasons_json or "[]")
+            except Exception:
+                reasons = []
+            if "dnc" not in reasons:
+                reasons.append("dnc")
+            conn.execute(text(
+                "UPDATE voice_prospects SET gate_blocked=TRUE, gate_block_reasons_json=:r, dnc_status='listed', "
+                "updated_at=:ts WHERE id=:id"
+            ), {"r": json.dumps(reasons), "ts": now, "id": pid})
+    return {"success": True, "phone_e164": phone_e164, "re_gated_prospects": len(blocked_rows)}
+
+
+@app.delete("/voice-outreach/dnc/{dnc_id}")
+async def voice_outreach_delete_dnc(dnc_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.begin() as conn:
+        result = conn.execute(text(
+            "DELETE FROM voice_dnc_list WHERE id=:id AND user_id=:uid"
+        ), {"id": dnc_id, "uid": uid})
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="DNC entry not found")
+    return {"success": True}
+
+
+# ── Settings ────────────────────────────────────────────────────────────────
+
+_VOICE_SETTINGS_PATCHABLE = (
+    "calling_window_start", "calling_window_end", "timezone", "compliance_mode",
+    "cooldown_days", "max_call_attempts_same_day", "blended_rate_per_minute_micros",
+    "avg_estimated_call_duration_seconds", "default_voice_agent_id",
+)
+
+
+class VoiceSettingsPatchRequest(BaseModel):
+    calling_window_start:                str | None = None
+    calling_window_end:                  str | None = None
+    calling_days:                        list | None = None
+    timezone:                            str | None = None
+    compliance_mode:                     str | None = None
+    cooldown_days:                       int | None = None
+    max_call_attempts_same_day:          int | None = None
+    blended_rate_per_minute_micros:      int | None = None
+    avg_estimated_call_duration_seconds: int | None = None
+    default_voice_agent_id:              int | None = None
+
+
+@app.get("/voice-outreach/settings")
+async def voice_outreach_get_settings(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"success": True, "settings": _get_or_create_voice_settings(uid)}
+
+
+@app.patch("/voice-outreach/settings")
+async def voice_outreach_patch_settings(payload: VoiceSettingsPatchRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    _get_or_create_voice_settings(uid)  # ensure a row exists first
+
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None and k in _VOICE_SETTINGS_PATCHABLE}
+    if payload.calling_days is not None:
+        updates["calling_days_json"] = json.dumps(payload.calling_days)
+    if not updates:
+        return {"success": True, "settings": _get_or_create_voice_settings(uid)}
+
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    sets = ", ".join(f"{k}=:{k}" for k in updates)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE voice_settings SET {sets} WHERE user_id=:uid"), {**updates, "uid": uid})
+    return {"success": True, "settings": _get_or_create_voice_settings(uid)}
+
+
+@app.get("/voice-outreach/agents")
+async def voice_outreach_list_agents(request: Request):
+    """Read-only listing of the 9 seeded global voice-agent presets (Phase 1
+    — no vapi_assistant_id assigned yet, filled in when Phase 2 wires real
+    Vapi calling). Settings page shows these for default_voice_agent_id
+    selection; no "Test Call" action exists until Phase 2."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, name, personality, language, vapi_assistant_id, is_active, is_default "
+            "FROM voice_agents WHERE user_id IS NULL ORDER BY is_default DESC, personality, language"
+        )).fetchall()
+    cols = ["id", "name", "personality", "language", "vapi_assistant_id", "is_active", "is_default"]
+    return {"success": True, "agents": [dict(zip(cols, r)) for r in rows]}
