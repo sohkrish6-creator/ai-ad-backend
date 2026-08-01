@@ -9,7 +9,7 @@ import phonenumbers
 from openai import OpenAI
 import httpx
 from datetime import datetime, date, timedelta
-from typing import Optional
+from typing import Optional, Literal
 from contextvars import ContextVar
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
@@ -4437,13 +4437,31 @@ def get_stats(request: Request, db: Session = Depends(get_db)):
     return {"total": len(leads), "whatsapp": len([l for l in leads if l.source == "whatsapp"]), "website": len([l for l in leads if l.source == "website"]), "form": len([l for l in leads if l.source == "form"]), "new": len([l for l in leads if l.status == "New"]), "converted": len([l for l in leads if l.status == "Converted"])}
 
 @app.put("/leads/{lead_id}")
-def update_lead(lead_id: int, status: str, db: Session = Depends(get_db)):
-    lead = db.query(LeadModel).filter(LeadModel.id == lead_id).first()
-    if lead:
-        lead.status = status
-        db.commit()
-        return {"success": True}
-    return {"success": False, "message": "Lead nahi mila"}
+def update_lead(
+    lead_id: int, status: Literal["New", "Contacted", "Converted", "Lost"],
+    request: Request, db: Session = Depends(get_db),
+):
+    # FIX 1 (bug-fix pass): this previously had NO user_id/ownership filter
+    # at all — any authenticated user could modify any other tenant's lead —
+    # and accepted any free-text status. Brought in line with the same
+    # "if _uid: filter" convention GET /leads and GET /leads/stats already
+    # use (both correctly scoped), plus a validated status enum matching the
+    # real values used everywhere else (LeadModel default 'New', Leads.jsx's
+    # statusColor map, and _voice_crm_sync's Contacted-only writes).
+    _uid = getattr(request.state, "user_id", "")
+    q = db.query(LeadModel).filter(LeadModel.id == lead_id)
+    if _uid:
+        q = q.filter(LeadModel.user_id == _uid)
+    lead = q.first()
+    if not lead:
+        # 404 regardless of whether the id doesn't exist or belongs to
+        # another tenant — never leak existence across tenants, same
+        # convention as every Voice Outreach endpoint (batches/prospects/
+        # calls/analysis/followups all 404 identically on ownership mismatch).
+        return JSONResponse({"success": False, "message": "Lead nahi mila"}, status_code=404)
+    lead.status = status
+    db.commit()
+    return {"success": True}
 
 
 # ── Google Ads Performance ────────────────────────────────────────────────────
