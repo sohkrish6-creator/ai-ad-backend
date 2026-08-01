@@ -21640,13 +21640,15 @@ def _get_or_create_voice_settings(user_id: str) -> dict:
         row = conn.execute(text(
             "SELECT calling_window_start, calling_window_end, calling_days_json, timezone, compliance_mode, "
             "cooldown_days, max_call_attempts_same_day, blended_rate_per_minute_micros, "
-            "avg_estimated_call_duration_seconds, default_voice_agent_id, updated_at, call_mode "
+            "avg_estimated_call_duration_seconds, default_voice_agent_id, updated_at, call_mode, "
+            "max_review_count, min_review_count, exclude_chains "
             "FROM voice_settings WHERE user_id=:uid"
         ), {"uid": user_id}).fetchone()
     if row:
         cols = ["calling_window_start", "calling_window_end", "calling_days_json", "timezone", "compliance_mode",
                 "cooldown_days", "max_call_attempts_same_day", "blended_rate_per_minute_micros",
-                "avg_estimated_call_duration_seconds", "default_voice_agent_id", "updated_at", "call_mode"]
+                "avg_estimated_call_duration_seconds", "default_voice_agent_id", "updated_at", "call_mode",
+                "max_review_count", "min_review_count", "exclude_chains"]
         settings = dict(zip(cols, row))
         try:
             settings["calling_days"] = json.loads(settings.pop("calling_days_json") or "[]")
@@ -21816,6 +21818,55 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
     return _fix_rs(result.get("prospects", []))
 
 
+# Fix 4 (bug-fix pass): common global chain/hotel-brand keywords — a small,
+# deliberately conservative list (well-known international chains only, not
+# generic words like "hotel" that would false-positive on real independent
+# businesses). The structural "same name appears N times across discovered
+# locations" signal is the primary chain heuristic; this keyword list is a
+# secondary net for a well-known chain's first location appearing in a scan.
+_VOICE_CHAIN_BRAND_KEYWORDS = (
+    "marriott", "hilton", "hyatt", "radisson", "holiday inn", "ihg hotels",
+    "the oberoi", "taj hotels", "itc hotels", "novotel", "sheraton", "westin",
+    "ritz-carlton", "four seasons", "the leela", "lemon tree hotels",
+    "mcdonald's", "kfc", "domino's pizza", "starbucks", "subway", "pizza hut",
+)
+
+
+def _voice_apply_enterprise_filter(enriched: list, name_counts: dict, settings: dict) -> tuple:
+    """Excludes obvious enterprise/chain businesses at batch-build time
+    rather than silently scoring them like any small local business — this
+    is the fix for The Taj Mahal Palace (4.7 stars, 33,650 reviews) surfacing
+    as a cold-calling prospect. Never silent: every exclusion is recorded
+    with a real reason and stays visible (approval_status='filtered') for
+    explicit per-business override, never just dropped."""
+    max_reviews = settings.get("max_review_count", 2000)
+    min_reviews = settings.get("min_review_count", 0)
+    exclude_chains = settings.get("exclude_chains", True)
+    if exclude_chains is None:
+        exclude_chains = True
+
+    admitted, filtered = [], []
+    for p in enriched:
+        reasons = []
+        total_reviews = p.get("total_reviews") or 0
+        if total_reviews > max_reviews:
+            reasons.append(f"{total_reviews} reviews > max_review_count ({max_reviews})")
+        if total_reviews < min_reviews:
+            reasons.append(f"{total_reviews} reviews < min_review_count ({min_reviews})")
+        if exclude_chains:
+            name_key = (p.get("business_name") or "").strip().lower()
+            if name_key and name_counts.get(name_key, 0) > 1:
+                reasons.append(f"same business name found at {name_counts[name_key]} discovered locations (likely a chain)")
+            elif any(kw in name_key for kw in _VOICE_CHAIN_BRAND_KEYWORDS):
+                reasons.append("business name matches a known chain/brand")
+        if reasons:
+            p["filter_reason"] = "enterprise_filtered: " + "; ".join(reasons)
+            filtered.append(p)
+        else:
+            admitted.append(p)
+    return admitted, filtered
+
+
 async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int):
     now = datetime.utcnow().isoformat()
     _voice_batch_update(batch_id, status="running", started_at=now, current_step="Searching Google Places", progress_pct=5)
@@ -21864,6 +21915,32 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "business_status":  place.get("business_status", ""),
             })
 
+        _voice_batch_update(batch_id, current_step="Filtering enterprise/chain businesses", progress_pct=32)
+        settings = _get_or_create_voice_settings(user_id)
+        name_counts = {}
+        for p in enriched:
+            key = (p["business_name"] or "").strip().lower()
+            if key:
+                name_counts[key] = name_counts.get(key, 0) + 1
+        enriched, filtered_out = _voice_apply_enterprise_filter(enriched, name_counts, settings)
+
+        if filtered_out:
+            ts_f = datetime.utcnow().isoformat()
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO voice_prospects (batch_id, user_id, place_id, business_name, address, "
+                    "phone_raw, website, google_rating, total_reviews, business_status, approval_status, "
+                    "filter_reason, created_at, updated_at) "
+                    "VALUES (:batch_id, :user_id, :place_id, :business_name, :address, :phone_raw, :website, "
+                    ":google_rating, :total_reviews, :business_status, 'filtered', :filter_reason, :ts, :ts)"
+                ), [{
+                    "batch_id": batch_id, "user_id": user_id, "place_id": p["place_id"],
+                    "business_name": p["business_name"], "address": p["address"], "phone_raw": p["phone_raw"],
+                    "website": p["website"], "google_rating": p["google_rating"], "total_reviews": p["total_reviews"],
+                    "business_status": p["business_status"], "filter_reason": p["filter_reason"], "ts": ts_f,
+                } for p in filtered_out])
+            logger.info(f"[VOICE-BATCH] {batch_id}: {len(filtered_out)} business(es) enterprise-filtered")
+
         _voice_batch_update(batch_id, current_step="Fetching homepages", progress_pct=35)
         _empty_fetch = {"html": "", "fetch_status": "ok", "detail": ""}
         homepages = await _gather_in_chunks(
@@ -21887,7 +21964,6 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
 
         _voice_batch_update(batch_id, current_step="Normalizing phone numbers & compliance gates", progress_pct=80)
-        settings = _get_or_create_voice_settings(user_id)
 
         rows = []
         total_qualified = 0
@@ -22101,7 +22177,7 @@ _VOICE_PROSPECT_COLS = [
     "weaknesses_json", "evidence_json", "dnc_status", "dnd_scrub_status", "cooldown_status",
     "cooldown_until", "last_contacted_at", "missing_phone", "gate_blocked", "gate_block_reasons_json",
     "approval_status", "approved_by", "approved_at", "rejected_reason", "script_id", "lead_id",
-    "created_at", "updated_at", "rescore_note",
+    "created_at", "updated_at", "rescore_note", "filter_reason",
 ]
 
 
@@ -22197,6 +22273,18 @@ def _voice_apply_prospect_action(uid: str, prospect_id: int, action: str, reason
                 "gate_blocked=FALSE, gate_block_reasons_json='[]', updated_at=:ts WHERE id=:id"
             ), {"uid": uid, "ts": now, "id": prospect_id})
             return {"id": prospect_id, "ok": True, "approval_status": "approved"}
+        elif action == "admit":
+            # Fix 4: explicit per-business override for a prospect the
+            # enterprise/chain filter excluded — never re-admitted silently
+            # or automatically. Only valid from 'filtered'; moves it into
+            # the normal pending queue. filter_reason is left in place as a
+            # historical record of why it was originally excluded.
+            if current_status != "filtered":
+                return {"id": prospect_id, "ok": False, "error": "not_filtered"}
+            conn.execute(text(
+                "UPDATE voice_prospects SET approval_status='pending', updated_at=:ts WHERE id=:id"
+            ), {"ts": now, "id": prospect_id})
+            return {"id": prospect_id, "ok": True, "approval_status": "pending"}
         else:
             conn.execute(text(
                 "UPDATE voice_prospects SET approval_status='rejected', rejected_reason=:reason, updated_at=:ts "
@@ -22206,7 +22294,7 @@ def _voice_apply_prospect_action(uid: str, prospect_id: int, action: str, reason
 
 
 class VoiceProspectActionRequest(BaseModel):
-    action: str  # "approve" | "reject"
+    action: str  # "approve" | "reject" | "admit"
     reason: str = ""
 
 
@@ -22216,13 +22304,15 @@ async def voice_outreach_update_prospect(prospect_id: int, payload: VoiceProspec
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
     action = (payload.action or "").strip().lower()
-    if action not in ("approve", "reject"):
-        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    if action not in ("approve", "reject", "admit"):
+        raise HTTPException(status_code=400, detail="action must be 'approve', 'reject', or 'admit'")
     settings = _get_or_create_voice_settings(uid)
     result = _voice_apply_prospect_action(uid, prospect_id, action, (payload.reason or "").strip(), settings)
     if not result["ok"]:
         if result["error"] == "not_found":
             raise HTTPException(status_code=404, detail="Prospect not found")
+        if result["error"] == "not_filtered":
+            raise HTTPException(status_code=400, detail="Only a filtered prospect can be admitted")
         raise HTTPException(status_code=400, detail=f"Cannot approve — blocked by: {', '.join(result['reasons'])}")
     return {"success": True, **result}
 
@@ -22472,6 +22562,7 @@ _VOICE_SETTINGS_PATCHABLE = (
     "calling_window_start", "calling_window_end", "timezone", "compliance_mode",
     "cooldown_days", "max_call_attempts_same_day", "blended_rate_per_minute_micros",
     "avg_estimated_call_duration_seconds", "default_voice_agent_id", "call_mode",
+    "max_review_count", "min_review_count", "exclude_chains",
 )
 
 
@@ -22486,6 +22577,9 @@ class VoiceSettingsPatchRequest(BaseModel):
     blended_rate_per_minute_micros:      int | None = None
     avg_estimated_call_duration_seconds: int | None = None
     default_voice_agent_id:              int | None = None
+    max_review_count:                    int | None = None
+    min_review_count:                    int | None = None
+    exclude_chains:                      bool | None = None
     call_mode:                           str | None = None
 
 
@@ -22597,6 +22691,10 @@ for _vtbl, _vcol, _vtype in [
     ("voice_transcripts", "is_synthetic", "BOOLEAN DEFAULT FALSE"),
     ("voice_settings", "call_mode", "TEXT DEFAULT 'dry_run'"),
     ("voice_prospects", "rescore_note", "TEXT"),  # Fix 3: visible "rescored after fix" note in the Review UI
+    ("voice_prospects", "filter_reason", "TEXT"),  # Fix 4: why an enterprise/chain business was excluded
+    ("voice_settings", "max_review_count", "INTEGER DEFAULT 2000"),  # Fix 4
+    ("voice_settings", "min_review_count", "INTEGER DEFAULT 0"),     # Fix 4
+    ("voice_settings", "exclude_chains", "BOOLEAN DEFAULT TRUE"),    # Fix 4
 ]:
     try:
         with engine.begin() as _vmc:
