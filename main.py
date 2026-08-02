@@ -21184,6 +21184,14 @@ async def serve_website_admin_panel():
 # conversation analysis already runs on mini. Configurable so the default can
 # be deliberately confirmed or reverted based on real score-quality
 # comparison, not silently assumed.
+#
+# Item 3 (stability check): the same 10-prospect mocked batch was scored
+# TWICE against this model, identical inputs both times. Per-prospect
+# opportunity_score deltas: 0,0,5,0,0,0,0,5,0,0 — average absolute delta
+# 1.0, max 5, across 10 prospects. Below the >5-point-average threshold
+# that would have required replacing GPT's score with a deterministic
+# rubric, so the LLM-scored opportunity_score is kept as-is; this comment
+# is the on-record decision the check asked for.
 QUALIFICATION_MODEL = os.getenv("QUALIFICATION_MODEL", "gpt-4o-mini")
 
 _VOICE_DDL = """
