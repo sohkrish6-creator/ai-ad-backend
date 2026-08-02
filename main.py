@@ -365,6 +365,30 @@ _is_sqlite = DATABASE_URL.startswith("sqlite")
 # Mask password for safe logging: show scheme + host only
 _db_host = DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else DATABASE_URL[:40]
 logger.info(f"[DB] Connecting to host: {_db_host} | sqlite={_is_sqlite}")
+
+# Fail loudly rather than silently losing data. `RENDER` is set by the
+# Render platform itself on every service it runs — not something anyone
+# configures — so this only ever fires on an actual Render deployment, never
+# in local dev (where the sqlite fallback above is legitimate and expected).
+# Render's disk is ephemeral: if DATABASE_URL is missing/misconfigured on a
+# real deployment, every batch/prospect/DNC-entry/transcript/lead silently
+# vanishes on the next deploy or restart, with zero warning anywhere. That
+# is strictly worse than refusing to start.
+if os.getenv("RENDER") and _is_sqlite:
+    logger.critical(
+        "[DB] FATAL: running on Render but DATABASE_URL is not set to a real "
+        "Postgres connection string — refusing to start with an ephemeral "
+        "SQLite fallback, which would silently wipe all data on the next "
+        "deploy or restart. Set DATABASE_URL to the Supabase Postgres "
+        "connection string in the Render dashboard's Environment tab, then "
+        "redeploy."
+    )
+    raise RuntimeError(
+        "DATABASE_URL is not a Postgres URL while running on Render — "
+        "refusing to start with an ephemeral SQLite fallback. See the "
+        "[DB] FATAL log line above for what to fix."
+    )
+
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if _is_sqlite else {},
