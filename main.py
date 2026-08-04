@@ -22421,6 +22421,27 @@ _VOICE_PROSPECT_COLS = [
 ]
 
 
+# Revenue Engine only (Voice Outreach rows have recommendation=NULL and are
+# never touched by this). Bug found on a real prospect: Opportunity 0, Need
+# 0, recommendation IGNORE, but estimated_call_success (GPT-generated,
+# independent of the deterministic recommendation) still showed "70%" —
+# inviting the user to call a prospect the system just told them to skip.
+# IGNORE is suppressed outright; everything else is capped so the closing
+# estimate can never exceed how strong the underlying opportunity/need
+# actually is.
+def _consistent_closing_estimate(raw, opportunity_score, need_score, recommendation):
+    if recommendation is None:
+        return raw  # not a Revenue Engine row — leave Voice Outreach untouched
+    if recommendation == "IGNORE":
+        return None
+    m = re.search(r'(\d+)', str(raw or ''))
+    if not m:
+        return raw
+    pct = int(m.group(1))
+    ceiling = max(opportunity_score or 0, need_score or 0)
+    return f"{min(pct, ceiling)}%"
+
+
 def _voice_parse_prospect_row(row) -> dict:
     p = dict(zip(_VOICE_PROSPECT_COLS, row))
     for k in ("weaknesses_json", "evidence_json", "gate_block_reasons_json"):
@@ -22433,6 +22454,9 @@ def _voice_parse_prospect_row(row) -> dict:
         p["signals"] = json.loads(p.pop("signals_json") or "{}")
     except Exception:
         p["signals"] = {}
+    p["estimated_call_success"] = _consistent_closing_estimate(
+        p["estimated_call_success"], p["opportunity_score"], p["need_score"], p["recommendation"]
+    )
     return p
 
 
@@ -22647,7 +22671,11 @@ async def _voice_generate_pitch_script(prospect_id: int, business_name: str, wea
     _bm = (memory or {}).get("business", {})
     memory_used = bool(memory)
 
-    weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in evidence) or "- none detected"
+    # Real weaknesses only — evidence-only entries (e.g. site_unverifiable,
+    # a blocked/bot-challenged 403) are audit-only and must never justify
+    # what the pitch says. See _real_weakness_evidence.
+    real_evidence = _real_weakness_evidence(weaknesses, evidence)
+    weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in real_evidence) or "- none detected"
     offered_labels = [lbl for k, lbl in _VOICE_SERVICE_CATALOG if k in services_offered]
     services_line = ", ".join(offered_labels) if offered_labels else "(no services configured — pitch must stay generic and not name a specific service)"
     if matched_service:
@@ -22717,7 +22745,12 @@ async def _voice_generate_pitch_script(prospect_id: int, business_name: str, wea
 async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str, weaknesses: list, evidence: list,
                                              caller_business_name: str, services_offered: list,
                                              matched_weakness, matched_service) -> dict:
-    weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in evidence) or "- none detected"
+    # Real weaknesses only — see _real_weakness_evidence. Was NOT filtered
+    # here despite the docstring above already claiming it: the exact bug
+    # this fixes (a 403/bot-block leaking into email/WhatsApp/LinkedIn/
+    # Instagram drafts as "your site is down").
+    real_evidence = _real_weakness_evidence(weaknesses, evidence)
+    weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in real_evidence) or "- none detected"
     offered_labels = [lbl for k, lbl in _VOICE_SERVICE_CATALOG if k in services_offered]
     services_line = ", ".join(offered_labels) if offered_labels else "(no services configured — every draft must stay generic and not name a specific service)"
     if matched_service:
@@ -23286,6 +23319,23 @@ _VOICE_WEAKNESS_SERVICE_MAP = {
     "low_review_count": "reputation_management",
     "inactive_listing": "social_media_management",
 }
+
+
+def _real_weakness_evidence(weaknesses: list, evidence: list) -> list:
+    """Evidence entries whose type is an actual REAL weakness — excludes
+    evidence-only entries added via _add_evidence_only (currently just
+    site_unverifiable: a blocked/bot-challenged/timed-out fetch, recorded
+    for audit but never counted as a weakness — see _detect_voice_weaknesses).
+    Bug found on a real prospect (weddingplannersinjaipur.com, 403): scoring
+    already excludes site_unverifiable correctly (it keys off `weaknesses`,
+    never `evidence`), but every pitch/script/outreach generator was built
+    from the full `evidence` list instead, so GPT told the owner their site
+    was "facing an accessibility issue" when it was actually just bot-
+    protected — false and credibility-destroying on a live call. Every
+    place that builds pitch-facing text from evidence MUST filter through
+    this first, never iterate `evidence` directly."""
+    weakness_set = set(weaknesses or [])
+    return [e for e in (evidence or []) if e.get("type") in weakness_set]
 
 
 def _voice_match_service(weaknesses: list, evidence: list, services_offered: list) -> tuple:
@@ -24905,7 +24955,11 @@ async def revenue_engine_call_assistant(prospect_id: int, request: Request):
             "phone_e164": prospect["phone_e164"], "website": prospect["website"],
             "google_rating": prospect["google_rating"], "total_reviews": prospect["total_reviews"],
         },
-        "pain_points": prospect["evidence"],
+        # Real weaknesses only — never an evidence-only entry like
+        # site_unverifiable (see _real_weakness_evidence). This field is
+        # what arms the salesperson for the live call; a false "your site
+        # is down" is worse than showing nothing.
+        "pain_points": _real_weakness_evidence(prospect["weaknesses"], prospect["evidence"]),
         "call_script": call_script,
         "suggested_offer": {
             "matched_weakness": prospect["matched_weakness"], "matched_service": prospect["matched_service"],
