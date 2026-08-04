@@ -21674,6 +21674,69 @@ def _detect_voice_weaknesses(prospect: dict, fetch_result: dict) -> tuple:
     return weaknesses, evidence
 
 
+# Revenue Engine Quick Scan: signals Voice Outreach never needed, kept
+# entirely separate from _detect_voice_weaknesses/weaknesses_json/
+# evidence_json so that function and the site_unverifiable-vs-
+# site_unreachable distinction it makes are never touched. "Google Ads
+# detected" / "Meta Pixel detected" from the spec are already covered by
+# the existing missing_tracking check above (GA/GTM/Meta Pixel script-tag
+# scan) — re-derived here as a positive-framed signal, not re-implemented.
+# Instagram activity/last-post-recency has NO real signal available (no
+# Instagram API integrated anywhere in this codebase) — honestly reported
+# as unverified rather than fabricated, same discipline as site_unverifiable.
+def _quick_scan_extra_signals(prospect: dict, fetch_result: dict, weaknesses: list) -> dict:
+    website = (prospect.get("website") or "").strip()
+    signals = {
+        "https": None, "mobile_friendly": None, "tracking_detected": None,
+        "instagram_active": None, "instagram_note": "unverified — no Instagram API integrated",
+    }
+    if website:
+        signals["https"] = website.lower().startswith("https://")
+        fetch_status = fetch_result.get("fetch_status", "ok")
+        if fetch_status == "ok":
+            html_lower = (fetch_result.get("html", "") or "").lower()
+            signals["mobile_friendly"] = 'name="viewport"' in html_lower or "name='viewport'" in html_lower
+            signals["tracking_detected"] = "missing_tracking" not in weaknesses
+    return signals
+
+
+# Deterministic (no GPT) severity weights per REAL detected weakness type —
+# used only for Need Score, never for opportunity_score (that stays
+# GPT-judged, per the Item 3 stability check already on record). Mirrors
+# the evidence-confidence ordering already used by _voice_match_service.
+_VOICE_NEED_WEIGHTS = {
+    "no_website": 30, "site_unreachable": 25, "poor_reviews": 25,
+    "inactive_listing": 20, "low_review_count": 15, "missing_tracking": 15,
+    "weak_seo_title": 10, "weak_seo_meta": 10, "no_cta": 10,
+}
+
+
+def _compute_need_score(weaknesses: list, evidence: list) -> int:
+    """How badly this business needs help — deterministic, distinct from
+    opportunity_score (which also weighs business scale) and confidence_score
+    (which measures evidence quality, not need)."""
+    conf_by_type = {}
+    for e in evidence or []:
+        t = e.get("type")
+        conf_by_type[t] = max(conf_by_type.get(t, 0.0), e.get("confidence", 0.0))
+    total = sum(_VOICE_NEED_WEIGHTS.get(w, 5) * conf_by_type.get(w, 1.0) for w in (weaknesses or []))
+    return min(100, round(total))
+
+
+def _compute_recommendation(priority: str, gate_blocked: bool, service_fit) -> str:
+    """CALL / FOLLOW_LATER / IGNORE — deterministic, no GPT call, so Quick
+    Scan stays inside its ~20-30s/business budget. A blocked gate or a
+    confirmed no-service-fit (False, not None/unset) means we can't act on
+    this prospect yet regardless of how strong the opportunity looks."""
+    if gate_blocked or service_fit is False:
+        return "IGNORE"
+    if priority == "high":
+        return "CALL"
+    if priority == "medium":
+        return "FOLLOW_LATER"
+    return "IGNORE"
+
+
 def _get_or_create_voice_settings(user_id: str) -> dict:
     with engine.connect() as conn:
         row = conn.execute(text(
@@ -21943,7 +22006,48 @@ def _voice_cap_priority(priority, confidence_score) -> str:
     return priority
 
 
-async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int):
+_QUICK_SCAN_CACHE_DAYS = int(os.getenv("QUICK_SCAN_CACHE_DAYS", "7"))
+_QUICK_SCAN_CONCURRENCY = int(os.getenv("QUICK_SCAN_CONCURRENCY", "5"))
+
+
+def _quick_scan_cache_lookup(user_id: str, place_ids: list) -> dict:
+    """Revenue Engine only: the most recent row per place_id (any channel —
+    a business's own weaknesses don't depend on which module scanned it)
+    within the cache window, so re-running a segment never re-fetches a
+    fresh scan for a business already scanned recently. Returns
+    {place_id: row_dict}; callers skip the homepage-fetch + weakness-
+    detection + GPT-scoring steps entirely for any place_id present here."""
+    place_ids = [p for p in place_ids if p]
+    if not place_ids:
+        return {}
+    cutoff = (datetime.utcnow() - timedelta(days=_QUICK_SCAN_CACHE_DAYS)).isoformat()
+    # text() doesn't auto-expand a tuple/list bound to a single :param inside
+    # IN (...) on either dialect — build one placeholder per id instead of
+    # relying on ANY()/IN-with-tuple, which avoids a dialect split entirely.
+    placeholders = ", ".join(f":pid{i}" for i in range(len(place_ids)))
+    params = {f"pid{i}": pid for i, pid in enumerate(place_ids)}
+    params.update({"uid": user_id, "cutoff": cutoff})
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT place_id, weaknesses_json, evidence_json, opportunity_score, business_score, "
+            "confidence_score, priority, reason, estimated_roi, estimated_call_success, signals_json, "
+            "scanned_at, created_at FROM voice_prospects "
+            f"WHERE user_id=:uid AND place_id IN ({placeholders}) AND COALESCE(scanned_at, created_at) >= :cutoff "
+            "ORDER BY COALESCE(scanned_at, created_at) DESC"
+        ), params).fetchall()
+    cols = ["place_id", "weaknesses_json", "evidence_json", "opportunity_score", "business_score",
+            "confidence_score", "priority", "reason", "estimated_roi", "estimated_call_success",
+            "signals_json", "scanned_at", "created_at"]
+    latest_by_place = {}
+    for r in rows:
+        d = dict(zip(cols, r))
+        if d["place_id"] not in latest_by_place:  # first row per place_id = most recent, by ORDER BY above
+            latest_by_place[d["place_id"]] = d
+    return latest_by_place
+
+
+async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int,
+                                channel: str = "voice"):
     now = datetime.utcnow().isoformat()
     _voice_batch_update(batch_id, status="running", started_at=now, current_step="Searching Google Places", progress_pct=5)
     try:
@@ -22017,26 +22121,48 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 } for p in filtered_out])
             logger.info(f"[VOICE-BATCH] {batch_id}: {len(filtered_out)} business(es) enterprise-filtered")
 
+        # Revenue Engine only (cache_hits stays empty for channel="voice",
+        # so every branch below that checks it is a no-op there — Voice
+        # Outreach's existing behavior is unaffected): skip the expensive
+        # homepage-fetch + weakness-detection + GPT-scoring steps entirely
+        # for any business scanned within the last _QUICK_SCAN_CACHE_DAYS.
+        cache_hits = {}
+        if channel == "revenue_engine":
+            _voice_batch_update(batch_id, current_step="Checking scan cache", progress_pct=34)
+            cache_hits = _quick_scan_cache_lookup(user_id, [p["place_id"] for p in enriched])
+        to_scan = [p for p in enriched if p["place_id"] not in cache_hits]
+
         _voice_batch_update(batch_id, current_step="Fetching homepages", progress_pct=35)
         _empty_fetch = {"html": "", "fetch_status": "ok", "detail": ""}
         homepages = await _gather_in_chunks(
-            [_fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result=_empty_fetch) for p in enriched],
-            chunk_size=10,
+            [_fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result=_empty_fetch) for p in to_scan],
+            chunk_size=_QUICK_SCAN_CONCURRENCY if channel == "revenue_engine" else 10,
         )
 
         _voice_batch_update(batch_id, current_step="Detecting weaknesses", progress_pct=45)
-        for i, p in enumerate(enriched):
+        for i, p in enumerate(to_scan):
             fetch_result = homepages[i] if isinstance(homepages[i], dict) else _empty_fetch
             weaknesses, evidence = _detect_voice_weaknesses(p, fetch_result)
             p["weaknesses"] = weaknesses
             p["evidence"] = evidence
+            if channel == "revenue_engine":
+                p["signals"] = _quick_scan_extra_signals(p, fetch_result, weaknesses)
+                p["scanned_at"] = datetime.utcnow().isoformat()
+
+        for p in enriched:
+            c = cache_hits.get(p["place_id"])
+            if c:
+                p["weaknesses"] = json.loads(c["weaknesses_json"] or "[]")
+                p["evidence"] = json.loads(c["evidence_json"] or "[]")
+                p["signals"] = json.loads(c["signals_json"] or "{}")
+                p["scanned_at"] = c["scanned_at"] or c["created_at"]
 
         _voice_batch_update(batch_id, current_step="Scoring & qualifying prospects", progress_pct=60)
         SCORE_BATCH_SIZE = 15
-        score_batches = [enriched[i:i + SCORE_BATCH_SIZE] for i in range(0, len(enriched), SCORE_BATCH_SIZE)]
+        score_batches = [to_scan[i:i + SCORE_BATCH_SIZE] for i in range(0, len(to_scan), SCORE_BATCH_SIZE)]
         batch_results = await asyncio.gather(
             *[_score_voice_prospect_batch(industry, search_scope, b) for b in score_batches]
-        )
+        ) if to_scan else []
         scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
 
         _voice_batch_update(batch_id, current_step="Normalizing phone numbers & compliance gates", progress_pct=80)
@@ -22046,15 +22172,25 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         ts = datetime.utcnow().isoformat()
         services_offered = settings.get("services_offered") or []
         for p in enriched:
-            score = scores_by_name.get(p["business_name"], {})
+            cached = cache_hits.get(p["place_id"])
+            if cached:
+                score = {
+                    "opportunity_score": cached["opportunity_score"], "business_score": cached["business_score"],
+                    "priority": cached["priority"], "reason": cached["reason"],
+                    "estimated_roi": cached["estimated_roi"], "estimated_call_success": cached["estimated_call_success"],
+                }
+                confidence_score = cached["confidence_score"]
+            else:
+                score = scores_by_name.get(p["business_name"], {})
+                confidences = [e.get("confidence", 0) for e in p["evidence"]]
+                confidence_score = int(round(100 * (sum(confidences) / len(confidences)))) if confidences else 50
             phone_e164 = _normalize_phone_e164(p["phone_raw"])
             gate = _voice_check_gates(user_id, phone_e164, None, settings)
-            confidences = [e.get("confidence", 0) for e in p["evidence"]]
-            confidence_score = int(round(100 * (sum(confidences) / len(confidences)))) if confidences else 50
             if not gate["blocked"]:
                 total_qualified += 1
             matched_weakness, matched_service = _voice_match_service(p["weaknesses"], p["evidence"], services_offered)
-            rows.append({
+            priority_capped = _voice_cap_priority(score.get("priority"), confidence_score)
+            row = {
                 "batch_id": batch_id, "user_id": user_id, "place_id": p["place_id"],
                 "business_name": p["business_name"], "address": p["address"],
                 "phone_raw": p["phone_raw"], "phone_e164": phone_e164, "website": p["website"],
@@ -22062,7 +22198,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "business_status": p["business_status"],
                 "opportunity_score": score.get("opportunity_score"), "business_score": score.get("business_score"),
                 "confidence_score": confidence_score,
-                "priority": _voice_cap_priority(score.get("priority"), confidence_score),
+                "priority": priority_capped,
                 "reason": score.get("reason"), "estimated_roi": score.get("estimated_roi"),
                 "estimated_call_success": score.get("estimated_call_success"),
                 "weaknesses_json": json.dumps(p["weaknesses"]), "evidence_json": json.dumps(p["evidence"]),
@@ -22073,7 +22209,15 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "matched_weakness": matched_weakness, "matched_service": matched_service,
                 "service_fit": matched_service is not None,
                 "created_at": ts, "updated_at": ts,
-            })
+                "channel": channel, "signals_json": None, "need_score": None,
+                "recommendation": None, "scanned_at": None,
+            }
+            if channel == "revenue_engine":
+                row["signals_json"] = json.dumps(p.get("signals") or {})
+                row["need_score"] = _compute_need_score(p["weaknesses"], p["evidence"])
+                row["recommendation"] = _compute_recommendation(priority_capped, gate["blocked"], row["service_fit"])
+                row["scanned_at"] = p.get("scanned_at") or ts
+            rows.append(row)
 
         _voice_batch_update(batch_id, current_step="Saving prospects", progress_pct=92)
         if rows:
@@ -22084,13 +22228,15 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                     "opportunity_score, business_score, confidence_score, priority, reason, estimated_roi, "
                     "estimated_call_success, weaknesses_json, evidence_json, dnc_status, cooldown_status, "
                     "missing_phone, gate_blocked, gate_block_reasons_json, matched_weakness, matched_service, "
-                    "service_fit, created_at, updated_at) "
+                    "service_fit, created_at, updated_at, channel, signals_json, need_score, recommendation, "
+                    "scanned_at) "
                     "VALUES (:batch_id, :user_id, :place_id, :business_name, :address, "
                     ":phone_raw, :phone_e164, :website, :google_rating, :total_reviews, :business_status, "
                     ":opportunity_score, :business_score, :confidence_score, :priority, :reason, :estimated_roi, "
                     ":estimated_call_success, :weaknesses_json, :evidence_json, :dnc_status, :cooldown_status, "
                     ":missing_phone, :gate_blocked, :gate_block_reasons_json, :matched_weakness, :matched_service, "
-                    ":service_fit, :created_at, :updated_at)"
+                    ":service_fit, :created_at, :updated_at, :channel, :signals_json, :need_score, "
+                    ":recommendation, :scanned_at)"
                 ), rows)
 
         finished = datetime.utcnow().isoformat()
@@ -22105,17 +22251,18 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         _voice_batch_update(batch_id, status="failed", error=str(_e), finished_at=datetime.utcnow().isoformat())
 
 
-def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: int) -> str:
+def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: int,
+                        channel: str = "voice", goal_json: str = None) -> str:
     batch_id = uuid.uuid4().hex
     now = datetime.utcnow().isoformat()
     with engine.begin() as conn:
         conn.execute(text(
             "INSERT INTO voice_batches (id, user_id, industry, city, max_prospects, status, progress_pct, "
-            "current_step, created_at) VALUES (:id, :uid, :industry, :city, :max_prospects, 'queued', 0, "
-            "'Queued', :ts)"
+            "current_step, created_at, channel, goal_json) VALUES (:id, :uid, :industry, :city, :max_prospects, "
+            "'queued', 0, 'Queued', :ts, :channel, :goal_json)"
         ), {"id": batch_id, "uid": user_id, "industry": industry, "city": city,
-            "max_prospects": max_prospects, "ts": now})
-    asyncio.create_task(_run_voice_batch_job(batch_id, user_id, industry, city, max_prospects))
+            "max_prospects": max_prospects, "ts": now, "channel": channel, "goal_json": goal_json})
+    asyncio.create_task(_run_voice_batch_job(batch_id, user_id, industry, city, max_prospects, channel=channel))
     return batch_id
 
 
@@ -22258,7 +22405,7 @@ async def voice_outreach_build_batch(payload: VoiceBatchBuildRequest, request: R
 
 _VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "status", "progress_pct",
                      "current_step", "total_found", "total_qualified", "error", "started_at",
-                     "finished_at", "created_at"]
+                     "finished_at", "created_at", "channel", "goal_json"]
 
 _VOICE_PROSPECT_COLS = [
     "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
@@ -22269,6 +22416,8 @@ _VOICE_PROSPECT_COLS = [
     "approval_status", "approved_by", "approved_at", "rejected_reason", "script_id", "lead_id",
     "created_at", "updated_at", "rescore_note", "filter_reason",
     "matched_weakness", "matched_service", "service_fit",
+    "channel", "signals_json", "need_score", "recommendation", "scanned_at",
+    "last_outcome", "last_outcome_at",
 ]
 
 
@@ -22280,6 +22429,10 @@ def _voice_parse_prospect_row(row) -> dict:
             p[target] = json.loads(p.pop(k) or "[]")
         except Exception:
             p[target] = []
+    try:
+        p["signals"] = json.loads(p.pop("signals_json") or "{}")
+    except Exception:
+        p["signals"] = {}
     return p
 
 
@@ -22549,6 +22702,63 @@ async def _voice_generate_pitch_script(prospect_id: int, business_name: str, wea
         label=f"voice-outreach script generation (prospect {prospect_id})",
     )
     return script, norm_key
+
+
+# Revenue Engine's multi-channel outreach generator. Deliberately NOT
+# outreach_ai() (main.py ~5741) — that function sources the CALLING
+# business's own identity/positioning from Marketing Brain memory keyed by
+# a fuzzy URL/industry/city match, which is exactly the fragile-identity
+# bug class fixed above for Voice Outreach ("Alex from Digital Marketing
+# Agency"). Also deliberately NOT a call into _voice_generate_pitch_script
+# itself (kept untouched, zero regression risk to an already-shipped,
+# tested module) — this is its own small sibling reusing the same
+# discipline: tenant identity from voice_settings.business_name, pitch
+# constrained to services_offered, real detected weaknesses only.
+async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str, weaknesses: list, evidence: list,
+                                             caller_business_name: str, services_offered: list,
+                                             matched_weakness, matched_service) -> dict:
+    weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in evidence) or "- none detected"
+    offered_labels = [lbl for k, lbl in _VOICE_SERVICE_CATALOG if k in services_offered]
+    services_line = ", ".join(offered_labels) if offered_labels else "(no services configured — every draft must stay generic and not name a specific service)"
+    if matched_service:
+        matched_label = dict(_VOICE_SERVICE_CATALOG).get(matched_service, matched_service)
+        focus_line = (
+            f"Focus: the prospect's strongest matching weakness is '{matched_weakness}'. "
+            f"Every draft below should center on how our '{matched_label}' service solves it."
+        )
+    else:
+        focus_line = (
+            "Focus: none of the prospect's detected weaknesses map to a service we offer. Keep every draft "
+            "general and honest about how our offered services could still help — do NOT claim we can fix a "
+            "specific detected weakness we have no matching service for."
+        )
+
+    def _build_messages(correction):
+        prompt = (
+            f"You are writing cold-outreach drafts on behalf of {caller_business_name}, a marketing/growth "
+            f"agency, to reach {business_name}, a prospect business.\n\n"
+            f"REAL detected weaknesses for {business_name} (cite specifically — never invent others):\n{weakness_lines}\n\n"
+            f"Services {caller_business_name} actually offers — ONLY ever pitch from this exact list, NEVER "
+            f"mention or imply any other service:\n{services_line}\n\n"
+            f"{focus_line}\n\n"
+            f"Never mention the platform name 'Adsoh' anywhere — {caller_business_name} is the only identity "
+            "that should appear. Never invent a human sender name, fabricated statistics, or fake client names.\n"
+            + (f"\n{correction}\n" if correction else "") +
+            "\nReturn JSON with a draft for EACH channel (call scripts are handled by a separate, dedicated "
+            "generator that already exists — do not include one here):\n"
+            "{\n"
+            '  "cold_email": {"subject": "...", "body": "..."},\n'
+            '  "whatsapp": {"message_1": "opening pain-point message", "message_2": "proof/value follow-up"},\n'
+            '  "linkedin": {"connection_note": "under 300 chars", "follow_up_message": "..."},\n'
+            '  "instagram_dm": {"opener": "...", "follow_up": "..."}\n'
+            "}\nReturn ONLY valid JSON."
+        )
+        return [{"role": "user", "content": prompt}]
+
+    return await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o-mini", max_tokens=1500, temperature=0.4, retries=1,
+        label=f"revenue-engine outreach drafts (prospect {prospect_id})",
+    )
 
 
 def _voice_persist_script_version(uid: str, prospect_id: int, disclosure_line: str, script: dict,
@@ -22950,12 +23160,90 @@ for _vtbl, _vcol, _vtype in [
     # existing data" precedent. Freshly-scored prospects always get a real
     # computed value, never this default.
     ("voice_prospects", "service_fit", "BOOLEAN DEFAULT TRUE"),
+    # Revenue Engine: generalizes voice_batches/voice_prospects into a
+    # shared prospect store rather than building a third one (prospect_memory,
+    # the OTHER pre-existing "Prospect Discovery" module, is a single JSON
+    # blob per industry::city with no row identity/approval/gating/CRM
+    # linkage — not viable to build on). channel distinguishes which module
+    # owns a batch/prospect; every existing call site omits it and gets the
+    # 'voice' default, so Voice Outreach's behavior is byte-for-byte
+    # unchanged by this addition.
+    ("voice_batches", "channel", "TEXT DEFAULT 'voice'"),
+    ("voice_batches", "goal_json", "TEXT"),
+    ("voice_prospects", "channel", "TEXT DEFAULT 'voice'"),
+    # Extra Quick Scan signals (mobile-friendly/HTTPS/tracking) that Voice
+    # Outreach's own weakness taxonomy never needed — kept in a separate
+    # column rather than folded into weaknesses_json/evidence_json so the
+    # existing taxonomy (and the site_unverifiable-vs-site_unreachable
+    # distinction) is never touched or regressed.
+    ("voice_prospects", "signals_json", "TEXT DEFAULT '{}'"),
+    ("voice_prospects", "need_score", "INTEGER"),
+    ("voice_prospects", "recommendation", "TEXT"),
+    # When this row's scan data was actually captured — distinct from
+    # created_at, which is when THIS batch row was inserted. A prospect
+    # copied forward from the 7-day cache keeps its original scanned_at so
+    # staleness is judged against the real scan, not the copy.
+    ("voice_prospects", "scanned_at", "TEXT"),
+    # Revenue Engine's Call Assistant is a human-dialed call (unlike Voice
+    # Outreach's AI dialer) — one-tap outcome logging writes here directly,
+    # no voice_calls row involved. Lets Today's Priority exclude a prospect
+    # already actioned without a separate "actioned" table.
+    ("voice_prospects", "last_outcome", "TEXT"),
+    ("voice_prospects", "last_outcome_at", "TEXT"),
 ]:
     try:
         with engine.begin() as _vmc:
             _vmc.execute(text(f"ALTER TABLE {_vtbl} ADD COLUMN {_vcol} {_vtype}"))
     except Exception:
         pass  # column already exists
+
+# New Revenue Engine tables — additive, no existing table touched.
+_REVENUE_DDL = """
+CREATE TABLE IF NOT EXISTS revenue_goals (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    batch_id TEXT,
+    goal_type TEXT NOT NULL,
+    industry TEXT,
+    city TEXT,
+    target_count INTEGER,
+    target_amount_micros BIGINT,
+    status TEXT DEFAULT 'active',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS revenue_rate_cards (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    service_key TEXT NOT NULL,
+    price_micros BIGINT NOT NULL,
+    currency TEXT DEFAULT 'INR',
+    unit TEXT DEFAULT 'month',
+    updated_at TEXT NOT NULL,
+    UNIQUE(user_id, service_key)
+);
+CREATE TABLE IF NOT EXISTS revenue_outreach_drafts (
+    id SERIAL PRIMARY KEY,
+    prospect_id BIGINT NOT NULL,
+    user_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    draft_json TEXT NOT NULL,
+    status TEXT DEFAULT 'draft',
+    sent_at TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+try:
+    _rddl = _REVENUE_DDL
+    if _is_sqlite:
+        _rddl = _rddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.begin() as _rconn:
+        for _rstmt in _rddl.strip().split(";"):
+            _rstmt = _rstmt.strip()
+            if _rstmt:
+                _rconn.execute(text(_rstmt))
+    logger.info("[REVENUE] revenue_goals/revenue_rate_cards tables ready")
+except Exception as _re:
+    logger.error(f"[REVENUE] table creation failed: {_re}")
 
 # voice_calls.prospect_id must be nullable for test calls (no real prospect
 # involved) — Postgres-only syntax (SQLite has no ALTER COLUMN, but fresh
@@ -24258,3 +24546,479 @@ async def voice_outreach_learning_insights(request: Request):
         "common_objections": [{"objection": o, "count": c} for o, c in common_objections],
         "note": "Recommendations only — never auto-applied. Excludes is_test and is_dry_run calls.",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REVENUE ENGINE — PHASE 1 (goal parsing, Quick Scan discovery, pipeline, today's
+# priority, call assistant, multi-channel outreach drafts, outcome logging)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PROSPECT-STORE DECISION (investigated before writing any schema, not decided
+#  silently): generalizes voice_batches/voice_prospects via a new `channel`
+#  column ('voice' | 'revenue_engine') rather than building a third store.
+#  prospect_memory — the OTHER pre-existing "Prospect Discovery" module — is a
+#  single JSON blob per industry::city with no row identity, no approval
+#  workflow, no DNC/cooldown gating, and no CRM linkage; not viable to build
+#  on. voice_prospects already has everything Revenue Engine needs. Every
+#  existing Voice Outreach call site omits `channel` and gets the 'voice'
+#  default, so its behavior is byte-for-byte unchanged (verified locally).
+#
+#  OUTREACH-GENERATION DECISION: does NOT call outreach_ai() (main.py
+#  ~5741) — it sources the calling business's own identity from Marketing
+#  Brain memory (fuzzy URL/industry/city match), the exact bug class fixed
+#  in Voice Outreach's Item 2 ("Alex from Digital Marketing Agency"). Reuses
+#  Voice Outreach's own tenant-identity-sourced approach instead (identity
+#  from voice_settings.business_name, pitch constrained to services_offered).
+#
+#  PIPELINE / GET /voice-outreach/batches/{id} IS REUSED AS-IS for Revenue
+#  Engine's Pipeline view (both _VOICE_BATCH_COLS and _VOICE_PROSPECT_COLS
+#  now include channel/goal_json/signals_json/need_score/recommendation/
+#  scanned_at) — no separate pipeline-fetch endpoint duplicated here.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Goal parsing ──────────────────────────────────────────────────────────────
+
+class RevenueGoalParseRequest(BaseModel):
+    text: str
+
+
+@app.post("/revenue-engine/parse-goal")
+async def revenue_engine_parse_goal(payload: RevenueGoalParseRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user_text = (payload.text or "").strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    def _build_messages(correction):
+        prompt = (
+            "Parse this sales goal into structured JSON. The user is an agency owner describing either a "
+            "segment they want to prospect, or a revenue target for this month.\n\n"
+            f"Input: \"{user_text}\"\n\n"
+            + (f"\n{correction}\n" if correction else "") +
+            "\nReturn JSON:\n"
+            "{\n"
+            '  "goal_type": "segment" or "revenue",\n'
+            '  "industry": "e.g. hotels, wedding planners — empty string if not mentioned",\n'
+            '  "city": "empty string if not mentioned",\n'
+            '  "target_count": integer or null (segment goals with an explicit headcount, e.g. \\"5 hotel clients\\"),\n'
+            '  "target_amount": integer or null (revenue goals, in INR with no symbols/commas),\n'
+            '  "needs_clarification": true only if industry is missing for a segment goal\n'
+            "}\nReturn ONLY valid JSON."
+        )
+        return [{"role": "user", "content": prompt}]
+
+    parsed = await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o-mini", max_tokens=300, temperature=0.1, retries=1,
+        label="revenue-engine goal parsing",
+    )
+    return {"success": True, "goal": parsed}
+
+
+# ── Discovery (Quick Scan) ──────────────────────────────────────────────────────
+
+class RevenueDiscoverRequest(BaseModel):
+    goal_type: str
+    industry: str = ""
+    city: str = ""
+    target_count: int | None = None
+    target_amount: int | None = None
+
+
+# Phase 1 fallback ONLY, used to size a revenue-goal discovery batch before
+# Goal Mode's editable, outcome-adjusting assumptions panel exists (Phase 2
+# per the spec's own phasing). Prefers the tenant's real rate-card average
+# when one exists; this flat figure is never presented to the user as a
+# real number, only used internally to decide how many prospects to fetch.
+_REVENUE_DEFAULT_AVG_DEAL_MICROS = int(os.getenv("REVENUE_DEFAULT_AVG_DEAL_MICROS", str(20000 * 1_000_000)))
+
+
+@app.post("/revenue-engine/discover")
+async def revenue_engine_discover(payload: RevenueDiscoverRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    industry = (payload.industry or "").strip()
+    if not industry:
+        raise HTTPException(status_code=400, detail="industry is required — ask the user to clarify before calling this")
+    goal_type = (payload.goal_type or "").strip().lower()
+    if goal_type not in ("segment", "revenue"):
+        raise HTTPException(status_code=400, detail="goal_type must be 'segment' or 'revenue'")
+
+    max_prospects = 15
+    if payload.target_count:
+        max_prospects = min(50, max(5, payload.target_count * 3))  # rough prospect-to-client funnel padding
+    elif goal_type == "revenue" and payload.target_amount:
+        with engine.connect() as conn:
+            avg_price = conn.execute(text(
+                "SELECT AVG(price_micros) FROM revenue_rate_cards WHERE user_id=:uid"
+            ), {"uid": uid}).scalar()
+        avg_deal_micros = avg_price or _REVENUE_DEFAULT_AVG_DEAL_MICROS
+        target_micros = payload.target_amount * 1_000_000
+        required_clients = -(-int(target_micros) // int(avg_deal_micros))  # ceil division, no extra import
+        max_prospects = min(50, max(15, required_clients * 5))
+
+    now = datetime.utcnow().isoformat()
+    goal_json = json.dumps({
+        "goal_type": goal_type, "industry": industry, "city": payload.city,
+        "target_count": payload.target_count, "target_amount": payload.target_amount,
+    })
+    batch_id = _start_voice_batch(uid, industry, (payload.city or "").strip(), max_prospects,
+                                   channel="revenue_engine", goal_json=goal_json)
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO revenue_goals (user_id, batch_id, goal_type, industry, city, target_count, "
+            "target_amount_micros, status, created_at) VALUES (:uid, :bid, :gt, :ind, :city, :tc, :ta, 'active', :ts)"
+        ), {
+            "uid": uid, "bid": batch_id, "gt": goal_type, "ind": industry, "city": payload.city,
+            "tc": payload.target_count, "ta": (payload.target_amount * 1_000_000) if payload.target_amount else None,
+            "ts": now,
+        })
+
+    return {"success": True, "batch_id": batch_id, "max_prospects": max_prospects}
+
+
+# ── Today's Priority ─────────────────────────────────────────────────────────
+
+@app.get("/revenue-engine/todays-priority")
+async def revenue_engine_todays_priority(request: Request, size: int = 10):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    size = max(1, min(size, 50))
+    order_sql = (
+        "CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, "
+        "COALESCE(need_score, 0) DESC"
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT {', '.join(_VOICE_PROSPECT_COLS)} FROM voice_prospects "
+            "WHERE user_id=:uid AND channel='revenue_engine' AND gate_blocked=FALSE "
+            "AND approval_status NOT IN ('rejected', 'filtered') "
+            "AND (service_fit IS NULL OR service_fit=TRUE) "
+            "AND last_outcome IS NULL "
+            f"ORDER BY {order_sql} LIMIT :n"
+        ), {"uid": uid, "n": size}).fetchall()
+    prospects = [_voice_parse_prospect_row(r) for r in rows]
+    counts = {"CALL": 0, "FOLLOW_LATER": 0, "IGNORE": 0}
+    for p in prospects:
+        if p.get("recommendation") in counts:
+            counts[p["recommendation"]] += 1
+    return {"success": True, "prospects": prospects, "counts": counts}
+
+
+# ── Outreach drafts (email / WhatsApp / LinkedIn / Instagram DM) ────────────────
+
+@app.post("/revenue-engine/prospects/{prospect_id}/outreach-drafts")
+async def revenue_engine_generate_outreach_drafts(prospect_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT business_name, weaknesses_json, evidence_json, matched_weakness, matched_service "
+            "FROM voice_prospects WHERE id=:id AND user_id=:uid"
+        ), {"id": prospect_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+    business_name, weaknesses_json, evidence_json, matched_weakness, matched_service = row
+    weaknesses = json.loads(weaknesses_json or "[]")
+    evidence = json.loads(evidence_json or "[]")
+
+    settings = _get_or_create_voice_settings(uid)
+    caller_business_name = (settings.get("business_name") or "").strip()
+    if not caller_business_name:
+        return {
+            "success": False, "blocked_reason": "missing_business_profile",
+            "message": "Complete your business profile in Settings — add your business name before generating outreach.",
+        }
+    services_offered = settings.get("services_offered") or []
+
+    drafts = await _revenue_generate_outreach_drafts(
+        prospect_id, business_name, weaknesses, evidence, caller_business_name, services_offered,
+        matched_weakness, matched_service,
+    )
+
+    now = datetime.utcnow().isoformat()
+    saved = []
+    with engine.begin() as conn:
+        for channel, content in drafts.items():
+            new_id = conn.execute(text(
+                "INSERT INTO revenue_outreach_drafts (prospect_id, user_id, channel, draft_json, status, created_at) "
+                "VALUES (:pid, :uid, :ch, :draft, 'draft', :ts) RETURNING id"
+            ), {"pid": prospect_id, "uid": uid, "ch": channel, "draft": json.dumps(content), "ts": now}).scalar()
+            saved.append({"id": new_id, "channel": channel, "content": content, "status": "draft"})
+
+    return {"success": True, "drafts": saved}
+
+
+@app.get("/revenue-engine/prospects/{prospect_id}/outreach-drafts")
+async def revenue_engine_list_outreach_drafts(prospect_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, channel, draft_json, status, sent_at, created_at FROM revenue_outreach_drafts "
+            "WHERE prospect_id=:pid AND user_id=:uid ORDER BY created_at DESC"
+        ), {"pid": prospect_id, "uid": uid}).fetchall()
+    drafts = []
+    for id_, channel, draft_json, status, sent_at, created_at in rows:
+        drafts.append({
+            "id": id_, "channel": channel, "content": json.loads(draft_json or "{}"),
+            "status": status, "sent_at": sent_at, "created_at": created_at,
+        })
+    return {"success": True, "drafts": drafts}
+
+
+class RevenueMarkSentRequest(BaseModel):
+    pass
+
+
+@app.post("/revenue-engine/outreach-drafts/{draft_id}/mark-sent")
+async def revenue_engine_mark_draft_sent(draft_id: int, request: Request):
+    """Nothing sends automatically anywhere in this module — this is the
+    one-tap user action that records "I sent this myself" after copying the
+    draft into email/WhatsApp/LinkedIn/Instagram, same discipline as Voice
+    Outreach's voice_followups.status flow."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT prospect_id, channel FROM revenue_outreach_drafts WHERE id=:id AND user_id=:uid"
+        ), {"id": draft_id, "uid": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        prospect_id, channel = row
+        conn.execute(text(
+            "UPDATE revenue_outreach_drafts SET status='sent', sent_at=:ts WHERE id=:id"
+        ), {"ts": now, "id": draft_id})
+
+        prow = conn.execute(text("SELECT business_name, phone_e164, lead_id FROM voice_prospects WHERE id=:id"), {"id": prospect_id}).fetchone()
+        if prow:
+            business_name, phone_e164, lead_id = prow
+            lead_id = _revenue_find_or_create_lead(conn, uid, lead_id, prospect_id, business_name, phone_e164, now)
+            conn.execute(text(
+                "INSERT INTO lead_timeline_events (lead_id, user_id, event_type, event_data_json, source, created_at) "
+                "VALUES (:lid, :uid, 'outreach_sent', :data, 'revenue_engine', :ts)"
+            ), {"lid": lead_id, "uid": uid, "data": json.dumps({"draft_id": draft_id, "channel": channel}), "ts": now})
+
+    return {"success": True, "status": "sent"}
+
+
+def _revenue_find_or_create_lead(conn, user_id: str, lead_id, prospect_id: int, business_name: str, phone_e164: str, now: str) -> int:
+    """Same find-or-create-by-phone pattern as _voice_crm_sync (main.py
+    ~24192) — reused, not reimplemented differently. Must run inside the
+    caller's own `with engine.begin() as conn:` block (takes conn, not its
+    own connection) since callers combine it with other writes in one
+    transaction."""
+    if lead_id:
+        return lead_id
+    existing = conn.execute(text(
+        "SELECT id FROM leads WHERE user_id=:uid AND phone=:phone"
+    ), {"uid": user_id, "phone": phone_e164}).fetchone()
+    if existing:
+        lead_id = existing[0]
+    else:
+        lead_id = conn.execute(text(
+            "INSERT INTO leads (name, phone, source, status, user_id, created_at) "
+            "VALUES (:name, :phone, 'revenue_engine', 'New', :uid, :ts) RETURNING id"
+        ), {"name": business_name, "phone": phone_e164, "uid": user_id, "ts": now}).scalar()
+    conn.execute(text("UPDATE voice_prospects SET lead_id=:lid WHERE id=:pid"), {"lid": lead_id, "pid": prospect_id})
+    return lead_id
+
+
+# ── Call Assistant ────────────────────────────────────────────────────────────
+
+@app.get("/revenue-engine/prospects/{prospect_id}/call-assistant")
+async def revenue_engine_call_assistant(prospect_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_VOICE_PROSPECT_COLS)} FROM voice_prospects WHERE id=:id AND user_id=:uid"
+        ), {"id": prospect_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Prospect not found")
+    prospect = _voice_parse_prospect_row(row)
+
+    settings = _get_or_create_voice_settings(uid)
+    caller_business_name = (settings.get("business_name") or "").strip()
+    if not caller_business_name:
+        return {
+            "success": False, "blocked_reason": "missing_business_profile",
+            "message": "Complete your business profile in Settings — add your business name before using the Call Assistant.",
+        }
+    services_offered = settings.get("services_offered") or []
+
+    with engine.connect() as conn:
+        srow = conn.execute(text(
+            "SELECT disclosure_line, opening, rapport, discovery_questions_json, pain_point, value_prop, "
+            "objection_handling_json, meeting_close FROM voice_scripts "
+            "WHERE prospect_id=:pid AND user_id=:uid AND is_current=TRUE"
+        ), {"pid": prospect_id, "uid": uid}).fetchone()
+
+    if not srow:
+        disclosure_line = _voice_disclosure_line(prospect["business_name"], caller_business_name)
+        script, script_template_id = await _voice_generate_pitch_script(
+            prospect_id, prospect["business_name"], prospect["weaknesses"], prospect["evidence"],
+            caller_business_name, services_offered, prospect["matched_weakness"], prospect["matched_service"],
+            "", "", "",
+        )
+        _voice_persist_script_version(uid, prospect_id, disclosure_line, script, False, script_template_id, "generate")
+        call_script = {
+            "disclosure_line": disclosure_line, "opening": script.get("opening", ""),
+            "rapport": script.get("rapport", ""), "discovery_questions": script.get("discovery_questions", []),
+            "pain_point": script.get("pain_point", ""), "value_prop": script.get("value_prop", ""),
+            "objection_handling": script.get("objection_handling", []), "meeting_close": script.get("meeting_close", ""),
+        }
+    else:
+        call_script = {
+            "disclosure_line": srow[0], "opening": srow[1], "rapport": srow[2],
+            "discovery_questions": json.loads(srow[3] or "[]"), "pain_point": srow[4], "value_prop": srow[5],
+            "objection_handling": json.loads(srow[6] or "[]"), "meeting_close": srow[7],
+        }
+
+    # Budget range: ONLY from the tenant's own rate card, never invented.
+    budget_range = None
+    if prospect["matched_service"]:
+        with engine.connect() as conn:
+            rc = conn.execute(text(
+                "SELECT price_micros, currency, unit FROM revenue_rate_cards WHERE user_id=:uid AND service_key=:sk"
+            ), {"uid": uid, "sk": prospect["matched_service"]}).fetchone()
+        if rc:
+            price_micros, currency, unit = rc
+            price = price_micros / 1_000_000
+            budget_range = {
+                "low": round(price * 0.8), "high": round(price * 1.3),
+                "currency": currency, "unit": unit,
+            }
+
+    return {
+        "success": True,
+        "business": {
+            "id": prospect["id"], "name": prospect["business_name"], "address": prospect["address"],
+            "phone_e164": prospect["phone_e164"], "website": prospect["website"],
+            "google_rating": prospect["google_rating"], "total_reviews": prospect["total_reviews"],
+        },
+        "pain_points": prospect["evidence"],
+        "call_script": call_script,
+        "suggested_offer": {
+            "matched_weakness": prospect["matched_weakness"], "matched_service": prospect["matched_service"],
+            "service_fit": prospect["service_fit"],
+        },
+        "budget_range": budget_range,
+        "budget_range_note": None if budget_range else "Set your rates in Settings to see an estimated budget range.",
+        "closing_probability_estimate": prospect["estimated_call_success"],
+        "opportunity_score": prospect["opportunity_score"],
+        "need_score": prospect["need_score"],
+        "recommendation": prospect["recommendation"],
+    }
+
+
+# ── Outcome logging ───────────────────────────────────────────────────────────
+
+_REVENUE_OUTCOMES = {
+    "no_answer":       {"lead_status": None},
+    "not_interested":  {"lead_status": None},
+    "callback":        {"lead_status": "Contacted"},
+    "interested":      {"lead_status": "Contacted"},
+    "meeting_booked":  {"lead_status": "Contacted"},
+}
+
+
+class RevenueOutcomeRequest(BaseModel):
+    outcome: str
+    note: str = ""
+
+
+@app.post("/revenue-engine/prospects/{prospect_id}/outcome")
+async def revenue_engine_log_outcome(prospect_id: int, payload: RevenueOutcomeRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    outcome = (payload.outcome or "").strip().lower()
+    if outcome not in _REVENUE_OUTCOMES:
+        raise HTTPException(status_code=400, detail=f"outcome must be one of {sorted(_REVENUE_OUTCOMES.keys())}")
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT business_name, phone_e164, lead_id FROM voice_prospects WHERE id=:id AND user_id=:uid"
+        ), {"id": prospect_id, "uid": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Prospect not found")
+        business_name, phone_e164, lead_id = row
+
+        conn.execute(text(
+            "UPDATE voice_prospects SET last_outcome=:o, last_outcome_at=:ts, updated_at=:ts WHERE id=:id"
+        ), {"o": outcome, "ts": now, "id": prospect_id})
+
+        lead_id = _revenue_find_or_create_lead(conn, uid, lead_id, prospect_id, business_name, phone_e164, now)
+        target_status = _REVENUE_OUTCOMES[outcome]["lead_status"]
+        if target_status:
+            # Never Converted/Lost (human-only) — same rule as _voice_crm_sync.
+            conn.execute(text("UPDATE leads SET status=:st WHERE id=:lid AND status='New'"), {"st": target_status, "lid": lead_id})
+
+        note_text = f"Revenue Engine call outcome: {outcome}." + (f" {payload.note}" if payload.note else "")
+        conn.execute(text(
+            "INSERT INTO lead_notes (lead_id, user_id, note_text, source, created_by, created_at) "
+            "VALUES (:lid, :uid, :note, 'revenue_engine', 'user', :ts)"
+        ), {"lid": lead_id, "uid": uid, "note": note_text, "ts": now})
+        conn.execute(text(
+            "INSERT INTO lead_timeline_events (lead_id, user_id, event_type, event_data_json, source, created_at) "
+            "VALUES (:lid, :uid, 'call_outcome', :data, 'revenue_engine', :ts)"
+        ), {"lid": lead_id, "uid": uid, "data": json.dumps({"prospect_id": prospect_id, "outcome": outcome, "note": payload.note}), "ts": now})
+
+    return {"success": True, "outcome": outcome, "lead_id": lead_id}
+
+
+# ── Rate card ─────────────────────────────────────────────────────────────────
+
+class RevenueRateCardEntry(BaseModel):
+    service_key: str
+    price: float
+    unit: str = "month"
+
+
+class RevenueRateCardRequest(BaseModel):
+    entries: list[RevenueRateCardEntry]
+
+
+@app.get("/revenue-engine/rate-card")
+async def revenue_engine_get_rate_card(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT service_key, price_micros, currency, unit, updated_at FROM revenue_rate_cards WHERE user_id=:uid"
+        ), {"uid": uid}).fetchall()
+    entries = [{"service_key": r[0], "price": r[1] / 1_000_000, "currency": r[2], "unit": r[3], "updated_at": r[4]} for r in rows]
+    return {
+        "success": True, "entries": entries,
+        "service_catalog": [{"key": k, "label": lbl} for k, lbl in _VOICE_SERVICE_CATALOG],
+    }
+
+
+@app.put("/revenue-engine/rate-card")
+async def revenue_engine_set_rate_card(payload: RevenueRateCardRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    invalid = [e.service_key for e in payload.entries if e.service_key not in _VOICE_SERVICE_KEYS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown service(s): {invalid}")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        for e in payload.entries:
+            conn.execute(text(
+                "INSERT INTO revenue_rate_cards (user_id, service_key, price_micros, unit, updated_at) "
+                "VALUES (:uid, :sk, :price, :unit, :ts) "
+                "ON CONFLICT (user_id, service_key) DO UPDATE SET price_micros=:price, unit=:unit, updated_at=:ts"
+            ), {"uid": uid, "sk": e.service_key, "price": round(e.price * 1_000_000), "unit": e.unit, "ts": now})
+    return await revenue_engine_get_rate_card(request)
