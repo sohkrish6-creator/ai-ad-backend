@@ -1659,7 +1659,26 @@ class FullReportRequest(BaseModel):
     target_city: str = ""
     mode: str = "b2c"  # kept for backward compat, unused
 
-async def fetch_firecrawl(url: str) -> str:
+async def fetch_firecrawl(url: str) -> dict:
+    """Best-effort Firecrawl scrape. Never raises. Returns
+    {'content': str, 'fetch_status': 'ok'|'unverifiable'|'unreachable', 'detail': str}
+    — same status vocabulary and honesty rule as _fetch_homepage_html_safe
+    (main.py:21594): 'unverifiable' (403/429/bot-challenge/timeout/a
+    Firecrawl-reported scrape failure) must NEVER be treated as a real
+    finding, only 'unreachable' (confirmed DNS failure) may be.
+
+    Post-audit fix: this function used to collapse every failure mode —
+    bot-block, timeout, DNS failure, WAF challenge, a genuinely empty page —
+    into a bare "". Callers substituted a placeholder and asked GPT for a
+    full scored audit with no signal the crawl had failed, which is how
+    Website Intelligence returned a confident, detailed, fabricated audit
+    for linkedin.com (a site that blocks scrapers) — score 82, "SSL
+    certificate found", "user testimonials found", none of it real."""
+    if not url:
+        return {"content": "", "fetch_status": "ok", "detail": ""}
+    if not FIRECRAWL_API_KEY:
+        return {"content": "", "fetch_status": "unverifiable", "detail": "Firecrawl not configured"}
+
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             resp = await c.post(
@@ -1670,10 +1689,37 @@ async def fetch_firecrawl(url: str) -> str:
                 },
                 json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
             )
-            data = resp.json()
-            return (data.get("data") or {}).get("markdown", "")
+    except httpx.TimeoutException:
+        return {"content": "", "fetch_status": "unverifiable", "detail": "request timed out"}
+    except Exception as _fe:
+        return {"content": "", "fetch_status": "unverifiable", "detail": f"{type(_fe).__name__}: {_fe}"}
+
+    if resp.status_code in (403, 429) or resp.status_code >= 400:
+        return {"content": "", "fetch_status": "unverifiable", "detail": f"Firecrawl HTTP {resp.status_code}"}
+
+    try:
+        data = resp.json()
     except Exception:
-        return ""
+        return {"content": "", "fetch_status": "unverifiable", "detail": "invalid Firecrawl response"}
+
+    if not data.get("success", True):
+        # Firecrawl surfaces the TARGET site's real failure reason in its own
+        # error text — a confirmed DNS failure there is a genuine
+        # 'unreachable' finding; everything else (bot-block, timeout, a 403
+        # Firecrawl hit on the target) is 'unverifiable'.
+        err = data.get("error", "") or "scrape failed"
+        err_lower = err.lower()
+        dns_markers = ("dns", "could not resolve", "name not resolved", "enotfound")
+        status = "unreachable" if any(m in err_lower for m in dns_markers) else "unverifiable"
+        return {"content": "", "fetch_status": status, "detail": f"Firecrawl: {err}"}
+
+    markdown = (data.get("data") or {}).get("markdown", "") or ""
+    if not markdown.strip():
+        return {"content": "", "fetch_status": "unverifiable", "detail": "Firecrawl returned no content"}
+    if _voice_looks_like_bot_challenge(markdown):
+        return {"content": "", "fetch_status": "unverifiable", "detail": "bot-challenge page detected"}
+
+    return {"content": markdown, "fetch_status": "ok", "detail": ""}
 
 async def fetch_tavily(query: str, include_domains: list | None = None) -> str:
     try:
@@ -4043,12 +4089,13 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
     # Phase 1: Evidence Collection — Firecrawl first, httpx fallback
     firecrawl_used = False
     if FIRECRAWL_API_KEY:
-        fc_md = await fetch_firecrawl(base)
-        if fc_md:
+        _fc_result = await fetch_firecrawl(base)
+        fc_md = _fc_result["content"]
+        if _fc_result["fetch_status"] == "ok" and fc_md:
             firecrawl_used = True
             logger.info(f"[BI] Firecrawl succeeded for {base}: {len(fc_md)} chars")
         else:
-            logger.info(f"[BI] Firecrawl returned empty for {base}, falling back to httpx")
+            logger.info(f"[BI] Firecrawl {_fc_result['fetch_status']} for {base} ({_fc_result['detail']}), falling back to httpx")
 
     logger.info(f"[BI] Phase 1a: homepage + sitemap for {base}")
     if firecrawl_used:
@@ -5443,11 +5490,38 @@ PREVIOUSLY KNOWN ABOUT THIS BUSINESS:
 Use this to judge whether the website speaks to the right audience with the right message.
 """
 
-    # Crawl
-    crawled = await fetch_firecrawl(url)
-    if not crawled:
-        crawled = f"[Crawl returned empty — analyse based on URL and any context available]"
-    crawled_trimmed = crawled[:7000]
+    # Crawl — post-audit fix: never ask GPT to score/audit content it never
+    # actually received. A blocked/bot-challenged/timed-out/DNS-dead crawl
+    # used to get silently replaced with a placeholder string and handed to
+    # GPT for a full scored audit anyway — confirmed live producing a
+    # confident, detailed, fabricated "audit" (score 82, specific findings)
+    # for linkedin.com, a site that simply blocks scrapers. Only a genuinely
+    # 'ok' crawl may produce a score; anything else returns an honest
+    # data_verified:false response instead of a guess dressed as a finding.
+    _fc = await fetch_firecrawl(url)
+    if _fc["fetch_status"] != "ok":
+        log_activity(
+            "website_intelligence", business_key=norm_key,
+            business_name=(_mem.get("business", {}) or {}).get("business_name", "") if _mem else "",
+            url=url, industry=request.industry, city=request.city,
+            summary=f"Website Intelligence — could not verify ({_fc['fetch_status']}): {_fc['detail']}",
+        )
+        return {
+            "success": True,
+            "data_verified": False,
+            "url": url,
+            "crawl_status": _fc["fetch_status"],
+            "message": (
+                "This site couldn't be crawled, so no audit was generated — showing a fabricated score "
+                "would be worse than showing nothing. "
+                + ("This usually means bot/WAF protection (Cloudflare, PerimeterX, etc.), not that the site is "
+                   "actually down — verify it loads correctly in your own browser."
+                   if _fc["fetch_status"] == "unverifiable" else
+                   "The domain appears to be unreachable (DNS failure) — verify the URL is correct and the site is live.")
+            ),
+            "detail": _fc["detail"],
+        }
+    crawled_trimmed = _fc["content"][:7000]
 
     prompt = f"""You are an expert website conversion auditor. Analyse the website content below and return a detailed, actionable audit as a JSON object.
 
@@ -5596,9 +5670,35 @@ PREVIOUSLY KNOWN:
     # ── Parallel data fetch ─────────────────────────────────────────────────
     crawled_task = fetch_firecrawl(url)
     tavily_task  = fetch_tavily(f"{industry} {city} SEO keywords ranking 2026")
-    crawled, tavily_data = await asyncio.gather(crawled_task, tavily_task)
+    fc_result, tavily_data = await asyncio.gather(crawled_task, tavily_task)
 
-    crawled_trimmed = (crawled or "")[:5000]
+    # Post-audit fix: identical treatment to Website Intelligence (shares
+    # the same fetch_firecrawl helper and the same fabrication bug) — a
+    # blocked/unreachable crawl must never be silently scored as a real
+    # SEO/AEO/GEO audit.
+    if fc_result["fetch_status"] != "ok":
+        log_activity(
+            "visibility_intelligence", business_key=norm_key,
+            business_name=(_mem.get("business", {}) or {}).get("business_name", "") if _mem else "",
+            url=url, industry=industry, city=city,
+            summary=f"Visibility Intelligence — could not verify ({fc_result['fetch_status']}): {fc_result['detail']}",
+        )
+        return {
+            "success": True,
+            "data_verified": False,
+            "url": url,
+            "crawl_status": fc_result["fetch_status"],
+            "message": (
+                "This site couldn't be crawled, so no visibility audit was generated. "
+                + ("This usually means bot/WAF protection, not that the site is actually down — verify it loads "
+                   "correctly in your own browser."
+                   if fc_result["fetch_status"] == "unverifiable" else
+                   "The domain appears to be unreachable (DNS failure) — verify the URL is correct and the site is live.")
+            ),
+            "detail": fc_result["detail"],
+        }
+
+    crawled_trimmed = fc_result["content"][:5000]
     tavily_trimmed  = (tavily_data or "")[:2000]
 
     # ── GPT-4o ─────────────────────────────────────────────────────────────
@@ -13126,7 +13226,9 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     # are safety checks, not "discovery", and stay strict regardless of memory reuse.
     site_content = ""
     if not memory_reused and FIRECRAWL_API_KEY and request.url:
-        site_content = await fetch_firecrawl(request.url)
+        _fc_cricket = await fetch_firecrawl(request.url)
+        if _fc_cricket["fetch_status"] == "ok":
+            site_content = _fc_cricket["content"]
     if not site_content:
         try:
             async with httpx.AsyncClient(timeout=12, follow_redirects=True) as _hc:
@@ -16069,7 +16171,9 @@ async def _sie_discover_platforms(input_value: str, input_type: str, city: str) 
         if not re.match(r'^https?://', website_url, re.I):
             website_url = f"https://{website_url}"
         if FIRECRAWL_API_KEY:
-            site_content = await fetch_firecrawl(website_url)
+            _fc_social = await fetch_firecrawl(website_url)
+            if _fc_social["fetch_status"] == "ok":
+                site_content = _fc_social["content"]
         if not site_content:
             try:
                 async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
@@ -19914,7 +20018,16 @@ async def _mi_research_company(company_input: str) -> dict:
 
     if detected_url:
         wc = results_p1[len(keys_p1)]
-        research["website_content"] = wc[:3000] if isinstance(wc, str) else ""
+        # fetch_firecrawl now returns a status dict, not a bare string — a
+        # blocked/unreachable crawl must not silently pass its empty
+        # content through as if it were real (unaffected here beyond that:
+        # this module already treats website_content as optional
+        # supporting context alongside Tavily research, never the sole
+        # source scored into a number, so no separate data_verified gate
+        # is needed the way Website/Visibility Intelligence required).
+        research["website_content"] = (
+            wc["content"][:3000] if isinstance(wc, dict) and wc.get("fetch_status") == "ok" else ""
+        )
     else:
         research["website_content"] = ""
 
