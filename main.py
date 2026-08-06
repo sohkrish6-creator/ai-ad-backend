@@ -19312,18 +19312,23 @@ async def search_console_recommendations(request: Request, refresh: bool = False
     if err:
         return err
 
+    with engine.connect() as conn:
+        cached = conn.execute(text(
+            "SELECT insights_json, generated_at FROM search_console_ai_insights WHERE user_id=:uid AND site_url=:su"
+        ), {"uid": uid, "su": site_url}).fetchone()
+
     if not refresh:
-        with engine.connect() as conn:
-            cached = conn.execute(text(
-                "SELECT insights_json, generated_at FROM search_console_ai_insights WHERE user_id=:uid AND site_url=:su"
-            ), {"uid": uid, "su": site_url}).fetchone()
-        if cached and cached[0] and cached[1]:
-            try:
-                gen_at = datetime.fromisoformat(cached[1])
-                if datetime.utcnow() - gen_at < timedelta(hours=24):
-                    return {"success": True, "cached": True, "generated_at": cached[1], **json.loads(cached[0])}
-            except Exception:
-                pass
+        # Post-audit fix (Item 5): this used to fall through to a real GPT
+        # call (billed) whenever there was no FRESH (<24h) cache — meaning
+        # a plain page load with a stale or missing cache silently
+        # generated new insights every time. Loading this page must never
+        # call GPT; only the explicit "Regenerate" click (refresh=True)
+        # does. A stale cache is still served (better than nothing, and
+        # `generated_at` lets the frontend show its age); a missing cache
+        # now returns no_data instead of auto-generating.
+        if cached and cached[0]:
+            return {"success": True, "cached": True, "generated_at": cached[1], **json.loads(cached[0])}
+        return {"success": True, "cached": False, "no_data": True}
 
     health = await search_console_health_score(request)
     opportunities = await search_console_opportunities(request)
@@ -22434,8 +22439,33 @@ def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: in
 # second, unrelated threshold.
 _VOICE_OPPORTUNITY_REVERT_THRESHOLD = 50
 
+# Post-audit fix (Item 5): rescore-existing had no cap at all — a tenant
+# with thousands of uncalled prospects across old scans would trigger
+# hundreds of real GPT calls (billed) in one click, with no confirmation
+# and a real risk of the request itself timing out before completion.
+# Default cap is user-configurable per request up to a hard ceiling so a
+# single click can never runaway regardless of what's passed.
+_VOICE_RESCORE_DEFAULT_LIMIT = int(os.getenv("VOICE_RESCORE_DEFAULT_LIMIT", "100"))
+_VOICE_RESCORE_MAX_LIMIT = 500
 
-async def _voice_rescore_existing_prospects(user_id: str) -> dict:
+# Rough cost estimate only (not billing-accurate) — QUALIFICATION_MODEL
+# (gpt-4o-mini) scores in batches of 15 prospects/call, ~250 prompt tokens
+# per business plus a shared instruction block, max_tokens=3500 output/call.
+# At gpt-4o-mini's published per-token rates ($0.15/1M in, $0.60/1M out)
+# that's roughly $0.0027/batch of 15 ≈ $0.00018/prospect — shown to the user
+# before they confirm, not charged silently after the fact.
+_VOICE_RESCORE_EST_USD_PER_PROSPECT = 0.00018
+
+
+def _voice_rescore_eligible_count(user_id: str) -> int:
+    with engine.connect() as conn:
+        return conn.execute(text(
+            "SELECT COUNT(*) FROM voice_prospects vp WHERE vp.user_id=:uid AND vp.id NOT IN "
+            "(SELECT prospect_id FROM voice_calls WHERE prospect_id IS NOT NULL)"
+        ), {"uid": user_id}).scalar() or 0
+
+
+async def _voice_rescore_existing_prospects(user_id: str, limit: int) -> dict:
     """Fix 3 (bug-fix pass): one-time, user-triggered re-run of weakness
     detection + scoring for every prospect that hasn't been called yet,
     using the corrected fetch-failure classification (site_unverifiable is
@@ -22443,7 +22473,11 @@ async def _voice_rescore_existing_prospects(user_id: str) -> dict:
     costs real money, so this only runs when explicitly requested, same
     discipline as batch-build/confirm-and-call. Never touches a prospect
     that already has any voice_calls row (called or in-flight) — rescoring
-    a business already spoken to means nothing."""
+    a business already spoken to means nothing.
+
+    `limit` bounds how many eligible prospects are processed in this one
+    call (Item 5) — the rest are left untouched for a follow-up run, never
+    silently skipped forever."""
     services_offered = _get_or_create_voice_settings(user_id).get("services_offered") or []
 
     with engine.connect() as conn:
@@ -22452,8 +22486,12 @@ async def _voice_rescore_existing_prospects(user_id: str) -> dict:
             "vp.total_reviews, vp.business_status, vp.opportunity_score, vp.approval_status, vb.industry, vb.city "
             "FROM voice_prospects vp JOIN voice_batches vb ON vb.id = vp.batch_id "
             "WHERE vp.user_id=:uid AND vp.id NOT IN "
-            "(SELECT prospect_id FROM voice_calls WHERE prospect_id IS NOT NULL)"
+            "(SELECT prospect_id FROM voice_calls WHERE prospect_id IS NOT NULL) "
+            "ORDER BY vp.id"
         ), {"uid": user_id}).fetchall()
+
+    total_eligible = len(rows)
+    rows = rows[:limit]
 
     by_batch = {}
     for r in rows:
@@ -22534,15 +22572,37 @@ async def _voice_rescore_existing_prospects(user_id: str) -> dict:
     return {
         "prospects_rescored": prospects_rescored, "score_changed": score_changed,
         "reverted_to_pending": reverted_to_pending, "batches_affected": len(batches_touched),
+        "total_eligible": total_eligible, "remaining": max(0, total_eligible - prospects_rescored),
+    }
+
+
+@app.get("/voice-outreach/rescore-existing/preview")
+async def voice_outreach_rescore_existing_preview(request: Request):
+    """Post-audit fix (Item 5): lets the frontend show the real count and
+    an estimated cost BEFORE the user commits to running rescore-existing —
+    no GPT calls made here, just a count query."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    count = _voice_rescore_eligible_count(uid)
+    return {
+        "success": True,
+        "eligible_count": count,
+        "estimated_cost_usd": round(count * _VOICE_RESCORE_EST_USD_PER_PROSPECT, 4),
+        "default_limit": _VOICE_RESCORE_DEFAULT_LIMIT,
+        "max_limit": _VOICE_RESCORE_MAX_LIMIT,
     }
 
 
 @app.post("/voice-outreach/rescore-existing")
-async def voice_outreach_rescore_existing(request: Request):
+async def voice_outreach_rescore_existing(request: Request, limit: int = _VOICE_RESCORE_DEFAULT_LIMIT):
     uid = getattr(request.state, "user_id", "")
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    result = await _voice_rescore_existing_prospects(uid)
+    if limit < 1:
+        raise HTTPException(status_code=400, detail="limit must be at least 1")
+    limit = min(limit, _VOICE_RESCORE_MAX_LIMIT)
+    result = await _voice_rescore_existing_prospects(uid, limit=limit)
     return {"success": True, **result}
 
 
