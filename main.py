@@ -14876,6 +14876,9 @@ async def run_meta_launch_preflight(
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @app.post("/cricket-ads/accounts/add")
 async def cricket_add_account(payload: CricketAccountRequest, request: Request):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # cricket_ad_accounts has no user_id column. A second tenant can't use
+    # Cricket Ads until that migration lands (see _require_admin_uid docstring).
     _require_admin_uid(request)
     cid = payload.customer_id.replace("-", "").strip()
     if not cid:
@@ -14906,6 +14909,8 @@ async def cricket_add_account(payload: CricketAccountRequest, request: Request):
 
 @app.get("/cricket-ads/accounts/list")
 async def cricket_list_accounts(request: Request):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # cricket_ad_accounts has no user_id column. See _require_admin_uid docstring.
     _require_admin_uid(request)
     try:
         accounts = await asyncio.to_thread(_cricket_account_ops, "list")
@@ -14916,6 +14921,8 @@ async def cricket_list_accounts(request: Request):
 
 @app.delete("/cricket-ads/accounts/{customer_id}")
 async def cricket_delete_account(customer_id: str, request: Request):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # cricket_ad_accounts has no user_id column. See _require_admin_uid docstring.
     _require_admin_uid(request)
     cid = customer_id.replace("-", "").strip()
     try:
@@ -19652,6 +19659,9 @@ def _require_admin_uid(request: Request):
 
 @app.get("/google/accounts")
 async def google_accounts(request: Request):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # gads_accounts has no user_id column. A second tenant can't use Google
+    # Ads until that migration lands (see _require_admin_uid docstring).
     _require_admin_uid(request)
     try:
         accounts = await asyncio.to_thread(_list_gads_accessible_accounts_sync)
@@ -19670,6 +19680,8 @@ async def google_accounts(request: Request):
 
 @app.post("/google/accounts/select")
 async def google_accounts_select(payload: GadsAccountSelectRequest, request: Request):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # gads_accounts has no user_id column. See _require_admin_uid docstring.
     _require_admin_uid(request)
     cid = payload.customer_id.replace("-", "").strip()
     try:
@@ -19727,6 +19739,8 @@ async def google_ads_refresh(request: GadsImportRequest):
 
 @app.get("/google-ads/import/status/{job_id}")
 async def google_ads_import_status(job_id: str, request: Request):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # gads_import_jobs has no user_id column. See _require_admin_uid docstring.
     _require_admin_uid(request)
     try:
         with engine.begin() as conn:
@@ -19763,6 +19777,9 @@ async def google_ads_import_status(job_id: str, request: Request):
 
 @app.get("/google-ads/dashboard")
 async def google_ads_dashboard(request: Request, customer_id: str = ""):
+    # TODO(multi-tenant): admin-only lock, not real per-tenant scoping —
+    # gads_campaigns/gads_campaign_day/gads_ad_groups have no user_id
+    # column (only customer_id). See _require_admin_uid docstring.
     _require_admin_uid(request)
     cid = customer_id.replace("-", "").strip()
     if not cid:
