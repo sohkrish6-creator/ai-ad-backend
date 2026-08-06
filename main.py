@@ -1300,13 +1300,25 @@ def save_report_snapshot(module: str, business_key: str, response: dict) -> None
 
 
 @app.get("/report-snapshot")
-async def get_report_snapshot(module: str, business_key: str):
+async def get_report_snapshot(module: str, business_key: str, request: Request):
     """Fetch the last full saved response for one module+business_key — powers the History page's 'restore report' click-through."""
+    # Security fix (Aug 2026 audit): this had no user_id check at all — any
+    # authenticated tenant who could construct/guess another tenant's
+    # business_key (derive_business_key already prefixes it with "{uid}::"
+    # on write, so it's not fully public, but nothing enforced it on read)
+    # could read that tenant's full saved report. Matches the same
+    # `if _uid: filter` convention used by every sibling read endpoint.
     try:
+        _uid = getattr(request.state, "user_id", "")
+        params = {"m": module, "bk": business_key}
+        where = "WHERE module = :m AND business_key = :bk"
+        if _uid:
+            where += " AND user_id = :uid"
+            params["uid"] = _uid
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT response_json, created_at FROM report_snapshot WHERE module = :m AND business_key = :bk"),
-                {"m": module, "bk": business_key},
+                text(f"SELECT response_json, created_at FROM report_snapshot {where}"),
+                params,
             ).first()
         if not row:
             return {"success": False, "error": "No snapshot found for this module/business_key"}
@@ -11682,12 +11694,25 @@ async def smart_analysis_history(request: Request, limit: int = 5):
 
 
 @app.get("/smart-analysis/history/{history_id}")
-async def smart_analysis_history_detail(history_id: int):
+async def smart_analysis_history_detail(history_id: int, request: Request):
+    # Security fix (Aug 2026 audit): history_id is a plain auto-increment
+    # int with zero ownership check — any authenticated tenant could read
+    # any other tenant's full smart-analysis result by incrementing the id.
+    # The sibling list endpoint above already scopes by user_id; this one
+    # didn't. Matches the same `if _uid: filter` convention used everywhere
+    # else in this file (only unscoped when SUPABASE_JWT_SECRET is unset in
+    # local dev, per auth_middleware).
     try:
+        _uid = getattr(request.state, "user_id", "")
+        params = {"id": history_id}
+        where = "WHERE id = :id"
+        if _uid:
+            where += " AND user_id = :uid"
+            params["uid"] = _uid
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT full_result FROM smart_analysis_history WHERE id = :id"
-            ), {"id": history_id}).first()
+                f"SELECT full_result FROM smart_analysis_history {where}"
+            ), params).first()
         if not row:
             return {"success": False, "error": "Not found"}
         return {"success": True, "result": json.loads(row[0])}
@@ -14748,14 +14773,15 @@ async def run_meta_launch_preflight(
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 @app.post("/cricket-ads/accounts/add")
-async def cricket_add_account(request: CricketAccountRequest):
-    cid = request.customer_id.replace("-", "").strip()
+async def cricket_add_account(payload: CricketAccountRequest, request: Request):
+    _require_admin_uid(request)
+    cid = payload.customer_id.replace("-", "").strip()
     if not cid:
         return {"success": False, "error": "customer_id is required"}
 
     probe = await asyncio.to_thread(
         _probe_cricket_account_sync, cid,
-        request.login_customer_id or None
+        payload.login_customer_id or None
     )
     if not probe.get("queryable"):
         return {"success": False, "queryable": False, "error": probe.get("error", "Account not reachable")}
@@ -14764,20 +14790,21 @@ async def cricket_add_account(request: CricketAccountRequest):
         await asyncio.to_thread(
             _cricket_account_ops, "insert", None,
             {
-                "account_name":      request.account_name,
+                "account_name":      payload.account_name,
                 "customer_id":       cid,
-                "login_customer_id": request.login_customer_id or "",
+                "login_customer_id": payload.login_customer_id or "",
             }
         )
     except Exception as _e:
         return {"success": False, "error": str(_e)}
 
-    logger.info(f"[CRICKET-ACCT] Saved account {cid!r} ({request.account_name!r})")
+    logger.info(f"[CRICKET-ACCT] Saved account {cid!r} ({payload.account_name!r})")
     return {"success": True, "queryable": True, "account": probe}
 
 
 @app.get("/cricket-ads/accounts/list")
-async def cricket_list_accounts():
+async def cricket_list_accounts(request: Request):
+    _require_admin_uid(request)
     try:
         accounts = await asyncio.to_thread(_cricket_account_ops, "list")
         return {"success": True, "accounts": accounts or []}
@@ -14786,7 +14813,8 @@ async def cricket_list_accounts():
 
 
 @app.delete("/cricket-ads/accounts/{customer_id}")
-async def cricket_delete_account(customer_id: str):
+async def cricket_delete_account(customer_id: str, request: Request):
+    _require_admin_uid(request)
     cid = customer_id.replace("-", "").strip()
     try:
         await asyncio.to_thread(_cricket_account_ops, "delete", cid)
@@ -19496,8 +19524,26 @@ async def connected_accounts(request: Request):
     }
 
 
+# Security fix (Aug 2026 audit): a small handful of legacy single-operator
+# admin tools (the Google Ads account-selector pipeline, Cricket Ads
+# account management) have no per-tenant data model at all — no user_id
+# column, process-global "selected" state, or both. Retrofitting real
+# per-tenant scoping onto them means either a schema migration or breaking
+# a legitimate multi-account admin workflow (see /google-ads/dashboard).
+# Until that's done properly, restrict them to the admin (KRISH_USER_ID) —
+# every other authenticated tenant gets 403 instead of reading/mutating
+# another tenant's data. No-op (skipped) when KRISH_USER_ID isn't set, same
+# "unscoped in local dev" convention used throughout this file.
+def _require_admin_uid(request: Request):
+    _uid = getattr(request.state, "user_id", "")
+    _krish_uid = os.getenv("KRISH_USER_ID", "")
+    if _krish_uid and _uid != _krish_uid:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+
 @app.get("/google/accounts")
-async def google_accounts():
+async def google_accounts(request: Request):
+    _require_admin_uid(request)
     try:
         accounts = await asyncio.to_thread(_list_gads_accessible_accounts_sync)
         with engine.connect() as conn:
@@ -19514,8 +19560,9 @@ async def google_accounts():
 
 
 @app.post("/google/accounts/select")
-async def google_accounts_select(request: GadsAccountSelectRequest):
-    cid = request.customer_id.replace("-", "").strip()
+async def google_accounts_select(payload: GadsAccountSelectRequest, request: Request):
+    _require_admin_uid(request)
+    cid = payload.customer_id.replace("-", "").strip()
     try:
         with engine.begin() as conn:
             row = conn.execute(text(
@@ -19570,7 +19617,8 @@ async def google_ads_refresh(request: GadsImportRequest):
 
 
 @app.get("/google-ads/import/status/{job_id}")
-async def google_ads_import_status(job_id: str):
+async def google_ads_import_status(job_id: str, request: Request):
+    _require_admin_uid(request)
     try:
         with engine.begin() as conn:
             row = conn.execute(text(
@@ -19605,7 +19653,8 @@ async def google_ads_import_status(job_id: str):
 
 
 @app.get("/google-ads/dashboard")
-async def google_ads_dashboard(customer_id: str = ""):
+async def google_ads_dashboard(request: Request, customer_id: str = ""):
+    _require_admin_uid(request)
     cid = customer_id.replace("-", "").strip()
     if not cid:
         acct = _get_selected_gads_account()
