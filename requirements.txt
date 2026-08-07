@@ -32,3 +32,4 @@ Pillow==12.3.0
 bcrypt==5.0.0
 google-api-python-client==2.149.0
 phonenumbers==8.13.55
+pytest==9.1.1

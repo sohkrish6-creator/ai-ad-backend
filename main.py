@@ -34,6 +34,7 @@ import hashlib
 import base64
 import uuid
 from zoneinfo import ZoneInfo
+from report_validators import strip_unproven_claims
 
 try:
     import jwt as _pyjwt
@@ -2285,6 +2286,90 @@ async def youtube_intelligence(request: YoutubeIntelligenceRequest):
         "competitor_insights":  competitor_insights,
     }
 
+# Post-audit fix (Report Engine P0.1): a minimal seed of real CPC/CTR/CPL/CPA
+# benchmark ranges per industry, so numeric provenance checking has a real
+# `benchmark` row to point to instead of trusting GPT's self-invented ranges.
+# Starting set, not exhaustive — expandable later without a schema change.
+_INDUSTRY_BENCHMARKS_DDL = """
+CREATE TABLE IF NOT EXISTS industry_benchmarks (
+    id SERIAL PRIMARY KEY,
+    industry TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    low DOUBLE PRECISION NOT NULL,
+    high DOUBLE PRECISION NOT NULL,
+    unit TEXT NOT NULL,
+    source_note TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(industry, metric)
+);
+"""
+_INDUSTRY_BENCHMARKS_SEED = [
+    # (industry, metric, low, high, unit)
+    ("life sciences / lab supply", "cpc", 15, 40, "INR"),
+    ("life sciences / lab supply", "ctr", 0.5, 2.5, "percent"),
+    ("life sciences / lab supply", "cpl", 200, 600, "INR"),
+    ("b2b saas", "cpc", 40, 150, "INR"),
+    ("b2b saas", "ctr", 1.0, 3.0, "percent"),
+    ("b2b saas", "cpl", 500, 2000, "INR"),
+    ("linkedin b2b ads", "cpc", 200, 500, "INR"),
+    ("linkedin b2b ads", "ctr", 0.3, 1.0, "percent"),
+    ("google search b2b", "cpc", 40, 200, "INR"),
+    ("google search b2b", "ctr", 2.0, 5.0, "percent"),
+    ("retail / ecommerce", "cpc", 8, 25, "INR"),
+    ("retail / ecommerce", "ctr", 1.0, 3.0, "percent"),
+    ("real estate", "cpc", 15, 60, "INR"),
+    ("real estate", "cpl", 300, 1200, "INR"),
+    ("healthcare / clinic", "cpc", 10, 45, "INR"),
+    ("healthcare / clinic", "cpl", 150, 500, "INR"),
+    ("education / coaching", "cpc", 8, 30, "INR"),
+    ("education / coaching", "cpl", 100, 400, "INR"),
+    ("hospitality / travel", "cpc", 6, 22, "INR"),
+    ("professional services", "cpc", 20, 80, "INR"),
+    ("professional services", "cpl", 250, 900, "INR"),
+    ("manufacturing / distribution", "cpc", 12, 50, "INR"),
+    ("manufacturing / distribution", "cpl", 300, 1000, "INR"),
+]
+try:
+    _ibddl = _INDUSTRY_BENCHMARKS_DDL
+    if _is_sqlite:
+        _ibddl = _ibddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.begin() as _ibconn:
+        _ibconn.execute(text(_ibddl))
+        _existing_count = _ibconn.execute(text("SELECT COUNT(*) FROM industry_benchmarks")).scalar()
+        if not _existing_count:
+            _ib_now = datetime.utcnow().isoformat()
+            for _ib_industry, _ib_metric, _ib_low, _ib_high, _ib_unit in _INDUSTRY_BENCHMARKS_SEED:
+                _ibconn.execute(text(
+                    "INSERT INTO industry_benchmarks (industry, metric, low, high, unit, updated_at) "
+                    "VALUES (:industry, :metric, :low, :high, :unit, :ts)"
+                ), {"industry": _ib_industry, "metric": _ib_metric, "low": _ib_low, "high": _ib_high, "unit": _ib_unit, "ts": _ib_now})
+    logger.info("[REPORT-ENGINE] industry_benchmarks table ready")
+except Exception as _ibe:
+    logger.error(f"[REPORT-ENGINE] industry_benchmarks table creation failed: {_ibe}")
+
+
+def _get_industry_benchmarks(industry_hint: str = "") -> list[dict]:
+    """Best-effort lookup of relevant benchmark rows for a numeric-provenance
+    check — matches on a loose substring of `industry_hint` against the
+    seeded industry names, falling back to all rows if nothing matches
+    (better to over-include candidate rows than to silently return none
+    and force everything into WARN/BLOCKING with no benchmark path)."""
+    try:
+        with engine.connect() as conn:
+            if industry_hint:
+                rows = conn.execute(text(
+                    "SELECT id, industry, metric, low, high, unit FROM industry_benchmarks "
+                    "WHERE LOWER(:hint) LIKE '%' || LOWER(industry) || '%' OR LOWER(industry) LIKE '%' || LOWER(:hint) || '%'"
+                ), {"hint": industry_hint}).fetchall()
+                if rows:
+                    return [{"id": r[0], "industry": r[1], "metric": r[2], "low": r[3], "high": r[4], "unit": r[5]} for r in rows]
+            rows = conn.execute(text("SELECT id, industry, metric, low, high, unit FROM industry_benchmarks")).fetchall()
+            return [{"id": r[0], "industry": r[1], "metric": r[2], "low": r[3], "high": r[4], "unit": r[5]} for r in rows]
+    except Exception as _e:
+        logger.warning(f"[REPORT-ENGINE] benchmark lookup failed: {_e}")
+        return []
+
+
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
 
@@ -2963,30 +3048,74 @@ For {request.target_industry} businesses in {request.target_city}, include:
     _contradiction_warning = _detect_consistency_contradiction(_trust_has_dna, a_parts.get("BUSINESS UNDERSTANDING:", ""))
     validation_warning = _combine_validation_warnings(_match_warning, _contradiction_warning)
 
+    # Post-audit fix (Report Engine P0.1): numeric provenance enforcement.
+    # A production report was audited with fabricated numbers (a ₹999 price,
+    # a "40% research efficiency" result claim, an invented "5-20 competitors"
+    # count) that trace to nothing real. Every numeric claim across every
+    # generated section is now independently verified against the real
+    # crawled evidence, the request's own client-supplied numbers, and a
+    # seeded industry-benchmark table — never GPT's own say-so. BLOCKING-tier
+    # claims (prices, %-attached outcome claims, competitor counts, market
+    # size) with no provenance are removed outright; WARN-tier claims
+    # (CPC/CTR/CPL/CPA ranges, scores) get an explicit caveat instead.
+    _evidence_for_provenance = "\n".join(
+        str(e.get("value", "")) for e in (bi_data or {}).get("evidence_collection", {}).get("evidence", []) or []
+    ) + " " + _business_context_txt
+    _client_inputs_for_provenance = {
+        "budget": request.budget, "target_industry": request.target_industry, "target_city": request.target_city,
+    }
+    _benchmarks_for_provenance = _get_industry_benchmarks(_dna.get("detected_industry") or request.business_type)
+    _suppressed_claims = []
+    for _section_key in list(_response_sections_pending := {
+        "business_understanding": a_parts.get("BUSINESS UNDERSTANDING:", section_a),
+        "market_understanding":   a_parts.get("MARKET UNDERSTANDING:", ""),
+        "competitor_insights":    a_parts.get("COMPETITOR INSIGHTS:", ""),
+        "positioning_strategy":   a_parts.get("POSITIONING STRATEGY:", ""),
+        "audience_strategy":      b_parts.get("AUDIENCE STRATEGY:", section_b),
+        "lead_sources":           b_parts.get("LEAD SOURCES:", ""),
+        "outreach_scripts":       b_parts.get("OUTREACH SCRIPTS:", ""),
+        "pitch_close":            b_parts.get("PITCH & CLOSE:", ""),
+        "marketing_plan":         c_parts.get("MARKETING PLAN:", section_c),
+        "ad_assets":              c_parts.get("AD ASSETS:", ""),
+    }):
+        _clean_text, _removed = strip_unproven_claims(
+            _section_key, _response_sections_pending[_section_key],
+            _evidence_for_provenance, _client_inputs_for_provenance, _benchmarks_for_provenance,
+        )
+        _response_sections_pending[_section_key] = _clean_text
+        _suppressed_claims.extend(_removed)
+    for _r in _suppressed_claims:
+        logger.warning(f"[PROVENANCE] removed {_r.tier} claim in {_r.section}: {_r.original_text!r} — {_r.reason}")
+    suppressed_claims_count = len(_suppressed_claims)
+
     _response = {
         "success": True,
         "url": request.url,
         "trust_verdict": trust_verdict,
         "based_on": based_on,
         "validation_warning": validation_warning or None,
+        # Post-audit fix (Report Engine P0.1): count of numeric claims removed
+        # or caveated for missing provenance, surfaced so the frontend can
+        # show it — never ship a report that silently dropped content.
+        "suppressed_claims_count": suppressed_claims_count,
         # Backward-compatible keys (existing frontend reads these)
         "strategy":       section_a,
-        "competitor":     a_parts.get("COMPETITOR INSIGHTS:", section_a),
+        "competitor":     _response_sections_pending["competitor_insights"] or a_parts.get("COMPETITOR INSIGHTS:", section_a),
         "audience":       section_b,
         "smart_creative": section_c,
         "ad_guide":       ad_guide,
         # New 11-section structure
         "sections": {
-            "business_understanding": a_parts.get("BUSINESS UNDERSTANDING:", section_a),
-            "market_understanding":   a_parts.get("MARKET UNDERSTANDING:", ""),
-            "competitor_insights":    a_parts.get("COMPETITOR INSIGHTS:", ""),
-            "positioning_strategy":   a_parts.get("POSITIONING STRATEGY:", ""),
-            "audience_strategy":      b_parts.get("AUDIENCE STRATEGY:", section_b),
-            "lead_sources":           b_parts.get("LEAD SOURCES:", ""),
-            "outreach_scripts":       b_parts.get("OUTREACH SCRIPTS:", ""),
-            "pitch_close":            b_parts.get("PITCH & CLOSE:", ""),
-            "marketing_plan":         c_parts.get("MARKETING PLAN:", section_c),
-            "ad_assets":              c_parts.get("AD ASSETS:", ""),
+            "business_understanding": _response_sections_pending["business_understanding"],
+            "market_understanding":   _response_sections_pending["market_understanding"],
+            "competitor_insights":    _response_sections_pending["competitor_insights"],
+            "positioning_strategy":   _response_sections_pending["positioning_strategy"],
+            "audience_strategy":      _response_sections_pending["audience_strategy"],
+            "lead_sources":           _response_sections_pending["lead_sources"],
+            "outreach_scripts":       _response_sections_pending["outreach_scripts"],
+            "pitch_close":            _response_sections_pending["pitch_close"],
+            "marketing_plan":         _response_sections_pending["marketing_plan"],
+            "ad_assets":              _response_sections_pending["ad_assets"],
             "media_buying_plan":      c_parts.get("MEDIA BUYING PLAN:", ""),
         },
         "bi_data":        bi_data,
