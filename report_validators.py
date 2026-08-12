@@ -46,8 +46,18 @@ class NumericClaim:
 # first signal — "Competitor threat score: 40/100" contains the substring
 # "competitor" (a BLOCKING-tier count word) even though the number itself is
 # a score (WARN tier); `kind="score"` short-circuits that collision.
+# Stem-based, not exact-word — "increased"/"increasing" must match just as
+# "increase" does. A live production run surfaced "We increased order volume
+# by 25%..." surviving unflagged because an earlier exact-word-only version
+# of this regex matched \bincrease\b but not "increased" (no word boundary
+# between "increase" and its own "-d" suffix). Every verb here is a stem
+# with the suffix made optional, not a closed list of exact forms.
 _OUTCOME_CONTEXT = re.compile(
-    r"\b(efficiency|result|results|more leads|increase|growth|improvement)\b",
+    r"\b(efficien(?:cy|t)|results?|more leads|increas(?:e|ed|es|ing)|growth|grow(?:s|ing)?|grew|grown|"
+    r"improv(?:e|ed|es|ing|ement)|boost(?:s|ed|ing)?|gain(?:s|ed|ing)?|"
+    r"driv(?:e|es|ing)|drove|driven|deliver(?:s|ed|ing)?|achiev(?:e|es|ed|ing)|"
+    r"expand(?:s|ed|ing)?|doubl(?:e|ed|es|ing)|tripl(?:e|ed|es|ing)|multipl(?:y|ied|ies|ying)|"
+    r"generat(?:e|ed|es|ing))\b",
     re.IGNORECASE,
 )
 _RATE_CONTEXT = re.compile(r"\b(cpc|ctr|cpl|cpa|conversion rate)\b", re.IGNORECASE)
@@ -58,6 +68,10 @@ _NUMERIC_PATTERNS = [
     ("percent", re.compile(r"\d+(?:\.\d+)?\s?%(?:\s?-\s?\d+(?:\.\d+)?\s?%)?|\d+(?:\.\d+)?\s?-\s?\d+(?:\.\d+)?\s?%")),
     ("range", re.compile(r"\b\d+\s?-\s?\d+\b(?!\s?%)")),
     ("score", re.compile(r"\b\d+\s?/\s?100\b")),
+    # "300+ institutional orders", "50+ clients" — a bare inflated-round-number
+    # count claim. Deliberately narrow (requires the literal "+") so ordinary
+    # numbers ("30 days", "10 minute call", a year) aren't false-positived.
+    ("count_plus", re.compile(r"\b\d+\+")),
 ]
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?\n])\s+|\n")
@@ -125,14 +139,27 @@ def classify_provenance(
         if value_str and (value_str in claim.text or normalized_claim == re.sub(r"\s+", "", f"₹{value_str}")):
             return ProvenanceTag(type="client_input", source=key)
 
-    # benchmark: does it match a real row in the benchmarks table (low-high range overlap)?
-    numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", claim.text)]
-    for row in benchmarks or []:
-        low, high = row.get("low"), row.get("high")
-        if low is None or high is None:
-            continue
-        if any(low <= n <= high for n in numbers):
-            return ProvenanceTag(type="benchmark", source=str(row.get("id", row.get("industry", "unknown"))))
+    # benchmark: does it match a real row in the benchmarks table? Requires
+    # BOTH a real industry-scoped row (callers pass [] when no industry
+    # matched — see main.py's _get_industry_benchmarks) AND the claim's own
+    # shape to be compatible with that row's metric unit, not just a
+    # coincidental numeric-range overlap. A live smoke test caught a
+    # fabricated "30% research efficiency" claim getting waved through
+    # against an unrelated CPC row that happened to span 10-45 — without
+    # this shape check, a percent claim could match a rupee-denominated
+    # metric purely by luck.
+    _kind_to_metrics = {"percent": {"ctr"}, "currency": {"cpc", "cpl"}}
+    _acceptable_metrics = _kind_to_metrics.get(claim.kind)
+    if _acceptable_metrics:
+        numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", claim.text)]
+        for row in benchmarks or []:
+            if row.get("metric") not in _acceptable_metrics:
+                continue
+            low, high = row.get("low"), row.get("high")
+            if low is None or high is None:
+                continue
+            if any(low <= n <= high for n in numbers):
+                return ProvenanceTag(type="benchmark", source=str(row.get("id", row.get("industry", "unknown"))))
 
     return None
 

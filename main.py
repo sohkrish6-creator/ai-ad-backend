@@ -2349,21 +2349,30 @@ except Exception as _ibe:
 
 
 def _get_industry_benchmarks(industry_hint: str = "") -> list[dict]:
-    """Best-effort lookup of relevant benchmark rows for a numeric-provenance
-    check — matches on a loose substring of `industry_hint` against the
-    seeded industry names, falling back to all rows if nothing matches
-    (better to over-include candidate rows than to silently return none
-    and force everything into WARN/BLOCKING with no benchmark path)."""
+    """Lookup of relevant benchmark rows for a numeric-provenance check —
+    matches on a loose substring of `industry_hint` against the seeded
+    industry names. Returns [] (not "all rows") when nothing matches.
+
+    An earlier version fell back to returning every seeded row when no
+    industry matched, reasoning "better to over-include than return none" —
+    that was wrong for this specific consumer: classify_provenance grants
+    `benchmark` provenance to any claim whose number falls inside ANY
+    returned row's [low, high], with no check that the row's industry or
+    metric actually relates to the claim. With ~20 seeded rows spanning
+    cpc/ctr/cpl 0.5-2000, returning all of them meant almost any number
+    would coincidentally fall inside some unrelated row's range — a live
+    smoke test confirmed this let a fabricated "30% research efficiency"
+    claim get waved through as "benchmark-backed" via an unrelated
+    healthcare-CPC row that happened to span 10-45. No real industry match
+    means no real benchmark to point to; the claim should stay unproven."""
     try:
         with engine.connect() as conn:
-            if industry_hint:
-                rows = conn.execute(text(
-                    "SELECT id, industry, metric, low, high, unit FROM industry_benchmarks "
-                    "WHERE LOWER(:hint) LIKE '%' || LOWER(industry) || '%' OR LOWER(industry) LIKE '%' || LOWER(:hint) || '%'"
-                ), {"hint": industry_hint}).fetchall()
-                if rows:
-                    return [{"id": r[0], "industry": r[1], "metric": r[2], "low": r[3], "high": r[4], "unit": r[5]} for r in rows]
-            rows = conn.execute(text("SELECT id, industry, metric, low, high, unit FROM industry_benchmarks")).fetchall()
+            if not industry_hint:
+                return []
+            rows = conn.execute(text(
+                "SELECT id, industry, metric, low, high, unit FROM industry_benchmarks "
+                "WHERE LOWER(:hint) LIKE '%' || LOWER(industry) || '%' OR LOWER(industry) LIKE '%' || LOWER(:hint) || '%'"
+            ), {"hint": industry_hint}).fetchall()
             return [{"id": r[0], "industry": r[1], "metric": r[2], "low": r[3], "high": r[4], "unit": r[5]} for r in rows]
     except Exception as _e:
         logger.warning(f"[REPORT-ENGINE] benchmark lookup failed: {_e}")

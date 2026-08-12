@@ -114,6 +114,28 @@ def test_strip_keeps_warn_claims_but_adds_caveat():
     assert len(warn_removed) >= 1
 
 
+def test_bare_inflated_count_claim_is_caught():
+    """Regression guard: a live production run surfaced '300+ institutional
+    orders' — a fabricated count with no %, no currency, no /100 shape —
+    that the original 4 patterns didn't catch at all."""
+    claims = extract_numeric_claims("We assisted a similar business in gaining 300+ institutional orders.")
+    count_claim = next(c for c in claims if c.kind == "count_plus")
+    assert count_claim.tier == "BLOCKING"
+    tag = classify_provenance(count_claim, EVIDENCE_TEXT, CLIENT_INPUTS, [])
+    assert tag is None
+
+
+def test_past_tense_outcome_verb_is_caught():
+    """Regression guard: a live production run surfaced 'We increased order
+    volume by 25% for a similar business' surviving unflagged — the
+    original outcome-keyword regex matched the base form 'increase' but not
+    its past tense 'increased' (no word boundary between the stem and its
+    own suffix)."""
+    claims = extract_numeric_claims("We increased order volume by 25% for a similar business.")
+    percent_claim = next(c for c in claims if c.kind == "percent")
+    assert percent_claim.tier == "BLOCKING"
+
+
 def test_strip_with_real_benchmarks_leaves_cpc_ctr_unflagged():
     cleaned, removed = strip_unproven_claims(
         "product_highlights", SECTION_TEXT_WITH_FABRICATED_NUMBERS, EVIDENCE_TEXT, CLIENT_INPUTS, REALISTIC_BENCHMARKS,
