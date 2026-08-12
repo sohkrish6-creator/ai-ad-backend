@@ -2493,6 +2493,137 @@ async def add_case_study(payload: CaseStudyRequest, request: Request, db: Sessio
     return {"success": True, "message": "Case study saved — mark it verified before it can be referenced in generated copy."}
 
 
+# Post-audit fix (Report Engine P0.3): a production report contained TWO
+# independently-generated, contradictory media plans in one deliverable —
+# full_report's own "MEDIA BUYING PLAN:" section (8 fields, one prompt,
+# generated alongside the marketing plan/ad assets) and a separate
+# POST /media-buying-plan endpoint (13 fields, a completely different
+# prompt, fed a much poorer truncated context) — different platform
+# priority, different budget split, different CTR benchmarks, different
+# pause rules, both rendered on the same MarketingBrain.jsx page and both
+# exportable to their own separate PDF. This is the single generator both
+# entry points now call — same prompt, same schema, same context depth,
+# so they can never diverge again.
+_MEDIA_PLAN_SECTION_HEADERS = [
+    ("campaign_objective",       "1. CAMPAIGN OBJECTIVE:"),
+    ("platform_recommendations", "2. PLATFORM RECOMMENDATIONS:"),
+    ("budget_allocation",        "3. BUDGET ALLOCATION:"),
+    ("bid_strategy",             "4. BID STRATEGY:"),
+    ("launch_plan",              "5. LAUNCH PLAN:"),
+    ("learning_phase",           "6. LEARNING PHASE:"),
+    ("scaling_plan",             "7. SCALING PLAN:"),
+    ("pause_rules",              "8. PAUSE RULES:"),
+    ("stop_rules",               "9. STOP RULES:"),
+    ("optimization_plan",        "10. OPTIMIZATION PLAN:"),
+    ("risk_analysis",            "11. RISK ANALYSIS:"),
+    ("media_buyer_playbook",     "12. MEDIA BUYER PLAYBOOK:"),
+    ("industry_benchmarks",      "13. INDUSTRY BENCHMARKS:"),
+]
+
+
+def _parse_media_plan_sections(raw_text: str) -> dict:
+    """Splits the numbered-section raw GPT text into a dict keyed by plain
+    field names — same `_header_pattern`-style loose matching (markdown
+    bold/hash noise, missing trailing colon) as full_report's own
+    split_by_headers, adapted for "N. HEADER:" numbering."""
+    result = {}
+    headers = [h for _, h in _MEDIA_PLAN_SECTION_HEADERS]
+    for i, (key, header) in enumerate(_MEDIA_PLAN_SECTION_HEADERS):
+        core = re.escape(header.rstrip(":"))
+        pattern = re.compile(r'[#\*\s]*' + core + r'[:\*\s]*', re.I)
+        start_match = pattern.search(raw_text)
+        if not start_match:
+            result[key] = ""
+            continue
+        content_start = start_match.end()
+        next_header = headers[i + 1] if i + 1 < len(headers) else None
+        if next_header:
+            next_core = re.escape(next_header.rstrip(":"))
+            end_match = re.compile(r'[#\*\s]*' + next_core + r'[:\*\s]*', re.I).search(raw_text[content_start:])
+            content = raw_text[content_start:content_start + end_match.start()].strip() if end_match else raw_text[content_start:].strip()
+        else:
+            content = raw_text[content_start:].strip()
+        result[key] = content
+    return result
+
+
+async def generate_media_plan(
+    business_label: str, budget: int, goal: str, language: str,
+    context_block: str, industry_hint: str = "", revenue_model: str = "",
+) -> dict:
+    """The one canonical media-plan generator. `context_block` is
+    caller-assembled free text (full_report passes its own rich
+    exec_txt+sc_txt+dna_txt+live_intel_block; the standalone endpoint's
+    cache-miss fallback passes whatever marketing_summary/bi_data it has) —
+    the generation LOGIC (prompt, 13-section schema, benchmark grounding,
+    provenance checking) is identical either way, which is the actual fix:
+    before this, the two callers didn't just have different context, they
+    ran two structurally different prompts with no shared schema at all."""
+    benchmarks = _get_industry_benchmarks(industry_hint)
+    benchmark_hint = ""
+    if benchmarks:
+        lines = "\n".join(f"- {b['industry']} {b['metric'].upper()}: {b['low']}-{b['high']} {b['unit']}" for b in benchmarks)
+        benchmark_hint = f"\nREAL BENCHMARK DATA for this industry (use these ranges for section 13, don't invent your own):\n{lines}\n"
+
+    system_prompt = (
+        "You are an expert Media Buyer. "
+        "You have access to the business intelligence data and marketing strategy provided below.\n\n"
+        "Using the BI data and marketing context, generate a complete media buying plan with these 13 sections:\n\n"
+        "1. CAMPAIGN OBJECTIVE: — Primary goal and why (Lead Gen / Sales / Awareness / etc.)\n"
+        "2. PLATFORM RECOMMENDATIONS: — Rank Google, Meta, LinkedIn, YouTube, Display, Remarketing as 1st/2nd/3rd priority with reasoning\n"
+        "3. BUDGET ALLOCATION: — Monthly budget, daily budget, platform split (e.g. Meta 50%, Google 40%, Remarketing 10%) with reasoning\n"
+        "4. BID STRATEGY: — Recommended bid strategy (Maximize Conversions / Target CPA / Manual CPC / etc.) and why it fits this business\n"
+        "5. LAUNCH PLAN: — Recommended launch date, what to prepare before launch\n"
+        "6. LEARNING PHASE: — Learning period duration, minimum data required, when NOT to judge the campaign\n"
+        "7. SCALING PLAN: — When to scale, how much to increase (%), safe vs aggressive scale rules, scale only if conditions\n"
+        "8. PAUSE RULES: — When to pause ads (CTR below benchmark, no conversions after learning, CPC too high)\n"
+        "9. STOP RULES: — When to stop campaign entirely (consistent losses, no improvement, poor audience match)\n"
+        "10. OPTIMIZATION PLAN: — Checklist for audience, creative, landing page, offer, and budget optimization\n"
+        "11. RISK ANALYSIS: — Risk level (Low/Medium/High), top risks (budget, audience, creative, competition)\n"
+        "12. MEDIA BUYER PLAYBOOK: — Exactly what to do on Day 1, Day 3, Day 7, Day 14, Day 30\n"
+        "13. INDUSTRY BENCHMARKS: — CTR range, CPC range, CPA range, conversion rate range for this industry (ranges only, no fake exact numbers)\n"
+        f"{benchmark_hint}\n"
+        "RULES: Never predict exact ROAS or CPA. Use benchmark RANGES only. Every recommendation must explain WHY. Use the BI data evidence provided."
+    )
+
+    user_msg = (
+        f"IMPORTANT: Write entire response in: {language}\n\n"
+        f"BUSINESS: {business_label}\n"
+        f"MONTHLY BUDGET: ₹{budget:,}\n"
+        f"PRIMARY GOAL: {goal}\n\n"
+        f"{context_block}\n\n"
+        "Now generate the complete 13-section media buying plan."
+    )
+
+    resp = await asyncio.to_thread(
+        lambda: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
+            max_tokens=3500,
+        )
+    )
+    raw_text = resp.choices[0].message.content.strip()
+    sections = _parse_media_plan_sections(raw_text)
+
+    # P0.1 numeric provenance — same validator every other report section
+    # goes through, applied here too since a media plan is exactly the
+    # kind of numerically-dense content that's easiest to fabricate.
+    client_inputs = {"budget": budget}
+    suppressed = []
+    for key in list(sections.keys()):
+        clean_text, removed = strip_unproven_claims(f"media_plan.{key}", sections[key], context_block, client_inputs, benchmarks)
+        sections[key] = clean_text
+        suppressed.extend(removed)
+    for r in suppressed:
+        logger.warning(f"[PROVENANCE] removed {r.tier} claim in {r.section}: {r.original_text!r} — {r.reason}")
+
+    return {
+        "sections": sections,
+        "raw_text": raw_text,
+        "suppressed_claims_count": len(suppressed),
+    }
+
+
 @app.post("/full-report")
 async def full_report(request: FullReportRequest, http_request: Request, db: Session = Depends(get_db)):
     # Post-audit fix (Report Engine P0.2): FastAPI detects the special
@@ -2909,17 +3040,18 @@ For {request.target_industry} businesses in {request.target_city}, include:
         )
 
     prompt_c = (
-        "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'MARKETING PLAN' and only contain sections 9, 10, 11.\n\n"
+        "CRITICAL INSTRUCTION: Do NOT write Business Understanding, Market Understanding, Competitor Insights, or Positioning Strategy sections. Those are already complete in sections 1-4. Your output must START DIRECTLY with 'MARKETING PLAN' and only contain sections 9, 10.\n\n"
         "You are the Marketing Brain inside Adsoh.\n"
         f"{business_critical}"
         f"{_memory_block}"
-        "Generate the marketing plan, ad assets, and media buying plan. All recommendations must reference BI evidence.\n"
+        "Generate the marketing plan and ad assets. All recommendations must reference BI evidence. "
+        "(The media buying plan is generated separately, by a dedicated media-planning pass — do not write one here.)\n"
         f"LANGUAGE: {lang}\nBUSINESS: {biz} | BUDGET: {bdgt} | GOAL: {request.goal}\n\n"
         f"{industry_context}"
         f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n"
         f"{live_intel_block}"
         "NEVER use the word Elevate in any headline, hook, or copy.\n"
-        "Koi asterisk mat use kar. Seedha likho. Generate sections 9-11 ONLY:\n\n"
+        "Koi asterisk mat use kar. Seedha likho. Generate sections 9-10 ONLY:\n\n"
         "MARKETING PLAN:\n"
         "Channel Ranking: [Rank the top 4-5 channels for THIS business right now out of: Google Ads, Meta Ads, SEO, "
         "Local SEO / Google Business Profile, Email, WhatsApp, LinkedIn, YouTube, Display, Performance Max, Demand "
@@ -2944,20 +3076,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "CTAs (3 — specific actions, not 'Contact Us' or 'Learn More'):\n"
         "1. []\n2. []\n3. []\n"
         "Creative Brief 1 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n"
-        "Creative Brief 2 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []\n\n"
-        "MEDIA BUYING PLAN:\n"
-        f"Campaign Objective: [{request.goal} — explain why this fits the business]\n"
-        "Platform Priority: [1st: [] — why | 2nd: [] — why | 3rd: [] — why]\n"
-        f"Budget Split: [{bdgt} — exact rupee allocation per platform with reasoning]\n"
-        f"Budget Pacing: [Given {bdgt} and the current competition level and learning-phase needs, should this "
-        "spend faster (compress into fewer days to exit the learning phase quickly — good for small budgets or "
-        "high competition) or pace evenly across the full month (steadier signal, better for stable long-term "
-        "accounts)? Recommend one and say why, citing the budget size and goal above]\n"
-        "Bid Strategy: [recommended bid strategy + why it fits this business and goal]\n"
-        "Launch Plan: [recommended launch date, what to set up first, first 7 days checklist]\n"
-        "Scaling Rules: [when to scale — conditions, by how much %, safe vs aggressive thresholds]\n"
-        "Pause Rules: [exact conditions — CTR below X%, no conversions after Y days, CPC above Z]\n"
-        "Benchmarks: [CTR range, CPC range, CPL range, conversion rate range for this industry]"
+        "Creative Brief 2 — [angle]: Hook: [] | Visual: [] | Copy: [] | CTA: []"
     )
 
     prompt_guide = (
@@ -2974,11 +3093,20 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "ABHI YEH KARO:\n1. []\n2. []\n3. []"
     )
 
-    section_a_raw, section_b_raw, section_c_raw, ad_guide_raw = await asyncio.gather(
+    # Post-audit fix (Report Engine P0.3): media_plan_result is generated in
+    # this SAME gather (not a second, later, independently-triggered call)
+    # so it always reflects this exact report's context, and it's the ONLY
+    # place a media plan gets generated for this report — no separate
+    # "MEDIA BUYING PLAN:" text in prompt_c above anymore.
+    _mp_industry_hint = (bi_data or {}).get("business_dna", {}).get("detected_industry") or request.business_type
+    _mp_context_block = f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n{live_intel_block}"
+
+    section_a_raw, section_b_raw, section_c_raw, ad_guide_raw, media_plan_result = await asyncio.gather(
         run_ai(prompt_a, 2400),
         run_ai(prompt_b, 2400),
         run_ai(prompt_c, 2800),
         run_ai(prompt_guide, 1000),
+        generate_media_plan(biz, request.budget, request.goal, lang, _mp_context_block, _mp_industry_hint),
     )
     section_a = _clean_banned_words(section_a_raw)
     section_b = _clean_banned_words(section_b_raw)
@@ -3018,7 +3146,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "AUDIENCE STRATEGY:", "LEAD SOURCES:", "OUTREACH SCRIPTS:", "PITCH & CLOSE:",
     ])
     c_parts = split_by_headers(section_c, [
-        "MARKETING PLAN:", "AD ASSETS:", "MEDIA BUYING PLAN:",
+        "MARKETING PLAN:", "AD ASSETS:",
     ])
     # Strip any repeated sections 1-4 content from section_c in case AI ignored the instruction
     _dupe_headers = ["BUSINESS UNDERSTANDING:", "MARKET UNDERSTANDING:", "COMPETITOR INSIGHTS:", "POSITIONING STRATEGY:"]
@@ -3028,7 +3156,7 @@ For {request.target_industry} businesses in {request.target_city}, include:
         if _m and _plan_m and _m.start() < _plan_m.start():
             section_c = section_c[_plan_m.start():]
             c_parts = split_by_headers(section_c, [
-                "MARKETING PLAN:", "AD ASSETS:", "MEDIA BUYING PLAN:",
+                "MARKETING PLAN:", "AD ASSETS:",
             ])
             break
 
@@ -3239,7 +3367,9 @@ For {request.target_industry} businesses in {request.target_city}, include:
         _suppressed_claims.extend(_removed)
     for _r in _suppressed_claims:
         logger.warning(f"[PROVENANCE] removed {_r.tier} claim in {_r.section}: {_r.original_text!r} — {_r.reason}")
-    suppressed_claims_count = len(_suppressed_claims)
+    # media_plan_result's own claims were already stripped + logged inside
+    # generate_media_plan() itself — just fold its count into the total.
+    suppressed_claims_count = len(_suppressed_claims) + media_plan_result["suppressed_claims_count"]
 
     _response = {
         "success": True,
@@ -3269,7 +3399,12 @@ For {request.target_industry} businesses in {request.target_city}, include:
             "pitch_close":            _response_sections_pending["pitch_close"],
             "marketing_plan":         _response_sections_pending["marketing_plan"],
             "ad_assets":              _response_sections_pending["ad_assets"],
-            "media_buying_plan":      c_parts.get("MEDIA BUYING PLAN:", ""),
+            # Post-audit fix (Report Engine P0.3): was raw text from a second,
+            # independent, contradiction-prone prompt (c_parts.get("MEDIA
+            # BUYING PLAN:", "")) — now the same structured dict the
+            # standalone /media-buying-plan endpoint reads back from cache,
+            # so the two can never show different numbers.
+            "media_buying_plan":      media_plan_result["sections"],
         },
         "bi_data":        bi_data,
         "bi_cached":      bi_cached,
@@ -4665,58 +4800,59 @@ class MediaBuyingRequest(BaseModel):
     marketing_summary: str = ""
 
 @app.post("/media-buying-plan")
-async def media_buying_plan(request: MediaBuyingRequest):
-    system_prompt = (
-        "You are an expert Media Buyer. "
-        "You have access to the business intelligence data and marketing strategy provided below.\n\n"
-        "Using the BI data and marketing context, generate a complete media buying plan with these 13 sections:\n\n"
-        "1. CAMPAIGN OBJECTIVE: — Primary goal and why (Lead Gen / Sales / Awareness / etc.)\n"
-        "2. PLATFORM RECOMMENDATIONS: — Rank Google, Meta, LinkedIn, YouTube, Display, Remarketing as 1st/2nd/3rd priority with reasoning\n"
-        "3. BUDGET ALLOCATION: — Monthly budget, daily budget, platform split (e.g. Meta 50%, Google 40%, Remarketing 10%) with reasoning\n"
-        "4. BID STRATEGY: — Recommended bid strategy (Maximize Conversions / Target CPA / Manual CPC / etc.) and why it fits this business\n"
-        "5. LAUNCH PLAN: — Recommended launch date, what to prepare before launch\n"
-        "6. LEARNING PHASE: — Learning period duration, minimum data required, when NOT to judge the campaign\n"
-        "7. SCALING PLAN: — When to scale, how much to increase (%), safe vs aggressive scale rules, scale only if conditions\n"
-        "8. PAUSE RULES: — When to pause ads (CTR below benchmark, no conversions after learning, CPC too high)\n"
-        "9. STOP RULES: — When to stop campaign entirely (consistent losses, no improvement, poor audience match)\n"
-        "10. OPTIMIZATION PLAN: — Checklist for audience, creative, landing page, offer, and budget optimization\n"
-        "11. RISK ANALYSIS: — Risk level (Low/Medium/High), top risks (budget, audience, creative, competition)\n"
-        "12. MEDIA BUYER PLAYBOOK: — Exactly what to do on Day 1, Day 3, Day 7, Day 14, Day 30\n"
-        "13. INDUSTRY BENCHMARKS: — CTR range, CPC range, CPA range, conversion rate range for this industry (ranges only, no fake exact numbers)\n\n"
-        "RULES: Never predict exact ROAS or CPA. Use benchmark RANGES only. Every recommendation must explain WHY. Use the BI data evidence provided."
-    )
+async def media_buying_plan(request: MediaBuyingRequest, http_request: Request):
+    # Post-audit fix (Report Engine P0.3): this endpoint used to run its own
+    # independent GPT call with its own 13-section prompt, fed a poorer,
+    # truncated context — a structurally different generation from
+    # full_report's own "MEDIA BUYING PLAN:" section, which is exactly how a
+    # production report ended up with two contradictory media plans in one
+    # deliverable. Now: look up the canonical plan full_report already
+    # generated and cached for this exact business (same business_key
+    # derivation as full_report's own _mem_key) — zero GPT calls, and
+    # guaranteed byte-identical to what full_report showed. Only falls back
+    # to generating fresh (via the EXACT SAME generate_media_plan() function
+    # full_report calls, not a second prompt) if this endpoint is somehow
+    # called before full_report ever ran for this business.
+    business_key = derive_business_key(request.url, request.industry, request.city)
+    uid = getattr(http_request.state, "user_id", "")
+    cached = None
+    if business_key:
+        try:
+            with engine.connect() as conn:
+                params = {"m": "marketing_brain", "bk": business_key}
+                where = "WHERE module = :m AND business_key = :bk"
+                if uid:
+                    where += " AND user_id = :uid"
+                    params["uid"] = uid
+                row = conn.execute(text(f"SELECT response_json FROM report_snapshot {where}"), params).first()
+            if row:
+                cached_response = json.loads(row[0])
+                cached_plan = (cached_response.get("sections") or {}).get("media_buying_plan")
+                if isinstance(cached_plan, dict) and cached_plan:
+                    cached = cached_plan
+        except Exception as _e:
+            logger.warning(f"[MEDIA BUYING] cache lookup failed: {_e}")
+
+    if cached:
+        return {"success": True, "media_plan": cached, "cached": True}
 
     import json as _json
-    bi_summary = f"BI DATA:\n{_json.dumps(request.bi_data, indent=2)[:3000]}\n\n" if request.bi_data else ""
-
-    user_msg = (
-        f"IMPORTANT: Write entire response in: {request.language}\n\n"
-        f"BUSINESS: {request.url}\n"
-        f"INDUSTRY: {request.industry or 'Not specified'}\n"
-        f"CITY/REGION: {request.city or 'India'}\n"
-        f"MONTHLY BUDGET: \u20b9{request.budget:,}\n"
-        f"PRIMARY GOAL: {request.goal}\n\n"
-        + bi_summary
-        + (f"MARKETING STRATEGY SUMMARY:\n{request.marketing_summary[:2000]}\n\n" if request.marketing_summary else "")
-        + "Now generate the complete 13-section media buying plan."
-    )
+    context_block = ""
+    if request.bi_data:
+        context_block += f"BI DATA:\n{_json.dumps(request.bi_data, indent=2)[:3000]}\n\n"
+    if request.marketing_summary:
+        context_block += f"MARKETING STRATEGY SUMMARY:\n{request.marketing_summary[:2000]}\n\n"
 
     try:
-        resp = await asyncio.to_thread(
-            lambda: client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=3500,
-            )
+        result = await generate_media_plan(
+            business_label=f"{request.url or 'Unknown'} | {request.industry or 'Not specified'} | {request.city or 'India'}",
+            budget=request.budget, goal=request.goal, language=request.language,
+            context_block=context_block, industry_hint=request.industry,
         )
-        media_plan = resp.choices[0].message.content.strip()
-        return {"success": True, "media_plan": media_plan}
+        return {"success": True, "media_plan": result["sections"], "cached": False}
     except Exception as ex:
         logger.error(f"[MEDIA BUYING] error: {ex}")
-        return {"success": False, "media_plan": "", "error": str(ex)}
+        return {"success": False, "media_plan": {}, "error": str(ex)}
 
 
 class IntelligenceRequest(BaseModel):
