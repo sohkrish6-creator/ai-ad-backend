@@ -2379,8 +2379,129 @@ def _get_industry_benchmarks(industry_hint: str = "") -> list[dict]:
         return []
 
 
+# Post-audit fix (Report Engine P0.2): a production outreach script fabricated
+# a client result ("Hamare ek client ko 40% zyada research efficiency mili
+# bas 3 weeks mein") with zero grounding — legal/reputational exposure once a
+# real prospect receives it. `case_studies` is the one real data source a
+# "proof angle" script variant is allowed to reference; every risky
+# generator checks this via get_case_study_for_prompt() before deciding
+# whether to even ASK for a proof-angle variant, rather than trying to
+# scrub a fabricated claim out of already-generated prose.
+_CASE_STUDIES_DDL = """
+CREATE TABLE IF NOT EXISTS case_studies (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    client_name TEXT NOT NULL,
+    industry TEXT,
+    metric TEXT NOT NULL,
+    value TEXT NOT NULL,
+    timeframe TEXT,
+    verified BOOLEAN DEFAULT FALSE,
+    uploaded_by TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+try:
+    _csddl = _CASE_STUDIES_DDL
+    if _is_sqlite:
+        _csddl = _csddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.begin() as _csconn:
+        _csconn.execute(text(_csddl))
+    logger.info("[REPORT-ENGINE] case_studies table ready")
+except Exception as _cse:
+    logger.error(f"[REPORT-ENGINE] case_studies table creation failed: {_cse}")
+
+
+def get_case_study_for_prompt(user_id: str, industry: str = "") -> Optional[dict]:
+    """The one shared lookup every proof-angle-capable generator calls.
+    Prefers an industry-matching verified case study for this tenant, falls
+    back to the tenant's most recent verified case study if none is
+    industry-specific, returns None if the tenant's library is empty —
+    callers must treat None as "omit the proof-angle variant entirely,
+    don't hedge, don't placeholder.\""""
+    if not user_id:
+        return None
+    try:
+        with engine.connect() as conn:
+            if industry:
+                row = conn.execute(text(
+                    "SELECT client_name, industry, metric, value, timeframe FROM case_studies "
+                    "WHERE user_id=:uid AND verified=TRUE AND LOWER(industry) LIKE '%' || LOWER(:industry) || '%' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ), {"uid": user_id, "industry": industry}).fetchone()
+                if row:
+                    return {"client_name": row[0], "industry": row[1], "metric": row[2], "value": row[3], "timeframe": row[4]}
+            row = conn.execute(text(
+                "SELECT client_name, industry, metric, value, timeframe FROM case_studies "
+                "WHERE user_id=:uid AND verified=TRUE ORDER BY created_at DESC LIMIT 1"
+            ), {"uid": user_id}).fetchone()
+            if row:
+                return {"client_name": row[0], "industry": row[1], "metric": row[2], "value": row[3], "timeframe": row[4]}
+    except Exception as _e:
+        logger.warning(f"[REPORT-ENGINE] case study lookup failed: {_e}")
+    return None
+
+
+def _format_case_study_for_prompt(cs: dict) -> str:
+    tf = f" in {cs['timeframe']}" if cs.get("timeframe") else ""
+    return f"{cs['client_name']} ({cs.get('industry') or 'a client'}): {cs['metric']} {cs['value']}{tf}"
+
+
+class CaseStudyRequest(BaseModel):
+    client_name: str
+    industry: str = ""
+    metric: str
+    value: str
+    timeframe: str = ""
+
+
+@app.get("/case-studies")
+async def list_case_studies(request: Request, db: Session = Depends(get_db)):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, client_name, industry, metric, value, timeframe, verified, uploaded_by, created_at "
+            "FROM case_studies WHERE user_id=:uid ORDER BY created_at DESC"
+        ), {"uid": uid}).fetchall()
+    return {"success": True, "case_studies": [
+        {"id": r[0], "client_name": r[1], "industry": r[2], "metric": r[3], "value": r[4],
+         "timeframe": r[5], "verified": bool(r[6]), "uploaded_by": r[7], "created_at": r[8]}
+        for r in rows
+    ]}
+
+
+@app.post("/case-studies")
+async def add_case_study(payload: CaseStudyRequest, request: Request, db: Session = Depends(get_db)):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO case_studies (user_id, client_name, industry, metric, value, timeframe, verified, uploaded_by, created_at) "
+            "VALUES (:uid, :client_name, :industry, :metric, :value, :timeframe, FALSE, :uid, :ts)"
+        ), {
+            "uid": uid, "client_name": payload.client_name, "industry": payload.industry,
+            "metric": payload.metric, "value": payload.value, "timeframe": payload.timeframe, "ts": now,
+        })
+    # Not yet verified — an operator must confirm the result is real before
+    # any generator will reference it (see get_case_study_for_prompt's
+    # verified=TRUE filter). No verification UI in this pass; the column
+    # and the gate on it exist so this isn't a dead end for a follow-up.
+    return {"success": True, "message": "Case study saved — mark it verified before it can be referenced in generated copy."}
+
+
 @app.post("/full-report")
-async def full_report(request: FullReportRequest, db: Session = Depends(get_db)):
+async def full_report(request: FullReportRequest, http_request: Request, db: Session = Depends(get_db)):
+    # Post-audit fix (Report Engine P0.2): FastAPI detects the special
+    # `Request` object by its type annotation, not by parameter name — so
+    # this can be added purely additively (`http_request`, not `request`,
+    # which already names the FullReportRequest body model throughout this
+    # ~700-line function) without renaming a single one of its existing
+    # `request.url`/`request.business_type`/... references.
+    _report_uid = getattr(http_request.state, "user_id", "")
 
     async def run_ai(prompt, max_tokens):
         resp = await asyncio.to_thread(
@@ -2661,6 +2782,31 @@ For {request.target_industry} businesses in {request.target_city}, include:
         "asset downstream. 3-4 specific points]"
     )
 
+    # Post-audit fix (Report Engine P0.2): the case-study fabrication block.
+    # A "WhatsApp Message 2 — Proof/result angle" and an Instagram DM "Line 2
+    # = connect it to a result you got for similar business" both exist
+    # below for both branches — GPT was never given anything real to ground
+    # either in, so it invents a plausible-sounding number every time. This
+    # is the one shared guard: look up a real verified case study once, and
+    # every proof-angle-shaped instruction below either references it by
+    # name or is swapped for a non-result instruction — never a gap, never
+    # a hedge ("clients have seen improvements").
+    _case_study = get_case_study_for_prompt(_report_uid, request.target_industry or request.business_type)
+    if _case_study:
+        _cs_text = _format_case_study_for_prompt(_case_study)
+        _whatsapp2_block = (
+            f"WhatsApp Message 2 — Proof/result angle (reference ONLY this real, verified case study — "
+            f"do not invent a different number or client: {_cs_text}):\n"
+            f"[Write 3-4 lines citing that real result. End EXACTLY with: \"Reply 'AUDIT' aur main aapka free analysis bhejta hoon 👇\"]\n\n"
+        )
+        _insta_line2 = f"Line 2 = reference this real result you got for a similar business: {_cs_text}."
+    else:
+        # No verified case study on file for this tenant — the proof-angle
+        # variant is simply not produced (per spec: no gap-filling
+        # placeholder, no hedged "clients have seen improvements" either).
+        _whatsapp2_block = ""
+        _insta_line2 = "Line 2 = state one concrete way you help businesses like theirs — no results, no case studies, no invented numbers."
+
     if request.target_industry:
         city = request.target_city or "India"
         prompt_b = (
@@ -2695,10 +2841,9 @@ For {request.target_industry} businesses in {request.target_city}, include:
             f"[RULE: Every message = Hook (specific to their {request.target_industry} situation) + Value (what they get) + CTA (exact next step). NO generic pain points.\n\n"
             f"WhatsApp Message 1 — Pain angle (reference a real {request.target_industry} problem like slow season, low footfall, no online presence):\n"
             f"[Write 3-4 lines. End EXACTLY with: \"Reply 'AUDIT' aur main aapka free analysis bhejta hoon 👇\"]\n\n"
-            f"WhatsApp Message 2 — Proof/result angle (reference a specific outcome like 'ek {request.target_industry} client ko 3x leads mile in 30 days'):\n"
-            f"[Write 3-4 lines. End EXACTLY with: \"Reply 'AUDIT' aur main aapka free analysis bhejta hoon 👇\"]\n\n"
+            f"{_whatsapp2_block}"
             f"Instagram DM Script (for {request.target_industry} business owner's personal/business account):\n"
-            f"[3 lines: Line 1 = something specific you noticed about their profile/business. Line 2 = what result you got for similar {request.target_industry} business. "
+            f"[3 lines: Line 1 = something specific you noticed about their profile/business. {_insta_line2} "
             f"Line 3 = End EXACTLY with: \"Interested? Main ek quick voice note bhej sakta hoon 🎙️\"]\n\n"
             f"Cold Call Opening — First 10 seconds:\n"
             f"[Hook = reference their specific business type + city. End EXACTLY with: \"Kya kal 10 minute ka call ho sakta hai?\"]\n\n"
@@ -2746,10 +2891,9 @@ For {request.target_industry} businesses in {request.target_city}, include:
             f"[RULE: Every message = Hook (specific to their situation as a {request.business_type} buyer) + Value (concrete benefit) + CTA (exact next step). NOT generic.\n\n"
             f"WhatsApp Message 1 — Pain angle (reference a real specific problem this audience faces — low footfall, wasted ad budget, no enquiries — based on the audience intel above):\n"
             f"[Write 3-4 lines. End EXACTLY with: \"Reply 'AUDIT' aur main aapka free analysis bhejta hoon 👇\"]\n\n"
-            f"WhatsApp Message 2 — Proof/result angle (reference a specific result like '{request.business_type} client ko 40% more leads mile in 3 weeks'):\n"
-            f"[Write 3-4 lines. End EXACTLY with: \"Reply 'AUDIT' aur main aapka free analysis bhejta hoon 👇\"]\n\n"
+            f"{_whatsapp2_block}"
             f"Instagram DM Script:\n"
-            f"[3 lines: Line 1 = notice something specific about their post/profile. Line 2 = connect it to a result you got for similar business. "
+            f"[3 lines: Line 1 = notice something specific about their post/profile. {_insta_line2} "
             f"Line 3 = End EXACTLY with: \"Interested? Main ek quick voice note bhej sakta hoon 🎙️\"]\n\n"
             f"Cold Outreach Email:\n"
             f"Subject: [specific, personalized — not 'Grow Your Business']\n"
@@ -3793,7 +3937,7 @@ class AdCreativeRequest(BaseModel):
     language: str = "Hinglish"
 
 @app.post("/ad-creative")
-async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db)):
+async def ad_creative(request: AdCreativeRequest, http_request: Request, db: Session = Depends(get_db)):
     import re
 
     def extract_clean(html):
@@ -3824,6 +3968,24 @@ async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db))
 
     site = await fetch(request.url)
 
+    # Post-audit fix (Report Engine P0.2): CREATIVE 2 — PROOF ANGLE explicitly
+    # asked for "numbers, results, credibility" with nothing real to ground
+    # it in. Only generated when a verified case study exists for this
+    # tenant; otherwise dropped from the outline entirely (2 creatives, not
+    # 3-with-a-gap) rather than asking GPT to invent a number.
+    _ac_uid = getattr(http_request.state, "user_id", "")
+    _ac_case_study = get_case_study_for_prompt(_ac_uid, request.business_type)
+    if _ac_case_study:
+        _creative_count_line = "3 alag ad creative banao — DISTINCT angles (Benefit / Proof / Urgency). Koi asterisk mat use kar.\n\n"
+        _creative2_block = (
+            f"CREATIVE 2 — PROOF ANGLE (reference ONLY this real, verified case study — "
+            f"do not invent a different number or client: {_format_case_study_for_prompt(_ac_case_study)}):\n"
+            "Hook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
+        )
+    else:
+        _creative_count_line = "2 alag ad creative banao — DISTINCT angles (Benefit / Urgency). Koi asterisk mat use kar.\n\n"
+        _creative2_block = ""
+
     _current_month_yr = datetime.now().strftime("%B %Y")
     prompt = (
         "Tu ek award-winning ad creative director hai jo Indian brands ke liye scroll-stopping ads banata hai.\n\n"
@@ -3836,9 +3998,9 @@ async def ad_creative(request: AdCreativeRequest, db: Session = Depends(get_db))
         "LANGUAGE: " + request.language + "\n"
         f"CURRENT DATE: {_current_month_yr}\n\n"
         "BRAND WEBSITE:\n" + site[:1500] + "\n\nPROMOTE: " + request.offer + "\nPLATFORM: " + request.platform + "\nINDUSTRY: " + request.business_type + "\n\n"
-        "3 alag ad creative banao — DISTINCT angles (Benefit / Proof / Urgency). Koi asterisk mat use kar.\n\n"
+        + _creative_count_line +
         "CREATIVE 1 — BENEFIT ANGLE (what they get, specific outcome):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
-        "CREATIVE 2 — PROOF ANGLE (numbers, results, credibility — no generic claims):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
+        + _creative2_block +
         "CREATIVE 3 — URGENCY ANGLE (limited time, competitor threat, or seasonal urgency):\nHook Line: []\nPrimary Text: []\nHeadline: []\nCTA Button: []\nImage Concept: []\nText On Image: []\nColor Palette: []\nLayout: []\n\n"
         "CRITICAL FINAL CHECK: Scan every word. If Transform, Elevate, Unlock, Seamless, Empower, Leverage, Boost, Maximize, "
         "Cutting-edge, State-of-the-art, World-class, One-stop solution, Look no further, In today's digital age found — rewrite completely."
@@ -5988,7 +6150,7 @@ class OutreachAIRequest(BaseModel):
     business_key:  str = ""
 
 @app.post("/outreach-ai")
-async def outreach_ai(request: OutreachAIRequest):
+async def outreach_ai(request: OutreachAIRequest, http_request: Request):
     industry = (request.industry or "").strip()
     city     = (request.city or "").strip()
     city_display = city or "India (no specific city given)"
@@ -6097,6 +6259,28 @@ WEBSITE STATUS:
 - Audit score: {_wm.get("overall_score", "not audited")}
 """
 
+    # Post-audit fix (Report Engine P0.2): four fields below ("ps_line",
+    # "message_2_proof", instagram "follow_up", call_script
+    # "value_statement") explicitly ask for social proof/results with
+    # nothing real to ground them in. Conditionally point each at a real
+    # verified case study, or redirect it to non-result content — the JSON
+    # keys stay present either way (this endpoint's frontend consumer reads
+    # them directly by key; dropping a key is a bigger API-shape change
+    # than redirecting its content, and P0.2 only requires the latter).
+    _oa_uid = getattr(http_request.state, "user_id", "")
+    _oa_case_study = get_case_study_for_prompt(_oa_uid, industry)
+    if _oa_case_study:
+        _oa_cs_text = _format_case_study_for_prompt(_oa_case_study)
+        _oa_ps_line = f"P.S. one sentence referencing this real, verified result — do not invent a different number: {_oa_cs_text}"
+        _oa_msg2_proof = f"Second WhatsApp (send 2 days later if no reply) — lead with this real, verified case study: {_oa_cs_text}. 3-4 lines, end with 'Reply AUDIT'"
+        _oa_insta_followup = f"Follow-up DM if no reply in 3 days — 2 lines, reference the opener, reference this real result: {_oa_cs_text}"
+        _oa_call_value = f"30-second value pitch after they share pain — specific, no fluff, may reference this real result: {_oa_cs_text}"
+    else:
+        _oa_ps_line = "P.S. one sentence adding urgency or a concrete next step — NOT a result, case study, or number (none verified for this client)"
+        _oa_msg2_proof = "Second WhatsApp (send 2 days later if no reply) — lead with a specific, concrete service benefit, NOT a result or case study (none verified for this client). 3-4 lines, end with 'Reply AUDIT'"
+        _oa_insta_followup = "Follow-up DM if no reply in 3 days — 2 lines, reference the opener, add a concrete detail about your service — NOT social proof (none verified for this client)"
+        _oa_call_value = "30-second value pitch after they share pain — specific, no fluff, describe the service/approach — do NOT reference results (none verified for this client)"
+
     # ── GPT-4o ───────────────────────────────────────────────────────────────
     prompt = f"""You are a senior B2B sales copywriter specialising in Indian market outreach for digital marketing agencies.
 Generate a complete, personalised outreach kit based on the business context below. Every message must feel written for a real human, not a template.
@@ -6108,7 +6292,7 @@ Return ONLY a valid JSON object matching this EXACT schema (no markdown, no text
   "cold_email": {{
     "subject": "subject line — curiosity-driven, under 8 words, no clickbait",
     "body": "email body — under 150 words, 3 short paragraphs, reference specific {industry} pain point, end with one soft ask",
-    "ps_line": "P.S. one sentence with social proof or urgency",
+    "ps_line": "{_oa_ps_line}",
     "why_it_works": "one sentence explaining the psychology behind this email"
   }},
   "linkedin_message": {{
@@ -6118,19 +6302,19 @@ Return ONLY a valid JSON object matching this EXACT schema (no markdown, no text
   }},
   "whatsapp": {{
     "message_1_pain": "First WhatsApp — lead with their pain point, 3-4 lines, end with 'Reply AUDIT to get a free audit'",
-    "message_2_proof": "Second WhatsApp (send 2 days later if no reply) — lead with a result or case study, 3-4 lines, end with 'Reply AUDIT'",
+    "message_2_proof": "{_oa_msg2_proof}",
     "follow_up_day3": "Day 3 follow-up — very short, casual Hinglish, 2 lines max, different angle",
     "follow_up_day7": "Day 7 final follow-up — breakup message, 2 lines, create scarcity or FOMO"
   }},
   "instagram_dm": {{
     "opener": "STRICTLY 3 lines max — start with a specific observation about their account or post, casual Hinglish, end with a soft question",
-    "follow_up": "Follow-up DM if no reply in 3 days — 2 lines, reference the opener, add light social proof",
+    "follow_up": "{_oa_insta_followup}",
     "why_it_works": "one sentence"
   }},
   "call_script": {{
     "opener_10sec": "10-second cold call opener — introduce yourself, name the specific pain, ask one yes/no question",
     "pain_question": "The single best discovery question to reveal their marketing pain — open-ended",
-    "value_statement": "30-second value pitch after they share pain — specific, no fluff, reference results",
+    "value_statement": "{_oa_call_value}",
     "close": "Meeting booking close — specific day/time suggestion, make it easy to say yes"
   }},
   "objection_handling": [
@@ -23031,7 +23215,8 @@ class VoiceScriptVersionRequest(BaseModel):
 
 async def _voice_generate_pitch_script(prospect_id: int, business_name: str, weaknesses: list, evidence: list,
                                         caller_business_name: str, services_offered: list,
-                                        matched_weakness, matched_service, url: str, industry: str, city: str) -> tuple:
+                                        matched_weakness, matched_service, url: str, industry: str, city: str,
+                                        user_id: str = "") -> tuple:
     """GPT pitch generation, factored out so both the single-prospect
     "generate" endpoint and the bulk regenerate-pitches action share exactly
     one prompt (never two copies drifting apart). Returns (script_dict,
@@ -23068,6 +23253,20 @@ async def _voice_generate_pitch_script(prospect_id: int, business_name: str, wea
             "this business grow — do NOT claim we can fix a specific detected weakness we have no matching service for."
         )
 
+    # Post-audit fix (Report Engine P0.2): "social_proof" already had a
+    # prompt-level "no fabricated numbers/client names" instruction — proven
+    # empirically (via full_report's own live testing this pass) that a
+    # soft "don't fabricate" instruction alone does not reliably stop GPT
+    # from fabricating. Same shared guard as every other proof-angle
+    # surface: reference a real verified case study when one exists,
+    # otherwise redirect to non-result content.
+    _vp_case_study = get_case_study_for_prompt(user_id, industry)
+    _vp_social_proof_instruction = (
+        f'1 short sentence referencing this real, verified result — do not invent a different number or client: {_format_case_study_for_prompt(_vp_case_study)}'
+        if _vp_case_study else
+        "1 short sentence — a concrete detail about the service/approach, NOT a result, client name, or number (none verified for this client)"
+    )
+
     def _build_messages(correction):
         prompt = (
             f"You are writing a phone-call pitch script for an AI voice agent calling on behalf of "
@@ -23094,7 +23293,7 @@ async def _voice_generate_pitch_script(prospect_id: int, business_name: str, wea
             '  "discovery_questions": ["question 1", "question 2"],\n'
             '  "pain_point": "1-2 sentences naming their real detected weakness conversationally",\n'
             '  "value_prop": "1-2 sentences on how we help with THAT specific weakness, using ONLY the services listed above",\n'
-            '  "social_proof": "1 short sentence, no fabricated numbers/client names",\n'
+            f'  "social_proof": "{_vp_social_proof_instruction}",\n'
             '  "objection_handling": [{"objection": "...", "response": "..."}],\n'
             '  "meeting_close": "1-2 sentences asking for a meeting/callback",\n'
             '  "follow_up": "1 sentence describing what happens if they say maybe/no"\n'
@@ -23121,7 +23320,7 @@ async def _voice_generate_pitch_script(prospect_id: int, business_name: str, wea
 # constrained to services_offered, real detected weaknesses only.
 async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str, weaknesses: list, evidence: list,
                                              caller_business_name: str, services_offered: list,
-                                             matched_weakness, matched_service) -> dict:
+                                             matched_weakness, matched_service, user_id: str = "") -> dict:
     # Real weaknesses only — see _real_weakness_evidence. Was NOT filtered
     # here despite the docstring above already claiming it: the exact bug
     # this fixes (a 403/bot-block leaking into email/WhatsApp/LinkedIn/
@@ -23143,6 +23342,16 @@ async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str
             "specific detected weakness we have no matching service for."
         )
 
+    # Post-audit fix (Report Engine P0.2): "message_2" ("proof/value
+    # follow-up") had a soft "never fabricated statistics" instruction only
+    # — same shared guard as every other proof-angle surface in this pass.
+    _rd_case_study = get_case_study_for_prompt(user_id, "")
+    _rd_message2_instruction = (
+        f'proof follow-up — reference ONLY this real, verified result, do not invent a different one: {_format_case_study_for_prompt(_rd_case_study)}'
+        if _rd_case_study else
+        "value follow-up — a concrete detail about the service/approach, NOT a result or statistic (none verified for this client)"
+    )
+
     def _build_messages(correction):
         prompt = (
             f"You are writing cold-outreach drafts on behalf of {caller_business_name}, a marketing/growth "
@@ -23158,7 +23367,7 @@ async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str
             "generator that already exists — do not include one here):\n"
             "{\n"
             '  "cold_email": {"subject": "...", "body": "..."},\n'
-            '  "whatsapp": {"message_1": "opening pain-point message", "message_2": "proof/value follow-up"},\n'
+            f'  "whatsapp": {{"message_1": "opening pain-point message", "message_2": "{_rd_message2_instruction}"}},\n'
             '  "linkedin": {"connection_note": "under 300 chars", "follow_up_message": "..."},\n'
             '  "instagram_dm": {"opener": "...", "follow_up": "..."}\n'
             "}\nReturn ONLY valid JSON."
@@ -23262,7 +23471,7 @@ async def voice_outreach_create_script_version(prospect_id: int, payload: VoiceS
     else:
         script, script_template_id = await _voice_generate_pitch_script(
             prospect_id, business_name, weaknesses, evidence, caller_business_name, services_offered,
-            matched_weakness, matched_service, payload.url, payload.industry, payload.city,
+            matched_weakness, matched_service, payload.url, payload.industry, payload.city, uid,
         )
         edited_by_user = False
 
@@ -23320,7 +23529,7 @@ async def _voice_regenerate_all_pitches(user_id: str) -> dict:
         disclosure_line = _voice_disclosure_line(business_name, caller_business_name)
         script, script_template_id = await _voice_generate_pitch_script(
             pid, business_name, weaknesses, evidence, caller_business_name, services_offered,
-            matched_weakness, matched_service, "", "", "",
+            matched_weakness, matched_service, "", "", "", user_id,
         )
         _voice_persist_script_version(user_id, pid, disclosure_line, script, False, script_template_id, "generate")
         regenerated += 1
@@ -25164,7 +25373,7 @@ async def revenue_engine_generate_outreach_drafts(prospect_id: int, request: Req
 
     drafts = await _revenue_generate_outreach_drafts(
         prospect_id, business_name, weaknesses, evidence, caller_business_name, services_offered,
-        matched_weakness, matched_service,
+        matched_weakness, matched_service, uid,
     )
 
     now = datetime.utcnow().isoformat()
@@ -25294,7 +25503,7 @@ async def revenue_engine_call_assistant(prospect_id: int, request: Request):
         script, script_template_id = await _voice_generate_pitch_script(
             prospect_id, prospect["business_name"], prospect["weaknesses"], prospect["evidence"],
             caller_business_name, services_offered, prospect["matched_weakness"], prospect["matched_service"],
-            "", "", "",
+            "", "", "", uid,
         )
         _voice_persist_script_version(uid, prospect_id, disclosure_line, script, False, script_template_id, "generate")
         call_script = {
