@@ -233,3 +233,74 @@ def strip_unproven_claims(
         cleaned_text = caveat + "\n" + cleaned_text
 
     return cleaned_text.strip(), removed
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# P0.4 — Business model taxonomy fix
+# ─────────────────────────────────────────────────────────────────────────
+
+PurchaseType = Literal["one_time", "recurring_consumable", "subscription", "project_based"]
+
+# Deliberately conservative and specific to consumable/reagent-style
+# goods — mirrors _VOICE_CHAIN_BRAND_KEYWORDS's "small, targeted keyword
+# net as a secondary signal" style. A distributor selling reagents/kits
+# is a repeat-order consumables business regardless of what a one-shot
+# GPT classification call decides; this override always wins on a match.
+RECURRING_KEYWORDS = (
+    "reagent", "kit", "consumable", "refill", "cartridge", "supplies",
+    "disposables", "media", "buffer", "antibody",
+)
+
+
+def check_purchase_type_override(evidence_text: str) -> Optional[str]:
+    """Pure keyword check over the client's own scraped evidence text.
+    Returns "recurring_consumable" on any match, else None — never
+    guesses any other purchase type from keywords alone, since only the
+    recurring-consumable misclassification was the confirmed, systemic
+    fault (equipment/SaaS/services still need the model's judgment)."""
+    if not evidence_text:
+        return None
+    text_lower = evidence_text.lower()
+    matched = [kw for kw in RECURRING_KEYWORDS if kw in text_lower]
+    return "recurring_consumable" if matched else None
+
+
+# Maps the model's free-text revenue_model output onto the fixed enum, in
+# case the prompt's own instruction isn't followed exactly (defense in
+# depth, not the primary mechanism — the prompt itself asks for the new
+# enum directly).
+_REVENUE_MODEL_MAP = {
+    "one-time": "one_time", "one_time": "one_time", "onetime": "one_time",
+    "subscription": "subscription", "freemium": "subscription",
+    "commission": "project_based", "project-based": "project_based",
+    "project_based": "project_based", "service": "project_based",
+    "recurring": "recurring_consumable", "recurring_consumable": "recurring_consumable",
+    "recurring consumable": "recurring_consumable",
+}
+
+
+def normalize_purchase_type(raw_value: str) -> PurchaseType:
+    """Best-effort mapping of a freeform model output to the fixed enum.
+    "Mixed" and anything unrecognized default to project_based — the
+    least presumptive bucket (no retention module is force-activated on
+    an ambiguous guess; recurring_consumable/subscription only ever get
+    set by an explicit model answer or the keyword override)."""
+    key = (raw_value or "").strip().lower()
+    return _REVENUE_MODEL_MAP.get(key, "project_based")
+
+
+def assert_retention_budget(media_plan: dict, revenue_model: str) -> Optional[str]:
+    """A recurring-revenue business (recurring_consumable/subscription)
+    whose media plan allocates 100% to acquisition — no existing-customer/
+    retention budget line at all — fails validation. Returns an error
+    string on failure, None if the plan is fine (either the business isn't
+    recurring, or a retention line is genuinely present)."""
+    if revenue_model not in ("recurring_consumable", "subscription"):
+        return None
+    budget_text = (media_plan or {}).get("budget_allocation", "") or ""
+    if not budget_text.strip():
+        return "recurring-revenue business but budget_allocation is empty — no retention line possible"
+    if not re.search(r"\b(retention|reactivation|existing customer|repeat order|reorder|win-back|winback)\b",
+                      budget_text, re.IGNORECASE):
+        return "recurring-revenue business but budget_allocation has no existing-customer/retention line — 100% acquisition"
+    return None

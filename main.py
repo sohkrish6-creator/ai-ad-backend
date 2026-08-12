@@ -34,7 +34,13 @@ import hashlib
 import base64
 import uuid
 from zoneinfo import ZoneInfo
-from report_validators import strip_unproven_claims
+from report_validators import (
+    strip_unproven_claims,
+    check_purchase_type_override,
+    normalize_purchase_type,
+    assert_retention_budget,
+    RECURRING_KEYWORDS,
+)
 
 try:
     import jwt as _pyjwt
@@ -2565,6 +2571,22 @@ async def generate_media_plan(
         lines = "\n".join(f"- {b['industry']} {b['metric'].upper()}: {b['low']}-{b['high']} {b['unit']}" for b in benchmarks)
         benchmark_hint = f"\nREAL BENCHMARK DATA for this industry (use these ranges for section 13, don't invent your own):\n{lines}\n"
 
+    # Post-audit fix (Report Engine P0.4): a repeat-order consumables
+    # business (reagents, refills, supplies) whose media plan puts 100% of
+    # budget toward new-customer acquisition is a real fault — reactivating
+    # a dormant existing account is reliably cheaper than winning a new
+    # one. When the classifier resolved recurring_consumable/subscription,
+    # section 3 MUST name an explicit existing-customer/retention budget
+    # line — enforced below by assert_retention_budget, not just asked for.
+    retention_hint = ""
+    if revenue_model in ("recurring_consumable", "subscription"):
+        retention_hint = (
+            "\nThis is a RECURRING-REVENUE business (repeat orders / consumables / subscription) — "
+            "section 3 (BUDGET ALLOCATION) MUST include a named, non-zero budget line for "
+            "existing-customer marketing (retention / reorder reminders / dormant-account "
+            "reactivation), not just new-customer acquisition. State the rupee amount or percentage.\n"
+        )
+
     system_prompt = (
         "You are an expert Media Buyer. "
         "You have access to the business intelligence data and marketing strategy provided below.\n\n"
@@ -2582,7 +2604,8 @@ async def generate_media_plan(
         "11. RISK ANALYSIS: — Risk level (Low/Medium/High), top risks (budget, audience, creative, competition)\n"
         "12. MEDIA BUYER PLAYBOOK: — Exactly what to do on Day 1, Day 3, Day 7, Day 14, Day 30\n"
         "13. INDUSTRY BENCHMARKS: — CTR range, CPC range, CPA range, conversion rate range for this industry (ranges only, no fake exact numbers)\n"
-        f"{benchmark_hint}\n"
+        f"{benchmark_hint}"
+        f"{retention_hint}\n"
         "RULES: Never predict exact ROAS or CPA. Use benchmark RANGES only. Every recommendation must explain WHY. Use the BI data evidence provided."
     )
 
@@ -2595,25 +2618,54 @@ async def generate_media_plan(
         "Now generate the complete 13-section media buying plan."
     )
 
-    resp = await asyncio.to_thread(
-        lambda: client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
-            max_tokens=3500,
-        )
-    )
-    raw_text = resp.choices[0].message.content.strip()
-    sections = _parse_media_plan_sections(raw_text)
-
-    # P0.1 numeric provenance — same validator every other report section
-    # goes through, applied here too since a media plan is exactly the
-    # kind of numerically-dense content that's easiest to fabricate.
     client_inputs = {"budget": budget}
-    suppressed = []
-    for key in list(sections.keys()):
-        clean_text, removed = strip_unproven_claims(f"media_plan.{key}", sections[key], context_block, client_inputs, benchmarks)
-        sections[key] = clean_text
-        suppressed.extend(removed)
+
+    async def _generate_and_clean():
+        resp = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
+                max_tokens=3500,
+            )
+        )
+        text_out = resp.choices[0].message.content.strip()
+        parsed = _parse_media_plan_sections(text_out)
+        # P0.1 numeric provenance — same validator every other report
+        # section goes through, applied here too since a media plan is
+        # exactly the kind of numerically-dense content that's easiest to
+        # fabricate. Run BEFORE the P0.4 retention check below, not after
+        # — a retention-budget line that "passes" but then has its own
+        # rupee figure stripped as an unprovenanced BLOCKING claim would
+        # ship an output that no longer actually shows what the check
+        # verified. The check has to see what actually ships.
+        removed_here = []
+        for key in list(parsed.keys()):
+            clean_text, removed = strip_unproven_claims(f"media_plan.{key}", parsed[key], context_block, client_inputs, benchmarks)
+            parsed[key] = clean_text
+            removed_here.extend(removed)
+        return text_out, parsed, removed_here
+
+    raw_text, sections, suppressed = await _generate_and_clean()
+
+    # P0.4: a recurring-revenue business with a budget plan that's 100%
+    # acquisition (no retention line) fails validation. Regenerate once —
+    # same retry-then-warn-block pattern used elsewhere in this engine —
+    # then, if it still fails, degrade in the OUTPUT itself (a visible
+    # caveat, never a silently-shipped contradictory plan) and log loudly.
+    retention_error = assert_retention_budget(sections, revenue_model)
+    if retention_error:
+        logger.warning(f"[TAXONOMY] media plan retention budget check failed, regenerating once: {retention_error}")
+        raw_text, sections, suppressed = await _generate_and_clean()
+        retention_error = assert_retention_budget(sections, revenue_model)
+        if retention_error:
+            logger.warning(f"[TAXONOMY] media plan retention budget check failed after retry: {retention_error}")
+            caveat = (
+                "⚠️ This is a recurring-revenue business but this budget allocation has no explicit "
+                "existing-customer/retention line — review before use; retention/reactivation spend is "
+                "typically cheaper than new-customer acquisition for repeat-order businesses."
+            )
+            sections["budget_allocation"] = f"{caveat}\n{sections.get('budget_allocation', '')}".strip()
+
     for r in suppressed:
         logger.warning(f"[PROVENANCE] removed {r.tier} claim in {r.section}: {r.original_text!r} — {r.reason}")
 
@@ -2621,7 +2673,62 @@ async def generate_media_plan(
         "sections": sections,
         "raw_text": raw_text,
         "suppressed_claims_count": len(suppressed),
+        "retention_budget_ok": retention_error is None,
     }
+
+
+async def generate_retention_module(business_context: str, revenue_model: str) -> Optional[dict]:
+    """Post-audit fix (Report Engine P0.4): a reagents/ELISA-kit distributor
+    was classified one-time purchase — actually a repeat-order consumables
+    business — and that misclassification cascaded through 8 sections: no
+    retention strategy, no reorder cycle, no reactivation plan, zero budget
+    for existing customers, despite reactivating a dormant account being
+    reliably cheaper than acquiring a new one. Returns None for
+    one_time/project_based (a real signal to callers: this business doesn't
+    get a retention module, not an empty one). For
+    recurring_consumable/subscription, unconditionally generates one."""
+    if revenue_model not in ("recurring_consumable", "subscription"):
+        return None
+
+    prompt = (
+        "You are a Customer Retention Strategist for a recurring-revenue business "
+        "(repeat-order consumables, refills/supplies, or a subscription/retainer model).\n\n"
+        f"BUSINESS CONTEXT:\n{business_context}\n\n"
+        "Return STRICT JSON:\n"
+        "{\n"
+        '  "reorder_cycle_estimate": "typical time between repeat orders for this business, with reasoning",\n'
+        '  "dormant_account_reactivation": "concrete plan to win back an account that has gone quiet",\n'
+        '  "reorder_reminder_sequence": ["touchpoint 1", "touchpoint 2", "touchpoint 3"],\n'
+        '  "account_level_ltv_estimate": "a directional lifetime-value estimate for one account, with reasoning — not a fake precise number",\n'
+        '  "existing_customer_budget_line": "an explicit rupee amount or percentage of total budget reserved for existing-customer marketing — never zero"\n'
+        "}"
+    )
+    resp = await asyncio.to_thread(
+        lambda: client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=700,
+            response_format={"type": "json_object"},
+        )
+    )
+    try:
+        module = json.loads(resp.choices[0].message.content)
+    except Exception as _e:
+        logger.warning(f"[TAXONOMY] retention module JSON parse failed: {_e}")
+        return None
+
+    # Same numeric-provenance backstop every other numerically-dense
+    # section gets — a fabricated LTV/budget figure here is exactly the
+    # kind of claim P0.1 exists to catch.
+    for key in ("reorder_cycle_estimate", "dormant_account_reactivation", "account_level_ltv_estimate", "existing_customer_budget_line"):
+        if not isinstance(module.get(key), str):
+            continue
+        clean_text, removed = strip_unproven_claims(f"retention_module.{key}", module[key], business_context, {}, [])
+        module[key] = clean_text
+        for r in removed:
+            logger.warning(f"[PROVENANCE] removed {r.tier} claim in {r.section}: {r.original_text!r} — {r.reason}")
+
+    return module
 
 
 @app.post("/full-report")
@@ -3100,13 +3207,19 @@ For {request.target_industry} businesses in {request.target_city}, include:
     # "MEDIA BUYING PLAN:" text in prompt_c above anymore.
     _mp_industry_hint = (bi_data or {}).get("business_dna", {}).get("detected_industry") or request.business_type
     _mp_context_block = f"EXECUTIVE DECISIONS:\n{exec_txt}\n\nBI SCORES:\n{sc_txt}\n\nBUSINESS DNA:\n{dna_txt}\n\n{live_intel_block}"
+    # P0.4: only a real, classified DNA carries a trustworthy revenue_model
+    # — industry-only mode (no site crawled) has no dna dict to read.
+    _mp_revenue_model = (bi_data or {}).get("business_dna", {}).get("revenue_model", "") if not industry_only_mode else ""
 
-    section_a_raw, section_b_raw, section_c_raw, ad_guide_raw, media_plan_result = await asyncio.gather(
+    section_a_raw, section_b_raw, section_c_raw, ad_guide_raw, media_plan_result, retention_module = await asyncio.gather(
         run_ai(prompt_a, 2400),
         run_ai(prompt_b, 2400),
         run_ai(prompt_c, 2800),
         run_ai(prompt_guide, 1000),
-        generate_media_plan(biz, request.budget, request.goal, lang, _mp_context_block, _mp_industry_hint),
+        generate_media_plan(biz, request.budget, request.goal, lang, _mp_context_block, _mp_industry_hint, _mp_revenue_model),
+        # P0.4: unconditionally activated for recurring_consumable/subscription
+        # businesses — returns None (not a call) for one_time/project_based.
+        generate_retention_module(_mp_context_block, _mp_revenue_model),
     )
     section_a = _clean_banned_words(section_a_raw)
     section_b = _clean_banned_words(section_b_raw)
@@ -3381,6 +3494,13 @@ For {request.target_industry} businesses in {request.target_city}, include:
         # or caveated for missing provenance, surfaced so the frontend can
         # show it — never ship a report that silently dropped content.
         "suppressed_claims_count": suppressed_claims_count,
+        # Post-audit fix (Report Engine P0.4): present only for
+        # recurring_consumable/subscription businesses (None otherwise —
+        # an explicit "this business doesn't get one" signal, not an
+        # absent key that looks like a bug). Additive key, no existing
+        # response shape touched.
+        "revenue_model":   _mp_revenue_model or None,
+        "retention_module": retention_module,
         # Backward-compatible keys (existing frontend reads these)
         "strategy":       section_a,
         "competitor":     _response_sections_pending["competitor_insights"] or a_parts.get("COMPETITOR INSIGHTS:", section_a),
@@ -4607,7 +4727,7 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
         '  "detected_industry": "",\n'
         '  "detected_sub_industry": "",\n'
         '  "business_model": "B2B or B2C or D2C or Marketplace or SaaS or Service or Hybrid",\n'
-        '  "revenue_model": "One-time or Subscription or Freemium or Commission or Project-based or Mixed",\n'
+        '  "revenue_model": "one_time (equipment/machinery/perpetual licences) or recurring_consumable (reagents/supplies/refills/spares) or subscription (SaaS/retainers/memberships) or project_based (services/agency/contracts)",\n'
         '  "core_products": ["product 1", "product 2", "product 3"],\n'
         '  "price_range": "Budget or Mid-market or Premium or Enterprise or Unknown",\n'
         '  "target_geography": "Local or Regional or National or International",\n'
@@ -4620,6 +4740,27 @@ async def gather_bi_data(url: str, business_type: str = "", competitor_urls: lis
         "dna_score 0-100: score 90+ only if pricing signals, trust signals, and a clear UVP are all found in evidence."
     )
     dna = await run_ai_json(dna_prompt, 800)
+
+    # Post-audit fix (Report Engine P0.4): a reagents/ELISA-kit distributor
+    # was classified "one-time purchase" — actually a repeat-order
+    # consumables business — which cascaded through 8 downstream sections
+    # (no retention strategy, no reorder cycle, zero budget for existing
+    # customers). Normalize the model's own answer onto the fixed enum,
+    # then let a keyword override on the client's OWN evidence text force
+    # recurring_consumable regardless of what the model said — mirrors
+    # _voice_apply_enterprise_filter's "keyword net always wins on a
+    # match" idiom. Never silent: every override is logged.
+    if isinstance(dna, dict):
+        dna["revenue_model"] = normalize_purchase_type(dna.get("revenue_model", ""))
+        _override_evidence = f"{evidence_text}\n{body_text}"
+        _override = check_purchase_type_override(_override_evidence)
+        if _override and dna["revenue_model"] != _override:
+            _matched_kw = [kw for kw in RECURRING_KEYWORDS if kw in _override_evidence.lower()]
+            logger.info(
+                f"[TAXONOMY] revenue_model override {dna['revenue_model']!r} → {_override!r} "
+                f"(matched: {_matched_kw}) for {url}"
+            )
+            dna["revenue_model"] = _override
 
     # Phase 3: Opportunity + Threat + Audience + Positioning in parallel
     dna_text_p = json.dumps(dna, indent=2)
@@ -4843,11 +4984,13 @@ async def media_buying_plan(request: MediaBuyingRequest, http_request: Request):
     if request.marketing_summary:
         context_block += f"MARKETING STRATEGY SUMMARY:\n{request.marketing_summary[:2000]}\n\n"
 
+    _mb_revenue_model = (request.bi_data or {}).get("business_dna", {}).get("revenue_model", "")
     try:
         result = await generate_media_plan(
             business_label=f"{request.url or 'Unknown'} | {request.industry or 'Not specified'} | {request.city or 'India'}",
             budget=request.budget, goal=request.goal, language=request.language,
             context_block=context_block, industry_hint=request.industry,
+            revenue_model=_mb_revenue_model,
         )
         return {"success": True, "media_plan": result["sections"], "cached": False}
     except Exception as ex:
