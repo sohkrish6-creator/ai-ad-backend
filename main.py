@@ -9282,6 +9282,90 @@ async def _retry_openai_call(fn, retries: int = 2, base_delay: float = 2.0, labe
     raise last_err
 
 
+# Post-audit fix: prospect_memory (above) is UNIQUE(business_key) and gets
+# upserted on every scan — an earlier scan for the same industry+city is
+# gone the moment a new one runs, and it's write-only besides (nothing in
+# this codebase ever SELECTs from it). New append-only table, one row per
+# scan, so history is actually browsable — same shape as the established
+# smart_analysis_history idiom (business_key + a real user_id column for
+# ownership filtering, not embedded-in-key scoping, since a history LIST
+# endpoint needs "all of this user's scans" independent of any single
+# derived key).
+_PROSPECT_SCAN_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS prospect_scan_history (
+    id                        BIGSERIAL PRIMARY KEY,
+    user_id                   TEXT,
+    business_key              TEXT,
+    industry                  TEXT,
+    city                      TEXT,
+    search_query_used         TEXT,
+    max_prospects             INTEGER,
+    result_count              INTEGER,
+    new_count                 INTEGER,
+    already_discovered_count  INTEGER,
+    place_ids                 TEXT,
+    result_data               TEXT,
+    created_at                TEXT
+);
+"""
+
+try:
+    with engine.connect() as _psh_conn:
+        _psh_ddl = _PROSPECT_SCAN_HISTORY_DDL
+        if _is_sqlite:
+            _psh_ddl = _psh_ddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        _psh_conn.execute(text(_psh_ddl))
+        _psh_conn.commit()
+    logger.info("[PROSPECT] scan history table created/verified")
+except Exception as _pshe:
+    logger.warning(f"[PROSPECT] Could not create scan history table: {_pshe}")
+
+
+def _prospect_get_previously_discovered_place_ids(business_key: str) -> set:
+    """Union of every place_id ever surfaced for this tenant+industry+city
+    across all past scans — the actual de-dup source for 'find new
+    businesses on re-scan'. Pure DB read, no network."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT place_ids FROM prospect_scan_history WHERE business_key = :bk"),
+                {"bk": business_key},
+            ).fetchall()
+    except Exception as _e:
+        logger.warning(f"[PROSPECT] Could not load scan history for dedup: {_e}")
+        return set()
+    seen = set()
+    for (raw,) in rows:
+        try:
+            seen.update(json.loads(raw) or [])
+        except Exception:
+            continue
+    return seen
+
+
+def _prospect_save_scan_history(
+    business_key: str, industry: str, city: str, search_query_used: str,
+    max_prospects: int, result_count: int, new_count: int, already_discovered_count: int,
+    place_ids: list, result_data: dict,
+) -> None:
+    try:
+        _uid = _request_user_id.get()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO prospect_scan_history "
+                "(user_id, business_key, industry, city, search_query_used, max_prospects, "
+                " result_count, new_count, already_discovered_count, place_ids, result_data, created_at) "
+                "VALUES (:uid, :bk, :ind, :cit, :sq, :mp, :rc, :nc, :adc, :pids, :rd, :ca)"
+            ), {
+                "uid": _uid, "bk": business_key, "ind": industry, "cit": city, "sq": search_query_used,
+                "mp": max_prospects, "rc": result_count, "nc": new_count, "adc": already_discovered_count,
+                "pids": json.dumps(place_ids), "rd": json.dumps(result_data),
+                "ca": datetime.utcnow().isoformat(),
+            })
+    except Exception as _e:
+        logger.warning(f"[PROSPECT] Could not save scan history: {_e}")
+
+
 @app.post("/prospect-discovery")
 async def prospect_discovery(request: ProspectDiscoveryRequest):
     try:
@@ -9290,7 +9374,16 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # Prospect discovery genuinely needs a location to search — blank means
         # search nationally (India) rather than silently assuming a specific city.
         search_scope   = city or "India"
-        max_prospects  = max(5, min(request.max_prospects, 50))
+        # Post-audit fix: raised from 50 so "Find more" (re-running with a
+        # higher max_prospects) has real room to page deeper — bounded in
+        # practice by Google's own per-sub-term ceiling (see fetch_google_places),
+        # not by this clamp.
+        max_prospects  = max(5, min(request.max_prospects, 150))
+
+        # Computed early (not just at save-time, as before) — de-dup needs
+        # it before any enrichment/scoring happens, not after.
+        prospect_key = derive_business_key("", industry, city)
+        previously_discovered_ids = _prospect_get_previously_discovered_place_ids(prospect_key)
 
         search_terms_list = _get_search_terms(industry)
         logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms_list!r} max_prospects={max_prospects}")
@@ -9331,10 +9424,32 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             f"{len(search_terms_list)} parallel sub-searches — debug={_places_debug}"
         )
 
+        # Post-audit fix: re-running the identical query used to return the
+        # identical businesses every time, silently — Google's ranking for a
+        # given query+location is stable, so page 1-3 comes back in the same
+        # order on every scan. Split out anything already surfaced in a
+        # PAST scan for this exact industry+city (any tenant scan, not just
+        # this request) so it never gets silently dropped OR silently
+        # re-shown as if new — it's counted and named separately instead.
+        new_raw_places, already_discovered_raw = [], []
+        for p in raw_places:
+            pid = p.get("place_id")
+            if pid and pid in previously_discovered_ids:
+                already_discovered_raw.append(p)
+            else:
+                new_raw_places.append(p)
+        logger.info(
+            f"[PROSPECT] {len(new_raw_places)} new / {len(already_discovered_raw)} already-discovered "
+            f"(against {len(previously_discovered_ids)} known place_id(s) for this industry+city)"
+        )
+
         # 2. Enrich up to max_prospects with place details, in parallel
         # batches (not all-at-once) to bound concurrency against Places API
-        # rate limits as this scales toward 50.
-        top_places = raw_places[:max_prospects]
+        # rate limits as this scales toward 50. Only the NEW places get the
+        # expensive treatment (Details + Tavily + GPT scoring) — an
+        # already-discovered business doesn't need re-scoring, just its
+        # name surfaced so it isn't silently missing.
+        top_places = new_raw_places[:max_prospects]
         places_with_id = [p for p in top_places if p.get("place_id")]
         detail_tasks = [fetch_place_details(p["place_id"]) for p in places_with_id]
         details_list = await _gather_in_chunks(detail_tasks, chunk_size=15)
@@ -9511,6 +9626,16 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             p["rank"] = i + 1
         prospects = prospects[:max_prospects]
 
+        # Lightweight only — these were already fully enriched/scored in a
+        # past scan (that's WHY they're in this bucket); re-fetching Place
+        # Details + Tavily + GPT scoring for them again would just burn
+        # budget to re-derive data already shown once. Name/address is
+        # enough to prove they weren't silently dropped.
+        already_discovered = [
+            {"name": p.get("name", ""), "address": p.get("address", ""), "place_id": p.get("place_id", "")}
+            for p in already_discovered_raw
+        ]
+
         result_obj = {
             "city":              search_scope,
             "industry":          industry,
@@ -9520,7 +9645,9 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 f"{prospects[0]['name']} — {prospects[0].get('why_contact', 'highest-scored prospect in this scan')}"
                 if prospects else ""
             ),
-            "prospects":         prospects,
+            "prospects":                prospects,
+            "already_discovered_count": len(already_discovered),
+            "already_discovered":       already_discovered,
         }
 
         # Cost/rate-limit visibility — real API call counts for this run,
@@ -9540,8 +9667,8 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         result_obj["cold_prospects"] = [p for p in prospects if p.get("classification", "").lower() == "cold"]
         result_obj["total_found"]    = len(prospects)
 
-        # 5. Save to prospect_memory keyed by industry::city
-        prospect_key = derive_business_key("", industry, city)
+        # 5. Save to prospect_memory keyed by industry::city (latest-only,
+        # pre-existing — kept as-is, unrelated to this fix)
         _now = datetime.utcnow().isoformat()
         def _save_prospect():
             with engine.begin() as conn:
@@ -9559,6 +9686,24 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     ), {"k": prospect_key, "d": json.dumps(result_obj), "ind": industry, "cit": city, "ca": _now, "ua": _now})
         await asyncio.to_thread(_save_prospect)
         logger.info(f"[PROSPECT] Saved to prospect_memory key={prospect_key!r}")
+
+        # Post-audit fix: append-only scan history, so this specific scan
+        # (not just "whatever the latest one was") stays browsable, and so
+        # the NEXT scan's dedup has this one's place_ids to check against.
+        # Every place_id we attempted this scan counts as "discovered" —
+        # new ones we just scored, plus ones already known from before —
+        # never re-attempted on a future scan even if GPT's own output
+        # happened to drop one from the final scored list.
+        _scan_place_ids = list({
+            *[p.get("place_id") for p in top_places if p.get("place_id")],
+            *[p.get("place_id") for p in already_discovered_raw if p.get("place_id")],
+        })
+        await asyncio.to_thread(
+            _prospect_save_scan_history,
+            prospect_key, industry, city, result_obj["search_query_used"], max_prospects,
+            len(prospects), len(prospects), len(already_discovered),
+            _scan_place_ids, result_obj,
+        )
 
         log_activity(
             "prospect_discovery", business_key=prospect_key,
@@ -9588,6 +9733,56 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         tb = _traceback.format_exc()
         logger.error(f"[PROSPECT] ERROR: {_e}\n{tb}")
         return {"success": False, "error": "Something went wrong while finding prospects — please try again."}
+
+
+@app.get("/prospect-discovery/history")
+async def prospect_discovery_history(request: Request, limit: int = 20):
+    """List past scans for the current tenant — lightweight rows only
+    (no result_data), matching /smart-analysis/history's shape/scoping."""
+    try:
+        _uid = getattr(request.state, "user_id", "")
+        params = {"lim": max(1, min(limit, 100))}
+        where = ""
+        if _uid:
+            where = "WHERE user_id = :uid "
+            params["uid"] = _uid
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, industry, city, search_query_used, max_prospects, result_count, "
+                "new_count, already_discovered_count, created_at "
+                f"FROM prospect_scan_history {where}ORDER BY id DESC LIMIT :lim"
+            ), params).mappings().all()
+        return {"success": True, "history": [dict(r) for r in rows]}
+    except Exception as _e:
+        logger.error(f"[PROSPECT] history list failed: {_e}")
+        return {"success": False, "error": "Could not load scan history.", "history": []}
+
+
+@app.get("/prospect-discovery/history/{scan_id}")
+async def prospect_discovery_history_detail(scan_id: int, request: Request):
+    # Ownership-scoped from the start — a prior audit on this codebase
+    # found a sibling history-detail endpoint (/smart-analysis/history/{id})
+    # that originally had no such check, letting any authenticated tenant
+    # read any other tenant's result by incrementing a plain auto-increment
+    # id. Same `if _uid: filter` convention as everywhere else in this file
+    # (only unscoped when SUPABASE_JWT_SECRET is unset in local dev).
+    try:
+        _uid = getattr(request.state, "user_id", "")
+        params = {"id": scan_id}
+        where = "WHERE id = :id"
+        if _uid:
+            where += " AND user_id = :uid"
+            params["uid"] = _uid
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                f"SELECT result_data FROM prospect_scan_history {where}"
+            ), params).first()
+        if not row:
+            return {"success": False, "error": "Not found"}
+        return {"success": True, "data": json.loads(row[0])}
+    except Exception as _e:
+        logger.error(f"[PROSPECT] history detail failed: {_e}")
+        return {"success": False, "error": "Could not load that scan."}
 
 
 # ── Google Ads Campaign Creation (Basic Access) ───────────────────────────────
