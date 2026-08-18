@@ -20605,13 +20605,16 @@ class MarketingIntelligenceRequest(BaseModel):
 
 _MI_HONESTY_RULES = """
 HONESTY RULES — MANDATORY, DO NOT VIOLATE:
-1. Revenue/financials: ONLY quote if explicitly found in the research below. If not found say "not publicly disclosed." NEVER estimate revenue.
+1. Revenue/financials: ONLY quote if explicitly found in the research below. If not found, say "not found in available data" — NEVER "not publicly disclosed", "undisclosed", or any other phrase that asserts WHY it's missing. You have no way to know whether a company discloses its financials; you only know whether THIS research happened to surface a figure. A missing search result is a research gap, not evidence of non-disclosure — many companies that DO publish financials (e.g. any publicly-listed/NYSE/NSE/BSE company) will still show this gap if the query didn't surface the number. NEVER estimate revenue.
 2. Founding date: Only if found in research. If estimating from context clues, label "circa YYYY (estimated)".
 3. Timeline: Include ONLY milestones supported by evidence in the research OR your verified model knowledge. Label each entry's data_source as "research" or "model knowledge" accordingly.
 4. Follower counts, engagement rates: handled in Social section separately — do NOT guess them here.
-5. Model knowledge fallback: If research snippets are sparse or empty but the company is a globally recognised brand (Fortune 500, major tech platform, well-known consumer brand), USE YOUR TRAINING KNOWLEDGE to populate the section — but label every such field or array item with data_source: "model knowledge". Model knowledge from training is acceptable and preferred over empty output for well-documented companies.
+5. Model knowledge fallback: If research snippets are sparse or empty but the company is a globally recognised brand (Fortune 500, major tech platform, well-known consumer brand), USE YOUR TRAINING KNOWLEDGE to populate the section — but label every such field or array item with data_source: "model knowledge". Model knowledge from training is acceptable and preferred over empty output for well-documented companies. EXCEPTION: any field whose name asserts direct observation (e.g. ends in "_observed", or is literally named "observed") must NEVER be filled from model knowledge — see rule 8.
 6. Sparse data for obscure businesses: For local, niche, or private companies with limited public presence, return null / [] for unknown fields and add a single "data_note" per section explaining the gap. NEVER paste a repeated placeholder string ("Limited public data available", "Not enough data", etc.) into multiple fields — that is a broken fallback, not honest reporting.
 7. Confidence discipline: sections built entirely from model knowledge should show confidence 55-65. Sections with verified live research data 70-85. Sections that are genuinely unknown 20-35.
+8. Observed vs. inferred: a field named "*_observed" (or any field whose plain-English name claims something was directly witnessed/evidenced) may ONLY be populated from content actually present in the research/website text below — a real ad-library reference, a tracking pixel mentioned in crawled HTML, an explicit "we advertise on X" statement, etc. General industry-typical assumptions ("companies like this usually run Meta/Google ads") are NOT observation, even if you are confident they're true — that confidence belongs in a different, honestly-labeled field, never in an "_observed" field. If no real evidence exists, the "_observed" field must be an empty array/string and its data_source must say "not verified — no direct evidence found", never "model knowledge".
+9. Never echo a schema example's placeholder text verbatim. Where a field's example shows two slash-separated options (e.g. "observed / not confirmed"), that slash separates your ONLY two allowed values — pick exactly one word, never return the literal string with the slash still in it.
+10. Locale: if the input is a specific country/region website (e.g. a .co.in, .co.uk, .com.au domain, or a stated regional site), ground audience/channels/advertising/competitors/SEO findings in evidence for THAT specific site/market — never silently substitute the global parent company's general profile. If the research results returned mostly global/generic information rather than anything specific to that region, say so explicitly (e.g. "research did not surface India-specific marketing data; findings below reflect the company's global presence") rather than presenting global findings as if they were regional.
 """.strip()
 
 
@@ -20680,6 +20683,67 @@ async def _mi_fetch_wikipedia(company_name: str) -> str:
         return ""
 
 
+# Post-audit fix: a .co.in URL (resmed.co.in) produced an entirely global/
+# US analysis with no India-specific findings — the domain was reduced to
+# just "Resmed" (urlparse().netloc.split(".")[0]) before any query was
+# built, discarding the ccTLD entirely. Longest-suffix-first so "co.in"
+# matches before the bare "in" would. Not exhaustive — common regional
+# sites only; an unrecognized TLD (or a generic .com/.io/.co) correctly
+# returns None rather than guessing.
+_MI_CCTLD_LOCALES = {
+    "co.in": "India", "in": "India",
+    "co.uk": "United Kingdom", "uk": "United Kingdom",
+    "com.au": "Australia", "au": "Australia",
+    "co.nz": "New Zealand", "nz": "New Zealand",
+    "co.za": "South Africa", "za": "South Africa",
+    "co.jp": "Japan", "jp": "Japan",
+    "com.br": "Brazil", "br": "Brazil",
+    "com.mx": "Mexico", "mx": "Mexico",
+    "co.id": "Indonesia", "id": "Indonesia",
+    "ca": "Canada", "de": "Germany", "fr": "France", "es": "Spain", "it": "Italy",
+    "nl": "Netherlands", "ch": "Switzerland", "ie": "Ireland", "sg": "Singapore",
+    "ae": "UAE", "my": "Malaysia", "ph": "Philippines", "hk": "Hong Kong",
+}
+
+
+def _mi_detect_locale(domain: str) -> str | None:
+    """Detect a country/region from a website's ccTLD so a regional site
+    isn't silently analyzed as if it were the generic global/.com entity.
+    Checks the longest suffix first (co.in before in)."""
+    parts = (domain or "").lower().strip(".").split(".")
+    for i in range(1, len(parts)):
+        suffix = ".".join(parts[i:])
+        if suffix in _MI_CCTLD_LOCALES:
+            return _MI_CCTLD_LOCALES[suffix]
+    return None
+
+
+_MI_URL_PATTERN = re.compile(
+    r'https?://[^\s]+|(?:www\.)[^\s]+'
+    r'|\b[a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9-]*)*\.[a-zA-Z]{2,}\b',
+    re.I,
+)
+
+
+def _mi_extract_url(company_input: str) -> str | None:
+    """Post-audit fix: this used to require an 'http(s)://' or 'www.'
+    prefix, so a bare domain like 'resmed.co.in' (a completely normal
+    thing to type into a "name, URL, or @handle" field, and literally the
+    input that triggered this audit) was never recognized as a URL at all
+    — detected_url stayed None, no Firecrawl crawl ever ran, and every
+    downstream locale/domain fix depending on it never activated. Now also
+    matches a bare domain-shaped token (letters/digits/hyphens,
+    dot-separated, ending in a plausible 2+ letter TLD) with no protocol
+    or www. prefix required. A plain company name with no dot (the
+    overwhelming majority of non-URL inputs) still correctly matches
+    nothing."""
+    m = _MI_URL_PATTERN.search(company_input or "")
+    if not m:
+        return None
+    url = m.group(0)
+    return url if url.startswith("http") else "https://" + url
+
+
 async def _mi_research_company(company_input: str) -> dict:
     """
     Two-phase deep research:
@@ -20690,32 +20754,42 @@ async def _mi_research_company(company_input: str) -> dict:
     Returns a flat research dict with all *_raw keys.
     """
     # ── Normalize: if URL input, derive a clean company name for search queries ─
-    url_match = re.search(r'https?://[^\s]+|(?:www\.)[^\s]+', company_input, re.I)
-    detected_url = url_match.group(0) if url_match else None
-    if detected_url and not detected_url.startswith("http"):
-        detected_url = "https://" + detected_url
+    detected_url = _mi_extract_url(company_input)
 
-    company_query = company_input  # default: use as-is for queries
+    company_query  = company_input  # default: use as-is for queries
+    detected_domain = ""
+    detected_locale: str | None = None
     if detected_url:
         try:
             from urllib.parse import urlparse
-            domain = urlparse(detected_url).netloc.replace("www.", "")
-            company_query = domain.split(".")[0].title()  # "linkedin.com" → "Linkedin"
+            detected_domain = urlparse(detected_url).netloc.replace("www.", "")
+            company_query = detected_domain.split(".")[0].title()  # "linkedin.com" → "Linkedin"
+            detected_locale = _mi_detect_locale(detected_domain)
         except Exception:
             pass
+
+    # Marketing-facing queries (how this specific site markets, who it
+    # competes with THERE, what it sells THERE) get the locale appended so
+    # search actually surfaces regional results instead of defaulting to
+    # the global/US entity — a regional ccTLD site is a real, distinct
+    # market presence, not just the parent company under a different URL.
+    # Corporate-identity queries (overview/revenue/timeline/stories) stay
+    # unlocalized: a public company's founding history and financials are
+    # facts about the single global entity, not a per-region figure.
+    _locale_suffix = f" {detected_locale}" if detected_locale else ""
 
     # ── Phase 1 ────────────────────────────────────────────────────────────
     queries_p1 = {
         "overview":    f"{company_query} company overview founded history CEO employees business model",
-        "marketing":   f"{company_query} marketing strategy brand campaigns advertising 2024 2025",
-        "social":      f"{company_query} Instagram Facebook LinkedIn YouTube followers social media",
-        "competitors": f"{company_query} top competitors market share competitive landscape",
-        "product":     f"{company_query} products services pricing offers website ecommerce",
+        "marketing":   f"{company_query}{_locale_suffix} marketing strategy brand campaigns advertising 2024 2025",
+        "social":      f"{company_query}{_locale_suffix} Instagram Facebook LinkedIn YouTube followers social media",
+        "competitors": f"{company_query}{_locale_suffix} top competitors market share competitive landscape",
+        "product":     f"{company_query}{_locale_suffix} products services pricing offers website ecommerce",
         "news":        f"{company_query} news funding revenue growth expansion 2025",
         "timeline":    f"{company_query} history milestones marketing campaigns brand evolution key events year",
-        "controversy": f"{company_query} marketing mistakes criticism controversy failed campaigns backlash",
-        "comp2":       f"{company_query} competitors comparison alternatives brands global market rivals",
-        "iconic_ads":  f"{company_query} most famous iconic advertising campaign history mascot tagline",
+        "controversy": f"{company_query}{_locale_suffix} marketing mistakes criticism controversy failed campaigns backlash",
+        "comp2":       f"{company_query}{_locale_suffix} competitors comparison alternatives brands market rivals",
+        "iconic_ads":  f"{company_query}{_locale_suffix} most famous iconic advertising campaign history mascot tagline",
         "revenue":     f"{company_query} revenue annual growth financial history year",
         "stories":     f"{company_query} untold story lesser known history interesting facts behind the scenes",
     }
@@ -20741,11 +20815,25 @@ async def _mi_research_company(company_input: str) -> dict:
         # supporting context alongside Tavily research, never the sole
         # source scored into a number, so no separate data_verified gate
         # is needed the way Website/Visibility Intelligence required).
+        _website_fetch_status = wc.get("fetch_status", "unverifiable") if isinstance(wc, dict) else "unverifiable"
         research["website_content"] = (
-            wc["content"][:3000] if isinstance(wc, dict) and wc.get("fetch_status") == "ok" else ""
+            wc["content"][:3000] if isinstance(wc, dict) and _website_fetch_status == "ok" else ""
         )
     else:
+        _website_fetch_status = "no_url_given"
         research["website_content"] = ""
+
+    # Surfaced downstream (prompts + final response) so the report is
+    # explicit about which real domain was analyzed and whether it was
+    # actually reachable — never silently substitutes a generic/global
+    # profile for a regional site that failed to scrape.
+    research["detected_domain"]       = detected_domain
+    research["detected_locale"]       = detected_locale
+    research["website_fetch_status"]  = _website_fetch_status
+    logger.info(
+        f"[MI] domain={detected_domain!r} locale={detected_locale!r} "
+        f"website_fetch_status={_website_fetch_status!r}"
+    )
 
     # Extract company_name AND founding_year together via one GPT-mini JSON call
     overview_snippet = research.get("overview_raw", "")[:800]
@@ -20813,6 +20901,33 @@ async def _mi_research_company(company_input: str) -> dict:
     return research
 
 
+def _mi_locale_context_block(research: dict) -> str:
+    """Shared by all 4 section generators so a regional-domain input (or a
+    website that failed to scrape) gets the same explicit heads-up in
+    every prompt, not just some of them."""
+    domain = research.get("detected_domain") or ""
+    if not domain:
+        return ""
+    locale = research.get("detected_locale")
+    if locale:
+        line = (
+            f"ANALYZING: {domain} — this is the {locale}-specific site, not just the global/generic entity. "
+            f"Ground audience/channels/advertising/competitor/SEO findings in evidence for THIS site/market "
+            f"specifically. If the research below skews toward global/US information rather than {locale}, "
+            f"say so explicitly (e.g. in the section's evidence or a data_note) rather than presenting global "
+            f"findings as if they were {locale}-specific.\n"
+        )
+    else:
+        line = f"ANALYZING: {domain}.\n"
+    if research.get("website_fetch_status") != "ok":
+        line += (
+            f"NOTE: the live website content for {domain} could not be scraped "
+            f"(status: {research.get('website_fetch_status')}) — nothing below is a direct website observation; "
+            "rely only on the search-research blocks.\n"
+        )
+    return line
+
+
 async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) -> dict:
     """
     GPT-4o call → {overview, business_dna, timeline, revenue_timeline, unique_stories}
@@ -20845,6 +20960,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
     )
     user_msg = (
         f"Company: {company_name}\n\n"
+        + _mi_locale_context_block(research) + "\n"
         + wiki_block
         + f"=== OVERVIEW ===\n{cap('overview_raw', 900)}\n\n"
         f"=== GENERAL TIMELINE / MILESTONES ===\n{cap('timeline_raw', 900)}\n\n"
@@ -20860,7 +20976,7 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         '    "company_name": "...", "industry": "...", "founded": "YYYY or \'not found\'",\n'
         '    "headquarters": "...", "business_model": "...", "core_value_proposition": "one sentence",\n'
         '    "estimated_size": "startup/SMB/mid-market/enterprise",\n'
-        '    "revenue": "most recent figure found in research, or \'not publicly disclosed\'",\n'
+        '    "revenue": "most recent figure found in research, or \'not found in available data\' — never a claim about WHY it\'s missing",\n'
         '    "key_products_services": ["..."], "confidence": 75,\n'
         '    "evidence": "brief source quote", "data_source": "Tavily research"\n'
         '  },\n'
@@ -20925,6 +21041,38 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         return {}
 
 
+_MI_UNVERIFIED_SOURCE_SIGNALS = (
+    "model knowledge", "not verified", "no direct evidence", "training data",
+    "general knowledge", "industry standard", "typical", "assumption", "inference",
+)
+
+
+def _mi_enforce_observed_fields(section: dict, observed_keys: tuple, fallback_note: str) -> dict:
+    """Post-audit fix: a live run for resmed.co.in returned
+    platforms_observed=["Meta","Google"] with evidence "General advertising
+    strategies for health-focused companies" and data_source "model
+    knowledge" — an industry-typical assumption dressed up as an
+    observation. The prompt itself now says never to do this, but per this
+    codebase's own established principle (P0.1's numeric-provenance
+    validator: "never trust the generator's own say-so"), any field whose
+    name asserts direct observation gets an independent Python-side check
+    too, not just a stronger prompt. If data_source doesn't read like real
+    evidence, every field named in `observed_keys` is forced empty
+    regardless of what the model put in them. Shared by every MI section
+    that has an "_observed"-style field (advertising.platforms_observed,
+    offers.promotions_observed, ...) — one guard, not one per call site."""
+    if not isinstance(section, dict):
+        return section
+    source = str(section.get("data_source", "") or "").lower()
+    looks_unverified = any(sig in source for sig in _MI_UNVERIFIED_SOURCE_SIGNALS) or not source.strip()
+    if looks_unverified:
+        for key in observed_keys:
+            if section.get(key):
+                section[key] = []
+        section["data_source"] = fallback_note
+    return section
+
+
 async def _mi_sections_audience_channels_ads(company_name: str, research: dict) -> dict:
     """
     GPT-4o call → {audience, channels, advertising}
@@ -20937,12 +21085,20 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
         "You are a senior marketing strategist producing structured JSON intelligence reports. "
         "Return ONLY a valid JSON object — no markdown, no explanation.\n\n"
         + _MI_HONESTY_RULES + "\n\n"
-        "For well-known companies (major platforms, global brands), supplement sparse research with your "
-        "training knowledge — label those fields with data_source: 'model knowledge'. "
-        "Never return null/empty for a globally recognised brand's audience profile."
+        "For well-known companies (major platforms, global brands), you may supplement sparse research with "
+        "your training knowledge for the 'audience' and 'channels' sections ONLY — label those fields with "
+        "data_source: 'model knowledge'. Never return null/empty for a globally recognised brand's audience "
+        "profile.\n"
+        "EXCEPTION — the 'advertising' section (platforms_observed, ad_formats, key_messages, cta_patterns) "
+        "does NOT get this fallback: these fields claim something was directly observed. If the research/"
+        "website content above contains no real evidence of specific ad platforms, formats, or CTAs actually "
+        "in use, return empty arrays for all four and set advertising.data_source to "
+        "'not verified — no direct evidence of active advertising found'. Do not fill them from general "
+        "knowledge of what companies in this industry 'typically' run."
     )
     user_msg = (
         f"Company: {company_name}\n\n"
+        + _mi_locale_context_block(research) + "\n"
         f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
         f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
         f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
@@ -20952,8 +21108,8 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
         '"pain_points_addressed": ["..."], "buying_triggers": ["..."], '
         '"geography_focus": "...", "data_label": "ESTIMATED from research", '
         '"confidence": 65, "evidence": "...", "data_source": "..."}, '
-        '"channels": {"primary_channels": [{"name": "Google Ads", "usage": "observed / not confirmed", "role": "..."}], '
-        '"content_strategy": "...", "email_marketing": "observed / not confirmed", '
+        '"channels": {"primary_channels": [{"name": "Google Ads", "usage": "the single word \'observed\' if this exact channel is directly evidenced in the research/website content, or \'inferred\' if it is a reasonable assumption — never both words, never a slash", "role": "..."}], '
+        '"content_strategy": "...", "email_marketing": "the single word \'observed\' or \'inferred\' — see usage rule above, never both", '
         '"offline_presence": "...", "confidence": 65, "evidence": "...", "data_source": "..."}, '
         '"advertising": {"platforms_observed": ["Meta", "Google"], "ad_formats": ["video", "carousel"], '
         '"key_messages": ["..."], "cta_patterns": ["..."], '
@@ -20971,10 +21127,17 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
         return msgs
 
     try:
-        return await _call_gpt_json_with_retry(
+        result = await _call_gpt_json_with_retry(
             _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.2, retries=1,
             label="MI audience/channels/ads",
         )
+        if isinstance(result, dict) and "advertising" in result:
+            result["advertising"] = _mi_enforce_observed_fields(
+                result["advertising"],
+                ("platforms_observed", "ad_formats", "key_messages", "cta_patterns"),
+                "not verified — no direct evidence of active advertising found",
+            )
+        return result
     except Exception as _e:
         if "insufficient_quota" in str(_e):
             raise
@@ -21003,6 +21166,7 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
     )
     user_msg = (
         f"Company: {company_name}\n\n"
+        + _mi_locale_context_block(research) + "\n"
         f"=== WEBSITE CONTENT ===\n{cap('website_content')}\n\n"
         f"=== PRODUCTS / SERVICES ===\n{cap('product_raw')}\n\n"
         f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
@@ -21022,7 +21186,7 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         '"confidence": 65, "evidence": "...", "data_source": "..."}, '
         '"funnels": {"awareness_stage": "...", "consideration_stage": "...", '
         '"conversion_stage": "...", "retention_signals": "...", '
-        '"referral_program": "observed / not confirmed", '
+        '"referral_program": "the single word \'observed\' if directly evidenced, or \'inferred\' if a reasonable assumption — never both words, never a slash", '
         '"confidence": 60, "evidence": "...", "data_source": "..."}}'
     )
     def _build_messages(correction):
@@ -21032,10 +21196,16 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         return msgs
 
     try:
-        return await _call_gpt_json_with_retry(
+        result = await _call_gpt_json_with_retry(
             _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.2, retries=1,
             label="MI seo/creatives/offers/funnels",
         )
+        if isinstance(result, dict) and "offers" in result:
+            result["offers"] = _mi_enforce_observed_fields(
+                result["offers"], ("promotions_observed",),
+                "not verified — no direct evidence of active promotions found",
+            )
+        return result
     except Exception as _e:
         if "insufficient_quota" in str(_e):
             raise
@@ -21073,6 +21243,7 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
     )
     user_msg = (
         f"Company: {company_name}\n\n"
+        + _mi_locale_context_block(research) + "\n"
         f"=== COMPETITOR RESEARCH (PRIMARY) ===\n{cap('competitor_raw')}\n\n"
         f"=== COMPETITOR RESEARCH (SUPPLEMENTARY) ===\n{cap('comp2_raw')}\n\n"
         f"=== MARKETING RESEARCH ===\n{cap('marketing_raw')}\n\n"
@@ -21300,9 +21471,15 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     # ── Step 4b: Reconcile overview.revenue vs revenue_timeline ─────────────
     # The two fields come from separate GPT calls and can disagree.
     # If revenue_timeline has real documented entries but overview.revenue still
-    # says "not publicly disclosed" (or similar), patch overview.revenue with
-    # the most recent figure so the two fields agree.
-    _UNDISCLOSED_SIGNALS = ("not publicly disclosed", "undisclosed", "not disclosed", "unknown", "n/a")
+    # reports a gap (post-audit fix: correct phrasing is "not found in
+    # available data" — never "not publicly disclosed", a false claim about
+    # a company's actual disclosure policy that a live run made for ResMed,
+    # an NYSE-listed company that files revenue quarterly), patch
+    # overview.revenue with the most recent figure so the two fields agree.
+    _UNDISCLOSED_SIGNALS = (
+        "not found in available data", "not publicly disclosed", "undisclosed",
+        "not disclosed", "unknown", "n/a",
+    )
     ov_section = sections.get("overview") or {}
     rt_list    = sections.get("revenue_timeline") or []
     if isinstance(ov_section, dict) and isinstance(rt_list, list) and rt_list:
@@ -21352,11 +21529,18 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     except Exception as _e:
         logger.warning(f"[MI] log_activity failed (non-fatal): {_e}")
 
+    # Post-audit fix: a .co.in URL used to produce an entirely global/US
+    # analysis with no way for the reader to tell that had happened.
+    # Additive fields — the report now states plainly which real domain/
+    # region it analyzed and whether that site was actually reachable.
     return {
-        "success":       True,
-        "company_name":  company_name,
-        "company_input": company_input,
-        "sections":      sections,
+        "success":              True,
+        "company_name":         company_name,
+        "company_input":        company_input,
+        "sections":             sections,
+        "analyzed_domain":      research.get("detected_domain") or None,
+        "analyzed_locale":      research.get("detected_locale"),
+        "website_fetch_status": research.get("website_fetch_status"),
     }
 
 
