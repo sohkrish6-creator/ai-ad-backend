@@ -9383,12 +9383,27 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     "ads":    ads_data[i]    if isinstance(ads_data[i],    str) else "",
                 }
 
-        # 4. Score in parallel batches of up to 15 businesses per GPT-4o call
+        # 4. Score in parallel batches of up to 8 businesses per GPT-4o call
         # instead of one single call for all of them — scoring 50 in one
         # call risks exceeding a sane output-token budget and forfeits the
         # speed benefit of running batches concurrently.
+        #
+        # Post-audit fix: this was 15/3500 (matching Voice Outreach/Revenue
+        # Engine's precedent) but this schema is heavier — 17 fields per
+        # business including 2 full-sentence free-text fields (why_contact,
+        # suggested_opening_line), vs. their ~7-field schema. Measured live
+        # against the real API with realistic business data (long names/
+        # addresses, full sentences): ~233 completion tokens/business,
+        # consistently — 15 × 233 ≈ 3495 tokens before any JSON structural
+        # overhead, right at the 3500 max_tokens ceiling. Every real run hit
+        # finish_reason="length" and truncated mid-string; the parse-failure
+        # retry added alongside this (_call_gpt_json_with_retry) couldn't
+        # fix it because a retry reissues the exact same oversized request —
+        # retrying doesn't shrink the output. batch=8 × 233 ≈ 1864 tokens
+        # against max_tokens=4000 is real, measured headroom (~53%
+        # utilization at worst case), not a guess.
         RS = "RS"
-        SCORE_BATCH_SIZE = 15
+        SCORE_BATCH_SIZE = 8
         batches = [enriched[i:i + SCORE_BATCH_SIZE] for i in range(0, len(enriched), SCORE_BATCH_SIZE)]
 
         async def _score_batch(batch: list) -> list:
@@ -9480,7 +9495,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             # uses: one parse-failure retry with a correction message, before
             # giving up.
             result = await _call_gpt_json_with_retry(
-                _build_messages, model="gpt-4o", max_tokens=3500, temperature=0.3, retries=1,
+                _build_messages, model="gpt-4o", max_tokens=4000, temperature=0.3, retries=1,
                 label="prospect_discovery batch scoring",
             )
             return result.get("prospects", [])
@@ -14382,7 +14397,7 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     core_res, creative_res, inventory_res, media_res = await asyncio.gather(
         _run(prompt_core, 5000, "core"),
         _run(prompt_creative, 3600, "creative"),
-        _run(prompt_inventory, 3400, "inventory"),
+        _run(prompt_inventory, 4200, "inventory"),
         _run(prompt_media, 2400, "media"),
         return_exceptions=True,
     )
