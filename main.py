@@ -9385,6 +9385,16 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         prospect_key = derive_business_key("", industry, city)
         previously_discovered_ids = _prospect_get_previously_discovered_place_ids(prospect_key)
 
+        # Post-audit fix: services this tenant actually sells — the
+        # missing ingredient GPT's own "recommended_service" guess never
+        # had, which is how "Website Development" got suggested for
+        # nearly every no-website prospect regardless of whether the
+        # tenant even offers it. Same settings table/shape Revenue Engine
+        # already reads from.
+        _uid = _request_user_id.get()
+        _tenant_settings = _get_or_create_voice_settings(_uid) if _uid else {}
+        services_offered = _tenant_settings.get("services_offered") or []
+
         search_terms_list = _get_search_terms(industry)
         logger.info(f"[PROSPECT] industry={industry!r} city={city!r} terms={search_terms_list!r} max_prospects={max_prospects}")
 
@@ -9478,6 +9488,33 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 "recent_reviews":     [r.get("text", "")[:120] for r in (det.get("reviews") or [])[:2]],
             })
 
+        # 2b. Post-audit fix: real weakness detection — the SAME detector
+        # Revenue Engine/Voice Outreach use (_detect_voice_weaknesses),
+        # not GPT's own free-text guess. A homepage fetch per business
+        # with a website (bounded, timeout-protected, never raises) is
+        # required for the full weakness taxonomy (missing_tracking/
+        # weak_seo_title/weak_seo_meta/no_cta all need real page content,
+        # not just Places data). `enriched`'s own keys are rating/
+        # user_ratings_total (Places' naming); remapped below to the
+        # google_rating/total_reviews keys the detector expects.
+        fetch_tasks = [
+            _fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result={"html": "", "fetch_status": "ok", "detail": ""})
+            for p in enriched
+        ]
+        fetch_results = await _gather_in_chunks(fetch_tasks, chunk_size=15)
+        for p, fetch_result in zip(enriched, fetch_results):
+            if not isinstance(fetch_result, dict):
+                fetch_result = {"html": "", "fetch_status": "unverifiable", "detail": str(fetch_result)}
+            weaknesses, evidence = _detect_voice_weaknesses(
+                {"website": p["website"], "google_rating": p["rating"], "total_reviews": p["user_ratings_total"],
+                 "business_status": p["business_status"]},
+                fetch_result,
+            )
+            detected_gap, sohscape_angle = _prospect_gap_and_angle(weaknesses, evidence, services_offered)
+            p["weaknesses"] = weaknesses
+            p["detected_gap"] = detected_gap
+            p["sohscape_angle"] = sohscape_angle
+
         # 3. Tavily social / ad presence checks — now for EVERY enriched
         # business (previously hardcoded to just the top 6), in parallel
         # batches so 50 businesses × 2 checks each doesn't fire 100
@@ -9536,6 +9573,9 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     "Recent Reviews: " + (" | ".join(p["recent_reviews"]) or "none") + "\n"
                     "Social Media Intel: " + (tv.get("social") or "no data")[:300] + "\n"
                     "Ads/Marketing Intel: " + (tv.get("ads") or "no data")[:300] + "\n"
+                    "Detected Gap (real, already verified — reference this specifically, do not invent a different one): " + p["detected_gap"] + "\n"
+                    "Recommended Angle (the ONE service this agency actually offers that fits — reference this specifically, "
+                    "do not suggest a different service): " + p["sohscape_angle"] + "\n"
                 )
             prompt_base = (
                 "You are a B2B prospect scoring expert for a digital marketing agency in " + search_scope + ".\n"
@@ -9563,7 +9603,9 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 "size (review_count/rating), never reuse the same rupee figure across businesses of different "
                 "scale just because they share a weakness category.\n\n"
                 "For each business provide a SPECIFIC, PERSONALIZED analysis based on the actual data.\n"
-                "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness).\n"
+                "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness) "
+                "AND must be consistent with the business's own Recommended Angle given above — never propose a "
+                "different service in the opening line than the one already given.\n"
                 "Use " + RS + " for Indian Rupee symbol in expected_ltv.\n\n"
                 "Businesses to score:\n" + biz_lines + "\n"
                 "Return JSON:\n"
@@ -9584,12 +9626,11 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 '      "closing_probability": "75%",\n'
                 '      "expected_ltv": "' + RS + '25,000/month",\n'
                 '      "why_contact": "specific reason based on real data",\n'
-                '      "weakness_found": "specific weakness (no website / 3 reviews only / no Instagram / last post 4 months ago)",\n'
-                '      "recommended_service": "Meta Ads Management",\n'
-                '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + search_scope + ' get more customers through [service]. Would love to show you what we did for similar businesses here."\n'
+                '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + search_scope + ' get more customers through [the Recommended Angle given above]. Would love to show you what we did for similar businesses here."\n'
                 "    }\n"
                 "  ]\n"
                 "}\n"
+                "Do NOT include weakness_found or recommended_service fields — those are supplied separately, not generated by you.\n"
                 "Return ONLY valid JSON. Score all " + str(len(batch)) + " businesses. Rank by opportunity_score descending within this batch."
             )
 
@@ -9618,6 +9659,19 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         logger.info(f"[PROSPECT] Scoring {len(enriched)} businesses across {len(batches)} parallel GPT-4o batch(es)")
         batch_results = await asyncio.gather(*[_score_batch(b) for b in batches])
         prospects = _fix_rs([p for batch in batch_results for p in batch])
+
+        # Post-audit fix: weakness_found/recommended_service are no longer
+        # GPT output fields (removed from the schema above) — attach the
+        # real, tenant-service-matched values computed in step 2b, matched
+        # back by exact business name (GPT is explicitly told to echo the
+        # exact name it was given). A name that somehow doesn't match
+        # falls back to an honest "not detected" pair rather than leaving
+        # the field silently absent.
+        _gap_angle_by_name = {p["name"].strip().lower(): (p["detected_gap"], p["sohscape_angle"]) for p in enriched}
+        for p in prospects:
+            gap, angle = _gap_angle_by_name.get((p.get("name") or "").strip().lower(), ("Not detected", "No service fit"))
+            p["weakness_found"] = gap
+            p["recommended_service"] = angle
 
         # Re-rank across the merged set — each batch only ranked within
         # itself, so the final order/rank must be resolved globally.
@@ -24650,6 +24704,18 @@ _VOICE_WEAKNESS_SERVICE_MAP = {
     "inactive_listing": "social_media_management",
 }
 
+# Human-readable labels for the same weakness codes — mirrors
+# RevenueEnginePipeline.jsx's WEAKNESS_LABELS constant exactly, so a
+# prospect's "detected gap" reads identically whether it's shown in
+# Revenue Engine, Prospect Discovery, or a Prospect Discovery export.
+# Keep both in sync if either changes.
+_VOICE_WEAKNESS_LABELS = {
+    "no_website": "No Website", "poor_reviews": "Poor Reviews", "low_review_count": "Few Reviews",
+    "inactive_listing": "Inactive Listing", "missing_tracking": "No Ad Tracking",
+    "weak_seo_meta": "Weak SEO Meta", "weak_seo_title": "Weak SEO Title", "no_cta": "No Clear CTA",
+    "site_unreachable": "Site Unreachable",
+}
+
 
 def _real_weakness_evidence(weaknesses: list, evidence: list) -> list:
     """Evidence entries whose type is an actual REAL weakness — excludes
@@ -24684,6 +24750,38 @@ def _voice_match_service(weaknesses: list, evidence: list, services_offered: lis
         if service and service in offered:
             return w, service
     return None, None
+
+
+_VOICE_SERVICE_LABEL_BY_KEY = dict(_VOICE_SERVICE_CATALOG)
+
+
+def _prospect_gap_and_angle(weaknesses: list, evidence: list, services_offered: list) -> tuple:
+    """Post-audit fix: Prospect Discovery used to let GPT invent both the
+    'detected gap' and the recommended service from scratch, unconstrained
+    by anything the tenant actually sells — which is how "Website
+    Development" got recommended for nearly every no-website prospect even
+    when a tenant's services_offered excluded it entirely. This is the one
+    shared function both the on-screen card and the DOCX/Excel export call,
+    so neither can drift from what _voice_match_service (Revenue Engine's
+    own enforcement) would have said.
+
+    Returns (detected_gap_label, sohscape_angle_label) — detected_gap is
+    always the single REAL strongest weakness found (transparency, even if
+    unsellable); sohscape_angle is the highest-confidence weakness that
+    ALSO has a matching offered service, or the literal 'No service fit'
+    string when nothing in services_offered addresses anything detected."""
+    if not weaknesses:
+        return "None detected", "No service fit"
+    conf_by_type = {}
+    for e in (evidence or []):
+        t = e.get("type")
+        conf_by_type[t] = max(conf_by_type.get(t, 0.0), e.get("confidence", 0.0))
+    strongest = max(weaknesses, key=lambda w: conf_by_type.get(w, 0.0))
+    detected_gap = _VOICE_WEAKNESS_LABELS.get(strongest, strongest)
+
+    _, matched_service_key = _voice_match_service(weaknesses, evidence, services_offered)
+    sohscape_angle = _VOICE_SERVICE_LABEL_BY_KEY.get(matched_service_key, "No service fit") if matched_service_key else "No service fit"
+    return detected_gap, sohscape_angle
 
 
 def _voice_effective_call_mode(settings: dict) -> str:
