@@ -5816,20 +5816,20 @@ Respond ONLY with a valid JSON object — no markdown, no explanation, just the 
   "confidence": 0
 }}"""
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=1200,
-            temperature=0.4,
+        opportunity = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=1200, temperature=0.4, retries=1,
+            label="opportunity engine",
         )
-        raw = resp.choices[0].message.content.strip()
-        opportunity = json.loads(raw)
     except Exception as _e:
         logger.error(f"[OPPORTUNITY ENGINE] GPT call failed: {_e}")
-        return {"success": False, "memory_used": True, "error": str(_e)}
+        return {"success": False, "memory_used": True, "error": "Could not generate the opportunity report right now — please try again."}
 
     # ── Save to opportunity_memory ────────────────────────────────────────────
     save_to_memory("opportunity", norm_key, {"opportunity_data": opportunity})
@@ -5977,20 +5977,20 @@ Respond ONLY with valid JSON — no markdown, no explanation:
   "confidence": 0
 }}"""
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=1200,
-            temperature=0.4,
+        offer = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=1200, temperature=0.4, retries=1,
+            label="offer intelligence",
         )
-        raw  = resp.choices[0].message.content.strip()
-        offer = json.loads(raw)
     except Exception as _e:
         logger.error(f"[OFFER INTELLIGENCE] GPT call failed: {_e}")
-        return {"success": False, "memory_used": True, "error": str(_e)}
+        return {"success": False, "memory_used": True, "error": "Could not generate the offer report right now — please try again."}
 
     save_to_memory("offer", norm_key, {"offer_data": offer})
 
@@ -6171,20 +6171,20 @@ RULES:
 - BANNED words in all text: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer, Dive in.
 - Return ONLY the JSON object. No explanation outside it."""
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2200,
-            temperature=0.3,
+        audit = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2200, temperature=0.3, retries=1,
+            label="website intelligence",
         )
-        raw   = resp.choices[0].message.content.strip()
-        audit = json.loads(raw)
     except Exception as _e:
         logger.error(f"[WEBSITE-INTEL] GPT call failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate the website audit right now — please try again."}
 
     save_to_memory("website", norm_key, {
         "url":           url,
@@ -6379,20 +6379,20 @@ RULES:
 - BANNED words: Elevate, Transform, Unlock, Revolutionize, Empower, Seamless, Game-changer.
 - Return ONLY the JSON object. No explanation outside it."""
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2800,
-            temperature=0.3,
+        visibility = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2800, temperature=0.3, retries=1,
+            label="visibility intelligence",
         )
-        raw        = resp.choices[0].message.content.strip()
-        visibility = json.loads(raw)
     except Exception as _e:
         logger.error(f"[VISIBILITY-INTEL] GPT call failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate the visibility report right now — please try again."}
 
     save_to_memory("visibility", norm_key, {
         "url":             url,
@@ -6630,20 +6630,20 @@ RULES:
   confidence to a guess.
 - Return ONLY the JSON object. Nothing outside it."""
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2800,
-            temperature=0.5,
+        outreach = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2800, temperature=0.5, retries=1,
+            label="outreach AI",
         )
-        raw      = resp.choices[0].message.content.strip()
-        outreach = json.loads(raw)
     except Exception as _e:
         logger.error(f"[OUTREACH-AI] GPT call failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate outreach scripts right now — please try again."}
 
     save_to_memory("outreach", norm_key, {"outreach_data": outreach})
     logger.info(f"[OUTREACH-AI] Done: key={norm_key!r} confidence={outreach.get('confidence')}")
@@ -6834,20 +6834,20 @@ RULES:
   "confidence_reason" when used.
 - Return ONLY the JSON. Nothing outside it."""
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2000,
-            temperature=0.3,
+        kpi = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.3, retries=1,
+            label="KPI engine",
         )
-        raw = resp.choices[0].message.content.strip()
-        kpi = json.loads(raw)
     except Exception as _e:
         logger.error(f"[KPI-ENGINE] GPT call failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate KPI predictions right now — please try again."}
 
     save_to_memory("kpi", norm_key, {
         "kpi_data": kpi,
@@ -6998,20 +6998,20 @@ async def autonomous_marketing(request: AutonomousMarketingRequest):
         "- Return ONLY the JSON. Nothing else."
     )
 
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=1600,
-            temperature=0.4,
+        plan = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=1600, temperature=0.4, retries=1,
+            label="autonomous marketing plan",
         )
-        raw = resp.choices[0].message.content.strip()
-        plan = json.loads(raw)
     except Exception as _e:
         logger.error(f"[AUTONOMOUS] GPT call failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate the marketing plan right now — please try again."}
 
     plan = _fix_rs(plan)
     plan = _clean_banned_words_deep(plan)
@@ -7585,17 +7585,16 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
 
         logger.info(f"[PERF-INTEL] Sending prompt to GPT-4o (len={len(prompt)})")
 
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2200,
-            temperature=0.3,
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        performance = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2200, temperature=0.3, retries=1,
+            label="performance intelligence",
         )
-        raw_resp = resp.choices[0].message.content.strip()
-        logger.info(f"[PERF-INTEL] GPT responded (len={len(raw_resp)})")
-        performance = json.loads(raw_resp)
 
         performance = _fix_rs(performance)
 
@@ -7672,9 +7671,8 @@ async def performance_intelligence(request: PerformanceIntelligenceRequest):
         tb = _traceback.format_exc()
         logger.error(f"[PERF-INTEL] UNHANDLED ERROR: {_outer_e}\n{tb}")
         return {
-            "success":   False,
-            "error":     str(_outer_e),
-            "traceback": tb,
+            "success": False,
+            "error":   "Could not generate the performance report right now — please try again.",
         }
 
 
@@ -7984,17 +7982,17 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
         )
 
         logger.info(f"[AI-OPT] Sending to GPT-4o (prompt_len={len(prompt)})")
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2800,
-            temperature=0.4,
+
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        optimizer = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2800, temperature=0.4, retries=1,
+            label="AI optimizer",
         )
-        raw = resp.choices[0].message.content.strip()
-        logger.info(f"[AI-OPT] GPT responded (len={len(raw)})")
-        optimizer = json.loads(raw)
 
         # Replace RS → ₹ in all string values
         optimizer = _fix_rs(optimizer)
@@ -8044,7 +8042,7 @@ async def _run_ai_optimizer_core(url: str = "", industry: str = "", city: str = 
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[AI-OPT] ERROR: {_e}\n{tb}")
-        return {"success": False, "error": str(_e), "traceback": tb}
+        return {"success": False, "error": "Could not generate optimizer recommendations right now — please try again."}
 
 @app.post("/ai-optimizer")
 async def ai_optimizer(request: AIOptimizerRequest):
@@ -8406,17 +8404,17 @@ async def result_center(request: ResultCenterRequest):
         )
 
         logger.info(f"[RESULT] GPT-4o call (prompt_len={len(prompt)})")
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_tokens=2800,
-            temperature=0.3,
+
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        result_obj = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2800, temperature=0.3, retries=1,
+            label="result center",
         )
-        raw = resp.choices[0].message.content.strip()
-        logger.info(f"[RESULT] GPT responded (len={len(raw)})")
-        result_obj = json.loads(raw)
 
         # RS → ₹ in all string values
         result_obj = _fix_rs(result_obj)
@@ -8451,7 +8449,7 @@ async def result_center(request: ResultCenterRequest):
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[RESULT] ERROR: {_e}\n{tb}")
-        return {"success": False, "error": str(_e), "traceback": tb}
+        return {"success": False, "error": "Could not generate the result summary right now — please try again."}
 
 
 # ── Module 23: Creative Studio ────────────────────────────────────────────────
@@ -9021,14 +9019,17 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
         )
 
         logger.info(f"[CREATIVE-STUDIO] Sending to GPT-4o (prompt_len={len(prompt)})")
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}, max_tokens=4500, temperature=0.5,
+
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        output = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=4500, temperature=0.5, retries=1,
+            label="creative studio",
         )
-        raw = resp.choices[0].message.content.strip()
-        logger.info(f"[CREATIVE-STUDIO] GPT responded (len={len(raw)})")
-        output = json.loads(raw)
 
         output = _clean_banned_words_deep(output)
         output = _backfill_creative_studio(output, _CREATIVE_STUDIO_VARIANTS)
@@ -9136,7 +9137,7 @@ async def _run_creative_studio(request: CreativeStudioRequest) -> dict:
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[CREATIVE-STUDIO] ERROR: {_e}\n{tb}")
-        return {"success": False, "error": str(_e), "traceback": tb}
+        return {"success": False, "error": "Could not generate creative concepts right now — please try again."}
 
 
 @app.post("/creative-studio")
@@ -9406,7 +9407,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     "Social Media Intel: " + (tv.get("social") or "no data")[:300] + "\n"
                     "Ads/Marketing Intel: " + (tv.get("ads") or "no data")[:300] + "\n"
                 )
-            prompt = (
+            prompt_base = (
                 "You are a B2B prospect scoring expert for a digital marketing agency in " + search_scope + ".\n"
                 "Industry focus: " + industry + "\n\n"
                 "Analyse these REAL local businesses found on Google Maps and score them as prospects.\n\n"
@@ -9461,17 +9462,28 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 "}\n"
                 "Return ONLY valid JSON. Score all " + str(len(batch)) + " businesses. Rank by opportunity_score descending within this batch."
             )
-            raw_resp = await _retry_openai_call(
-                lambda: client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=3500,
-                    temperature=0.3,
-                    response_format={"type": "json_object"},
-                ).choices[0].message.content,
-                label="prospect_discovery GPT-4o call",
+
+            def _build_messages(correction):
+                prompt = prompt_base + (f"\n{correction}\n" if correction else "")
+                return [{"role": "user", "content": prompt}]
+
+            # Post-audit fix: this predates _call_gpt_json_with_retry and used
+            # to do a bare json.loads() with zero retry-on-parse-failure — a
+            # truncated GPT response (this schema carries 2 free-text sentence
+            # fields per business, heavier than the other batch-scoring call
+            # sites sharing this same 15-per-batch/3500-token shape) raised an
+            # uncaught JSONDecodeError straight out of _score_batch, and the
+            # endpoint's own except block below returned str(e) — the raw
+            # "Unterminated string starting at: line N column M" parser
+            # message — directly to the frontend. Now routed through the same
+            # helper Voice Outreach/Revenue Engine's batch scoring already
+            # uses: one parse-failure retry with a correction message, before
+            # giving up.
+            result = await _call_gpt_json_with_retry(
+                _build_messages, model="gpt-4o", max_tokens=3500, temperature=0.3, retries=1,
+                label="prospect_discovery batch scoring",
             )
-            return json.loads(raw_resp).get("prospects", [])
+            return result.get("prospects", [])
 
         logger.info(f"[PROSPECT] Scoring {len(enriched)} businesses across {len(batches)} parallel GPT-4o batch(es)")
         batch_results = await asyncio.gather(*[_score_batch(b) for b in batches])
@@ -9547,10 +9559,20 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             "data":               result_obj,
         }
 
+    # A GPT response that's still unparseable after _call_gpt_json_with_retry's
+    # own correction-retry is a raw model/infra failure, not something the
+    # user did wrong — the parser's own message ("Unterminated string
+    # starting at: line N column M") must never reach them. e.doc is the
+    # actual text json.loads() was given, so its length is always logged
+    # server-side even though it's never shown to the user.
+    except json.JSONDecodeError as _e:
+        tb = _traceback.format_exc()
+        logger.error(f"[PROSPECT] GPT returned unparseable JSON after retry — {_e} — response_length={len(_e.doc)} chars\n{tb}")
+        return {"success": False, "error": "Could not score prospects right now — please try again in a moment."}
     except Exception as _e:
         tb = _traceback.format_exc()
         logger.error(f"[PROSPECT] ERROR: {_e}\n{tb}")
-        return {"success": False, "error": str(_e), "traceback": tb}
+        return {"success": False, "error": "Something went wrong while finding prospects — please try again."}
 
 
 # ── Google Ads Campaign Creation (Basic Access) ───────────────────────────────
@@ -12806,22 +12828,23 @@ async def _classify_command(text_cmd: str, url: str, industry: str, city: str, b
         "command comes from a single free-text box with no separate url field. Only fill \"extracted\" fields you "
         "can confidently pull from the command text itself — leave blank/0 if not mentioned."
     )
-    resp = await asyncio.to_thread(
-        client.chat.completions.create,
-        # Classification is a cheap, well-bounded categorization task (fixed
-        # list of ~19 intents) — gpt-4o-mini handles it reliably at a
-        # fraction of the cost/latency of gpt-4o. The actual content
-        # generation/analysis steps once intent is known still use gpt-4o
-        # elsewhere in this file — this switch is scoped to classification
-        # only, per the "cheap model first, frontier model on escalation"
-        # pattern.
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        max_tokens=400,
-        temperature=0,
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
+    # Classification is a cheap, well-bounded categorization task (fixed
+    # list of ~19 intents) — gpt-4o-mini handles it reliably at a
+    # fraction of the cost/latency of gpt-4o. The actual content
+    # generation/analysis steps once intent is known still use gpt-4o
+    # elsewhere in this file — this switch is scoped to classification
+    # only, per the "cheap model first, frontier model on escalation"
+    # pattern.
+    parsed = await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o-mini", max_tokens=400, temperature=0, retries=1,
+        label="command classification",
     )
-    parsed = json.loads(resp.choices[0].message.content.strip())
     if parsed.get("intent") not in _COMMAND_INTENTS:
         parsed["intent"] = "unknown"
     try:
@@ -13197,7 +13220,7 @@ async def command_center(request: CommandRequest):
             classification = await _classify_command(text_cmd, request.url, request.industry, request.city, request.budget)
         except Exception as _e:
             logger.error(f"[COMMAND] classification failed: {_e}")
-            return {"success": False, "error": f"Could not understand command: {_e}"}
+            return {"success": False, "error": "Could not understand that command — please try rephrasing it."}
 
     intent      = classification.get("intent", "unknown")
     confidence  = classification.get("confidence", 1.0)
@@ -13361,11 +13384,16 @@ async def command_center(request: CommandRequest):
                     '"how_to_adapt": "one paragraph — how THIS business could adapt these trends"}\n'
                     "Every theme/format/angle must be traceable to the search results above."
                 )
-                resp = await asyncio.to_thread(
-                    client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"}, max_tokens=900, temperature=0.3,
-                )
-                parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+                def _build_messages(correction, _prompt=prompt):
+                    msgs = [{"role": "user", "content": _prompt}]
+                    if correction:
+                        msgs.append({"role": "user", "content": correction})
+                    return msgs
+
+                parsed = _clean_banned_words_deep(await _call_gpt_json_with_retry(
+                    _build_messages, model="gpt-4o", max_tokens=900, temperature=0.3, retries=1,
+                    label="command trend_research",
+                ))
                 parsed["based_on"] = f"Based on real-time web search results for \"{research['query']}\" — not invented."
                 result = {"success": True, **parsed}
 
@@ -13416,11 +13444,16 @@ async def command_center(request: CommandRequest):
                 "context is available, do not invent a city). 2-3 caption variations, each 1-3 sentences ending "
                 "with a clear call to action."
             )
-            resp = await asyncio.to_thread(
-                client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}, max_tokens=700, temperature=0.5,
-            )
-            parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+            def _build_messages(correction):
+                msgs = [{"role": "user", "content": prompt}]
+                if correction:
+                    msgs.append({"role": "user", "content": correction})
+                return msgs
+
+            parsed = _clean_banned_words_deep(await _call_gpt_json_with_retry(
+                _build_messages, model="gpt-4o", max_tokens=700, temperature=0.5, retries=1,
+                label="command hashtag_generation",
+            ))
             parsed["grounded_in_business_data"] = _grounded
             parsed["research_used"] = _researched
             if _researched:
@@ -13453,11 +13486,16 @@ async def command_center(request: CommandRequest):
                 '"body": ["beat 1", "beat 2", "beat 3"], "cta": "final on-screen call to action line", '
                 '"format_suggestion": "e.g. 15-30s Reel, talking-head or product demo, with a one-line visual note"}'
             )
-            resp = await asyncio.to_thread(
-                client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}, max_tokens=600, temperature=0.5,
-            )
-            parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+            def _build_messages(correction):
+                msgs = [{"role": "user", "content": prompt}]
+                if correction:
+                    msgs.append({"role": "user", "content": correction})
+                return msgs
+
+            parsed = _clean_banned_words_deep(await _call_gpt_json_with_retry(
+                _build_messages, model="gpt-4o", max_tokens=600, temperature=0.5, retries=1,
+                label="command ad_script_writing",
+            ))
             parsed["grounded_in_business_data"] = _grounded
             parsed["research_used"] = _researched
             if _researched:
@@ -13480,11 +13518,16 @@ async def command_center(request: CommandRequest):
                     f"REAL SEARCH RESULTS:\n{research['raw'][:3500]}\n\n"
                     'Return ONLY JSON: {"answer": "direct answer, 3-5 sentences", "key_findings": ["...","...","..."]}'
                 )
-                resp = await asyncio.to_thread(
-                    client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"}, max_tokens=700, temperature=0.3,
-                )
-                parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+                def _build_messages(correction):
+                    msgs = [{"role": "user", "content": prompt}]
+                    if correction:
+                        msgs.append({"role": "user", "content": correction})
+                    return msgs
+
+                parsed = _clean_banned_words_deep(await _call_gpt_json_with_retry(
+                    _build_messages, model="gpt-4o", max_tokens=700, temperature=0.3, retries=1,
+                    label="command market_query",
+                ))
                 parsed["based_on"] = f"Based on real-time web search results for \"{research['query']}\"."
                 result = {"success": True, **parsed}
 
@@ -13514,7 +13557,7 @@ async def command_center(request: CommandRequest):
             _request_user_id.get(), text_cmd, intent, confidence, _pu,
             [f"Attempted {intent} — raised an error before completing"], [], str(_e),
         )
-        return {"success": False, "intent": intent, "error": str(_e)}
+        return {"success": False, "intent": intent, "error": "Something went wrong completing that — please try again."}
 
     trust_verdict, based_on = _command_top_level_trust(intent, result)
     actions_taken = _command_actions_taken(intent, result, extra_fields)
@@ -14325,19 +14368,16 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
     )
 
     # ── 4. Four parallel GPT-4o calls, each isolated ─────────────────────────
-    def _make_call(prompt_text, max_tok):
-        return client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt_text}],
-            response_format={"type": "json_object"},
-            temperature=0.4,
-            max_tokens=max_tok,
-        )
-
     async def _run(prompt_text, max_tok, label):
-        resp = await asyncio.to_thread(_make_call, prompt_text, max_tok)
-        logger.info(f"[CRICKET] {label} finish_reason={resp.choices[0].finish_reason!r} completion_tokens={resp.usage.completion_tokens}")
-        return json.loads(resp.choices[0].message.content)
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt_text}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+        return await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=max_tok, temperature=0.4, retries=1,
+            label=f"cricket {label}",
+        )
 
     core_res, creative_res, inventory_res, media_res = await asyncio.gather(
         _run(prompt_core, 5000, "core"),
@@ -14349,7 +14389,7 @@ async def cricket_ads_intelligence(request: CricketAdsRequest):
 
     if isinstance(core_res, Exception):
         logger.error(f"[CRICKET] core section failed: {core_res}")
-        return {"success": False, "error": f"Core intelligence generation failed: {core_res}"}
+        return {"success": False, "error": "Could not generate the core analysis right now — please try again."}
 
     result = dict(core_res)
     warnings = []
@@ -16529,11 +16569,21 @@ async def creator_finder_generate_outreach(body: CreatorOutreachRequest):
         'Return ONLY JSON: {"dm": "...", "email_pitch": "...", "collaboration_brief": {"deliverables": ["..."], '
         '"suggested_angle": "...", "why_this_creator_fits": "..."}}'
     )
-    resp = await asyncio.to_thread(
-        client.chat.completions.create, model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}, max_tokens=1400, temperature=0.4,
-    )
-    parsed = _clean_banned_words_deep(json.loads(resp.choices[0].message.content.strip()))
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
+    try:
+        parsed = _clean_banned_words_deep(await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=1400, temperature=0.4, retries=1,
+            label="creator-finder outreach",
+        ))
+    except Exception as _e:
+        logger.error(f"[CREATOR-FINDER] outreach generation failed: {_e}")
+        return {"success": False, "error": "Could not generate outreach copy right now — please try again."}
+
     return {
         "success": True, "creator_data": creator_data,
         "grounded_in_business_data": ctxr["grounded_in_business_data"], "research_used": ctxr["research_used"],
@@ -17071,12 +17121,16 @@ async def _sie_social_observed_step(business_name: str, platforms: dict, city: s
             '"linkedin": {"approx_followers": null, "activity_level": null, "content_themes": [], '
             '"notable_mentions": null, "source_snippet": null, "data_label": "NOT_VERIFIED", "note": ""}}'
         )
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}, temperature=0.3, max_tokens=900,
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        parsed = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=900, temperature=0.3, retries=1,
+            label="SIE social observed",
         )
-        parsed = json.loads(resp.choices[0].message.content)
         # Scrub any literal "..." placeholder values the model may have echoed from the schema
         def _scrub_placeholders(obj):
             if isinstance(obj, dict):
@@ -17118,7 +17172,7 @@ async def _sie_social_observed_step(business_name: str, platforms: dict, city: s
         logger.error(f"[SIE] Social observed synthesis failed: {_e}")
         return {
             p: {"platform": p, "handle_or_url": platforms.get(p, ""), "data_label": "NOT_VERIFIED",
-                "note": f"Research synthesis failed: {_e}"}
+                "note": "Social research wasn't available this run."}
             for p in targets
         }
 
@@ -17157,12 +17211,16 @@ async def _sie_competitor_step(business_name: str, industry: str, city: str, mem
             'Return ONLY JSON: {"competitors": [{"name":"...","activity_level":"...","content_style":"...",'
             '"positioning":"..."}], "where_ahead": ["...","..."], "where_behind": ["...","..."]}'
         )
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}, temperature=0.4, max_tokens=700,
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        parsed = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=700, temperature=0.4, retries=1,
+            label="SIE competitor step",
         )
-        parsed = json.loads(resp.choices[0].message.content)
         for c in parsed.get("competitors", []):
             c["data_label"] = "OBSERVED"
         parsed["data_label"] = "OBSERVED"
@@ -17170,7 +17228,7 @@ async def _sie_competitor_step(business_name: str, industry: str, city: str, mem
         return parsed
     except Exception as _e:
         logger.error(f"[SIE] Competitor step failed: {_e}")
-        return {"competitors": [], "data_label": "NOT_VERIFIED", "note": str(_e)}
+        return {"competitors": [], "data_label": "NOT_VERIFIED", "note": "Competitor comparison wasn't available this run."}
 
 
 async def _sie_content_intelligence_step(business_name: str, industry: str, city: str, positioning: str) -> dict:
@@ -17199,15 +17257,24 @@ async def _sie_content_intelligence_step(business_name: str, industry: str, city
         f"{business_name} in {city}, not generic filler."
     )
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}, temperature=0.6, max_tokens=4000,
+        def _build_messages(correction):
+            msgs = [{"role": "user", "content": prompt}]
+            if correction:
+                msgs.append({"role": "user", "content": correction})
+            return msgs
+
+        result = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=4000, temperature=0.6, retries=1,
+            label="SIE content intelligence",
         )
-        result = json.loads(resp.choices[0].message.content)
     except Exception as _e:
+        # Never leak the raw parser/model error into the response — the
+        # backfill loop below fills every calendar field from empty (via
+        # per-field backfill, then a deterministic pad as last resort), so
+        # an empty `result` here still ends up as a complete, honest
+        # INFERRED response, just without any real seed content.
         logger.error(f"[SIE] Content intelligence GPT call failed: {_e}")
-        result = {"error": str(_e)}
+        result = {}
 
     _sie_content_singular = {"reels": "reel", "carousels": "carousel", "stories": "story"}
     calendar = result.setdefault("calendar", {})
@@ -17337,16 +17404,20 @@ async def _sie_growth_engine(business_name: str, industry: str, city: str, brand
         '  "campaign_recommendations": ["...","...","..."]\n'
         "}"
     )
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o", messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}, temperature=0.4, max_tokens=1800,
+        return await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=1800, temperature=0.4, retries=1,
+            label="SIE growth engine",
         )
-        return json.loads(resp.choices[0].message.content)
     except Exception as _e:
         logger.error(f"[SIE] Growth engine call failed: {_e}")
-        return {"error": str(_e), "quick_wins": [], "plan_30_day": [], "plan_90_day": []}
+        return {"quick_wins": [], "plan_30_day": [], "plan_90_day": []}
 
 
 class SocialIntelRequest(BaseModel):
@@ -18336,7 +18407,7 @@ def _write_gads_import_data(customer_id: str, data: dict):
 
 
 # ── AI summary — reads only from the DB tables just written, never Google Ads ─
-def _generate_gads_ai_summary_sync(customer_id: str) -> dict:
+async def _generate_gads_ai_summary_sync(customer_id: str) -> dict:
     with engine.connect() as conn:
         top_campaigns = conn.execute(text("""
             SELECT c.name, SUM(d.cost_micros)/1000000.0 AS cost, SUM(d.conversions) AS conversions,
@@ -18421,14 +18492,16 @@ def _generate_gads_ai_summary_sync(customer_id: str) -> dict:
         "}"
     )
 
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.4,
-        max_tokens=2000,
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
+    return await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.4, retries=1,
+        label="gads AI summary",
     )
-    return json.loads(resp.choices[0].message.content)
 
 
 # ── Background import job ────────────────────────────────────────────────────
@@ -18485,7 +18558,7 @@ async def _run_gads_import_job(job_id: str, customer_id: str, login_customer_id:
 
         _job_update(job_id, current_step="Generating AI summary", progress_pct=98)
         try:
-            summary = await asyncio.to_thread(_generate_gads_ai_summary_sync, customer_id)
+            summary = await _generate_gads_ai_summary_sync(customer_id)
             with engine.begin() as conn:
                 conn.execute(text(
                     "UPDATE gads_accounts SET ai_summary_json=:s, ai_summary_generated_at=:ts WHERE customer_id=:cid"
@@ -19887,7 +19960,7 @@ async def search_console_opportunities(request: Request, url: str = "", industry
 # ── AI Recommendations — grounded only in the real health-score/opportunities ──
 # data just computed above, never re-touches the Search Console or OpenAI API on
 # every dashboard load (cached in search_console_ai_insights, 24h TTL).
-def _generate_gsc_recommendations_sync(health: dict, opportunities: dict) -> dict:
+async def _generate_gsc_recommendations_sync(health: dict, opportunities: dict) -> dict:
     prompt = (
         "You are an SEO strategist writing recommendations for a real Google Search Console account. "
         "Use ONLY the numbers given below — never invent a metric, query, or page that isn't listed. "
@@ -19901,14 +19974,17 @@ def _generate_gsc_recommendations_sync(health: dict, opportunities: dict) -> dic
         '  "top_actions": [{"action": "...", "why": "cites a specific query/page/number", "impact": "HIGH|MEDIUM|LOW"}]\n'
         "}"
     )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-        max_tokens=900,
+
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
+    return await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o-mini", max_tokens=900, temperature=0.3, retries=1,
+        label="GSC recommendations",
     )
-    return json.loads(resp.choices[0].message.content)
 
 
 @app.get("/search-console/recommendations")
@@ -19944,10 +20020,10 @@ async def search_console_recommendations(request: Request, refresh: bool = False
         return {"success": False, "error": "Could not compute health score / opportunities."}
 
     try:
-        insights = await asyncio.to_thread(_generate_gsc_recommendations_sync, health, opportunities)
+        insights = await _generate_gsc_recommendations_sync(health, opportunities)
     except Exception as _e:
         logger.error(f"[GSC] AI recommendations generation failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate recommendations right now — please try again."}
 
     now = datetime.utcnow().isoformat()
     with engine.begin() as conn:
@@ -19967,8 +20043,8 @@ async def search_console_recommendations(request: Request, refresh: bool = False
 # data (not _run_creative_studio, whose 3 fixed tone-of-voice variants don't map
 # to these 3 asset types). Same anti-filler discipline as the cricket-ads/gads
 # prompts: every asset must cite the page's real numbers.
-def _generate_gsc_repurpose_content_sync(page_url: str, top_query: str, impressions: int, clicks: int,
-                                          ctr: float, avg_position: float) -> dict:
+async def _generate_gsc_repurpose_content_sync(page_url: str, top_query: str, impressions: int, clicks: int,
+                                                 ctr: float, avg_position: float) -> dict:
     prompt = (
         "This page is already ranking in real Google search results — use its REAL performance data below, "
         "don't invent anything.\n\n"
@@ -19983,14 +20059,16 @@ def _generate_gsc_repurpose_content_sync(page_url: str, top_query: str, impressi
         '  "video_script_hook": {"hook": "...", "body": "...", "cta": "..."}\n'
         "}"
     )
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.5,
-        max_tokens=700,
+    def _build_messages(correction):
+        msgs = [{"role": "user", "content": prompt}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
+    return await _call_gpt_json_with_retry(
+        _build_messages, model="gpt-4o", max_tokens=700, temperature=0.5, retries=1,
+        label="GSC repurpose-content",
     )
-    return json.loads(resp.choices[0].message.content)
 
 
 @app.post("/search-console/repurpose-content")
@@ -20027,12 +20105,12 @@ async def search_console_repurpose_content(request: Request):
     ctr = (clicks / impressions) if impressions else 0
 
     try:
-        assets = await asyncio.to_thread(
-            _generate_gsc_repurpose_content_sync, page_url, top_query, impressions, clicks, ctr, avg_position
+        assets = await _generate_gsc_repurpose_content_sync(
+            page_url, top_query, impressions, clicks, ctr, avg_position
         )
     except Exception as _e:
         logger.error(f"[GSC] repurpose-content generation failed: {_e}")
-        return {"success": False, "error": str(_e)}
+        return {"success": False, "error": "Could not generate repurposed content right now — please try again."}
 
     log_activity("organic_intelligence_repurpose", url=page_url, summary=f"Repurposed content for {page_url}")
     return {
@@ -20814,19 +20892,17 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
         "2. Do NOT include generic corporate facts (e.g. 'was founded in X' is not a unique story).\n"
         "3. If nothing genuinely interesting is found, return unique_stories as []."
     )
+    def _build_messages(correction):
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=5000,
+        return await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=5000, temperature=0.2, retries=1,
+            label="MI overview/dna/timeline",
         )
-        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as _e:
         if "insufficient_quota" in str(_e):
             raise
@@ -20872,20 +20948,18 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
     marketing_len = len(cap('marketing_raw'))
     website_len   = len(cap('website_content'))
     logger.info(f"[MI] audience/channels/ads: marketing_data={marketing_len}c website={website_len}c")
-    _raw_aud = ""
+
+    def _build_messages(correction):
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=2000,
+        return await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.2, retries=1,
+            label="MI audience/channels/ads",
         )
-        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as _e:
         if "insufficient_quota" in str(_e):
             raise
@@ -20936,19 +21010,17 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         '"referral_program": "observed / not confirmed", '
         '"confidence": 60, "evidence": "...", "data_source": "..."}}'
     )
+    def _build_messages(correction):
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=2000,
+        return await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.2, retries=1,
+            label="MI seo/creatives/offers/funnels",
         )
-        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as _e:
         if "insufficient_quota" in str(_e):
             raise
@@ -21013,19 +21085,17 @@ async def _mi_sections_competitors_swot_lessons(company_name: str, research: dic
         f"[MI] competitors/swot/lessons: competitor_data={comp_data_len}c "
         f"news={news_data_len}c controversy={controversy_len}c"
     )
+    def _build_messages(correction):
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=2500,
+        result = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2500, temperature=0.3, retries=1,
+            label="MI competitors/swot/lessons",
         )
-        result = json.loads(resp.choices[0].message.content or "{}")
         n_comp = len(result.get("competitors") or [])
         n_swot_s = len((result.get("swot") or {}).get("strengths") or [])
         n_lessons = len(result.get("lessons") or [])
@@ -21114,25 +21184,23 @@ async def _mi_apply_to_business(
         '"note": "projections only — actual results depend on execution quality and market conditions"}, '
         '"priority_actions": ["..."]}'
     )
+    def _build_messages(correction):
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        if correction:
+            msgs.append({"role": "user", "content": correction})
+        return msgs
+
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=2500,
+        result = await _call_gpt_json_with_retry(
+            _build_messages, model="gpt-4o", max_tokens=2500, temperature=0.3, retries=1,
+            label="MI apply-to-business",
         )
-        result = json.loads(resp.choices[0].message.content)
         result["memory_quality"] = memory_quality
         result["memory_used"] = memory_quality != "none"
         return result
     except Exception as _e:
         logger.error(f"[MI] apply_to_business failed: {_e}")
-        return {"error": str(_e), "memory_quality": memory_quality}
+        return {"memory_quality": memory_quality}
 
 
 @app.post("/marketing-intelligence")
@@ -21148,7 +21216,7 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
         research = await _mi_research_company(company_input)
     except Exception as _e:
         logger.error(f"[MI] Research step failed: {_e}")
-        return {"success": False, "error": f"Research failed: {_e}"}
+        return {"success": False, "error": "Company research failed — please try again in a moment."}
 
     company_name = research.get("company_name") or company_input
 
@@ -21251,7 +21319,7 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
             )
         except Exception as _e:
             logger.error(f"[MI] apply_to_business step failed: {_e}")
-            apply_result = {"error": str(_e)}
+            apply_result = {}
         sections["apply_to_my_business"] = apply_result
         sections["action_plan"] = apply_result.get("execution_plan_90_days", {})
 
@@ -22612,7 +22680,10 @@ async def _call_gpt_json_with_retry(build_messages_fn, model: str = "gpt-4o", ma
             return json.loads(raw)
         except json.JSONDecodeError as e:
             last_err = e
-            logger.warning(f"[JSON-RETRY] {label} attempt {attempt + 1} invalid JSON: {e} — raw[:300]={raw[:300]!r}")
+            logger.warning(
+                f"[JSON-RETRY] {label} attempt {attempt + 1} invalid JSON: {e} — "
+                f"response_length={len(raw)} chars — raw[:300]={raw[:300]!r}"
+            )
             correction = (
                 f"Your previous response was not valid JSON and failed to parse (error: {e}). "
                 "Return ONLY a valid JSON object matching the exact schema requested — no markdown, "
