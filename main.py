@@ -9374,11 +9374,32 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # Prospect discovery genuinely needs a location to search — blank means
         # search nationally (India) rather than silently assuming a specific city.
         search_scope   = city or "India"
-        # Post-audit fix: raised from 50 so "Find more" (re-running with a
-        # higher max_prospects) has real room to page deeper — bounded in
-        # practice by Google's own per-sub-term ceiling (see fetch_google_places),
-        # not by this clamp.
-        max_prospects  = max(5, min(request.max_prospects, 150))
+        # Post-incident fix (Render OOM restart, 2026-08): this used to
+        # silently clamp anything up to 150 — which is exactly what let a
+        # scan large enough to spike past the 512MB free-tier memory limit
+        # run at all. Measured live against a real local httpx fetch (real
+        # network I/O, GPT mocked): a 58-business scan against a realistic
+        # heavy-page mix peaked at 270MB RSS pre-fix (53% of the 512MB
+        # budget); an adversarial 30-80MB page mix peaked at 1024MB — over
+        # double the instance's budget, guaranteed to OOM. The homepage-
+        # fetch/concurrency fixes below cut that dramatically (post-fix:
+        # 58 businesses peaked at 184MB even against the adversarial mix,
+        # 150 businesses at 194MB — the fetch is now bounded regardless of
+        # real page size, see _fetch_homepage_html_safe and
+        # tests/test_prospect_memory_safety.py). A request above what's
+        # been actually measured as safe is still rejected with a clear,
+        # actionable message — never silently truncated (which hides that
+        # deeper results were skipped) and never left to run unbounded.
+        _MAX_SAFE_PROSPECTS = 60
+        if request.max_prospects > _MAX_SAFE_PROSPECTS:
+            return {
+                "success": False,
+                "error": (
+                    f"Scans are capped at {_MAX_SAFE_PROSPECTS} prospects at a time to keep the service stable. "
+                    f"Lower Max Prospects, or run this scan again and use \"Find More\" afterward to keep going deeper."
+                ),
+            }
+        max_prospects  = max(5, min(request.max_prospects, _MAX_SAFE_PROSPECTS))
 
         # Computed early (not just at save-time, as before) — de-dup needs
         # it before any enrichment/scoring happens, not after.
@@ -9497,11 +9518,18 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # not just Places data). `enriched`'s own keys are rating/
         # user_ratings_total (Places' naming); remapped below to the
         # google_rating/total_reviews keys the detector expects.
+        #
+        # Post-incident fix (Render OOM): chunk_size lowered from 15 — real
+        # homepages are arbitrary third-party pages (unlike the Places/
+        # Tavily JSON calls elsewhere, which are small and well-behaved),
+        # so fewer of them in flight at once bounds worst-case concurrent
+        # download memory even with the per-fetch byte cap already applied
+        # in _fetch_homepage_html_safe.
         fetch_tasks = [
             _fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result={"html": "", "fetch_status": "ok", "detail": ""})
             for p in enriched
         ]
-        fetch_results = await _gather_in_chunks(fetch_tasks, chunk_size=15)
+        fetch_results = await _gather_in_chunks(fetch_tasks, chunk_size=8)
         for p, fetch_result in zip(enriched, fetch_results):
             if not isinstance(fetch_result, dict):
                 fetch_result = {"html": "", "fetch_status": "unverifiable", "detail": str(fetch_result)}
@@ -9514,6 +9542,12 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             p["weaknesses"] = weaknesses
             p["detected_gap"] = detected_gap
             p["sohscape_angle"] = sohscape_angle
+        # Post-incident fix: fetch_results/fetch_tasks hold every fetched
+        # page's HTML (up to 150K chars each) — nothing below this point
+        # needs them, but as ordinary local variables they'd otherwise stay
+        # alive (and un-freeable) for the rest of the request, through the
+        # Tavily and GPT-scoring phases that follow. Free them immediately.
+        del fetch_tasks, fetch_results
 
         # 3. Tavily social / ad presence checks — now for EVERY enriched
         # business (previously hardcoded to just the top 6), in parallel
@@ -9656,8 +9690,24 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             )
             return result.get("prospects", [])
 
+        # Post-incident fix: bounded rather than one unbounded asyncio.gather
+        # of every batch — at max_prospects=150 that's ~19 concurrent
+        # GPT-4o calls with no ceiling. Matches the same chunked-concurrency
+        # discipline already applied to the Places/homepage/Tavily phases
+        # above.
         logger.info(f"[PROSPECT] Scoring {len(enriched)} businesses across {len(batches)} parallel GPT-4o batch(es)")
-        batch_results = await asyncio.gather(*[_score_batch(b) for b in batches])
+        batch_results = await _gather_in_chunks([_score_batch(b) for b in batches], chunk_size=6)
+        # _gather_in_chunks uses return_exceptions=True internally (so one
+        # failed batch doesn't cancel the others still in flight) — a plain
+        # asyncio.gather() would have let a batch's exception propagate
+        # directly, which the specific except json.JSONDecodeError clause
+        # below relies on. Re-raise here to preserve that exact behavior.
+        for _br in batch_results:
+            if isinstance(_br, BaseException):
+                raise _br
+        # tavily_results is only referenced inside _score_batch's closure —
+        # every batch has now completed, so it's dead weight from here on.
+        del tavily_results
         prospects = _fix_rs([p for batch in batch_results for p in batch])
 
         # Post-audit fix: weakness_found/recommended_service are no longer
@@ -9668,6 +9718,10 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # falls back to an honest "not detected" pair rather than leaving
         # the field silently absent.
         _gap_angle_by_name = {p["name"].strip().lower(): (p["detected_gap"], p["sohscape_angle"]) for p in enriched}
+        # enriched (per-business weaknesses/evidence/recent_reviews etc. for
+        # every scanned business) isn't needed past this lookup — freed
+        # before the response gets built and JSON-serialized below.
+        del enriched
         for p in prospects:
             gap, angle = _gap_angle_by_name.get((p.get("name") or "").strip().lower(), ("Not detected", "No service fit"))
             p["weakness_found"] = gap
@@ -12763,7 +12817,28 @@ _MULTI_STEP_INTENTS = set(_COMMAND_STEP_TEMPLATES.keys())
 
 # In-memory task store for multi-step commands — fine for a single-process
 # app (consistent with other in-memory state already used in this file).
+#
+# Post-incident fix (Render OOM): GET /command/status/{task_id} already
+# told callers a task "may have expired" — but nothing ever actually
+# expired anything. Every full_report/campaign_launch_kit run this ever
+# handled stayed in this dict for the life of the process, `result` and
+# all (a full Marketing Brain report is not small). A genuine, unbounded,
+# module-level accumulation of scan/call state. Swept lazily on each new
+# task's creation rather than a background thread — no task is ever
+# touched while still running (only terminal-state, aged-out ones), and a
+# process typically creates far more tasks than it needs a timer for.
 _COMMAND_TASKS: dict = {}
+_COMMAND_TASK_TTL_SECONDS = 2 * 60 * 60  # 2h — comfortably past any realistic poll window
+
+
+def _evict_stale_command_tasks() -> None:
+    now = time.time()
+    stale = [
+        tid for tid, t in _COMMAND_TASKS.items()
+        if t.get("status") in ("done", "error") and (now - t.get("created_at", now)) > _COMMAND_TASK_TTL_SECONDS
+    ]
+    for tid in stale:
+        del _COMMAND_TASKS[tid]
 
 
 def _task_set_step(task_id: str, key: str, status: str, detail=None) -> None:
@@ -13538,12 +13613,13 @@ async def command_center(request: CommandRequest):
                 "planned_steps": [{"key": s["key"], "label": s["label"]} for s in _COMMAND_STEP_TEMPLATES[intent]],
             }
 
+        _evict_stale_command_tasks()
         task_id = str(uuid.uuid4())
         _COMMAND_TASKS[task_id] = {
             "status": "running", "intent": intent, "reasoning": classification.get("reasoning", ""),
             "params_used": _pu, "text_cmd": text_cmd, "confidence": confidence,
             "steps": [{"key": s["key"], "label": s["label"], "status": "pending", "detail": None} for s in _COMMAND_STEP_TEMPLATES[intent]],
-            "result": None, "extra_fields": {},
+            "result": None, "extra_fields": {}, "created_at": time.time(),
         }
         asyncio.create_task(_run_multi_step_command(task_id, intent, url, industry, city, budget, goal))
         return {
@@ -22843,6 +22919,22 @@ def _voice_looks_like_bot_challenge(html: str) -> bool:
     return any(m in lower for m in _VOICE_BOT_CHALLENGE_MARKERS)
 
 
+# Post-incident fix (Render OOM restart, 2026-08): the old implementation
+# called `resp.text`, which decodes the ENTIRE response body into memory
+# BEFORE the `[:200_000]` slice below ever runs — so one unexpectedly large
+# real-world homepage (a heavy SPA bundle, base64-inlined images, a page
+# that redirects into a large asset) had no actual cap during the fetch
+# itself, only after. Measured live: a 58-business scan with a realistic
+# ~13% share of multi-MB pages peaked at 270MB RSS (53% of the 512MB free
+# tier) even with GPT calls mocked out — driven almost entirely by this
+# phase (see tests/manual_memory_repro.py). Streaming with a hard byte cap
+# means the download itself is bounded regardless of how large the real
+# page is, and a huge page is aborted early instead of fully downloaded
+# and thrown away.
+_HOMEPAGE_FETCH_MAX_BYTES = 2 * 1024 * 1024      # never read more than this off the wire
+_HOMEPAGE_ANALYSIS_MAX_CHARS = 150_000            # what's actually kept for weakness detection
+
+
 async def _fetch_homepage_html_safe(url: str, timeout: float = 8.0) -> dict:
     """Best-effort homepage fetch for weakness detection. Never raises.
     Returns {'html': str, 'fetch_status': 'ok'|'unverifiable'|'unreachable',
@@ -22863,7 +22955,26 @@ async def _fetch_homepage_html_safe(url: str, timeout: float = 8.0) -> dict:
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client_:
-                resp = await client_.get(url, headers={"User-Agent": "Mozilla/5.0 (AdsohBot)"})
+                async with client_.stream("GET", url, headers={"User-Agent": "Mozilla/5.0 (AdsohBot)"}) as resp:
+                    if resp.status_code in (403, 429):
+                        return {"html": "", "fetch_status": "unverifiable", "detail": f"HTTP {resp.status_code}"}
+                    if resp.status_code >= 500:
+                        last_detail = f"HTTP {resp.status_code}"
+                        if attempt == 0:
+                            await asyncio.sleep(1.5)
+                            continue
+                        return {"html": "", "fetch_status": "unreachable", "detail": f"persistent {last_detail} after retry"}
+                    if resp.status_code >= 400:
+                        return {"html": "", "fetch_status": "unverifiable", "detail": f"HTTP {resp.status_code}"}
+
+                    # Bounded read — abort the download once the cap is
+                    # hit instead of pulling the whole body into memory.
+                    raw = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        raw += chunk
+                        if len(raw) >= _HOMEPAGE_FETCH_MAX_BYTES:
+                            break
+                    body = raw.decode(resp.encoding or "utf-8", errors="ignore")[:_HOMEPAGE_ANALYSIS_MAX_CHARS]
         except httpx.ConnectError as _ce:
             msg = str(_ce).lower()
             dns_markers = ("nodename nor servname", "name or service not known", "getaddrinfo failed",
@@ -22880,18 +22991,6 @@ async def _fetch_homepage_html_safe(url: str, timeout: float = 8.0) -> dict:
             # gone), not 'unreachable'.
             return {"html": "", "fetch_status": "unverifiable", "detail": f"{type(_fe).__name__}: {_fe}"}
 
-        if resp.status_code in (403, 429):
-            return {"html": "", "fetch_status": "unverifiable", "detail": f"HTTP {resp.status_code}"}
-        if resp.status_code >= 500:
-            last_detail = f"HTTP {resp.status_code}"
-            if attempt == 0:
-                await asyncio.sleep(1.5)
-                continue
-            return {"html": "", "fetch_status": "unreachable", "detail": f"persistent {last_detail} after retry"}
-        if resp.status_code >= 400:
-            return {"html": "", "fetch_status": "unverifiable", "detail": f"HTTP {resp.status_code}"}
-
-        body = resp.text[:200_000]
         if _voice_looks_like_bot_challenge(body):
             return {"html": "", "fetch_status": "unverifiable", "detail": "bot-challenge page detected (HTTP 200)"}
         return {"html": body, "fetch_status": "ok", "detail": ""}
