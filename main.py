@@ -1373,6 +1373,15 @@ def version():
     return {
         "commit": commit or "unknown (not running on Render, or var unset)",
         "commit_short": commit[:7] if commit else "unknown",
+        # Post-audit fix: a live report had sections self-labeling
+        # data_source: "Tavily research" while the local dev environment
+        # (missing TAVILY_API_KEY) proved that claim CAN be false. Whether
+        # research actually ran is now enforced deterministically in code
+        # (see _mi_apply_research_ground_truth), not trusted from the
+        # model — but confirming whether Tavily is even configured in a
+        # given environment previously required Render dashboard access.
+        # Boolean only, never the key itself.
+        "tavily_configured": bool(TAVILY_API_KEY),
     }
 
 
@@ -21355,11 +21364,15 @@ async def _mi_sections_overview_dna_timeline(company_name: str, research: dict) 
             msgs.append({"role": "user", "content": correction})
         return msgs
 
+    _overview_keys_used = ("wikipedia_raw", "overview_raw", "timeline_raw", "iconic_ads_raw", "revenue_raw",
+                            "revenue2_raw", "stories_raw", "stories2_raw", "news_raw", "product_raw", "decade_raw_group")
+
     try:
-        return await _call_gpt_json_with_retry(
+        result = await _call_gpt_json_with_retry(
             _build_messages, model="gpt-4o", max_tokens=5000, temperature=0.2, retries=1,
             label="MI overview/dna/timeline",
         )
+        return _mi_apply_research_ground_truth(result, ("overview", "business_dna"), research, _overview_keys_used)
     except Exception as _e:
         if "insufficient_quota" in str(_e):
             raise
@@ -21397,6 +21410,71 @@ def _mi_enforce_observed_fields(section: dict, observed_keys: tuple, fallback_no
                 section[key] = []
         section["data_source"] = fallback_note
     return section
+
+
+# Post-audit fix: a live run for resmed.co.in (no TAVILY_API_KEY configured
+# in that environment) returned overview.data_source = "Tavily research"
+# and business_dna.data_source = "Tavily research" while citing specific
+# facts (employee counts, revenue figures). The FIRST version of this fix
+# treated "did any research run" as one bool per section-generator call —
+# which turned out wrong for exactly this case: wikipedia_raw comes from
+# _mi_fetch_wikipedia, a direct public REST call needing no API key at all,
+# so it genuinely succeeded even with Tavily fully unconfigured. research
+# DID run — just not Tavily specifically — so suppressing the section to
+# UNVERIFIED would have been its own dishonesty (real Wikipedia content,
+# mislabeled as untrustworthy). The caller (each _mi_sections_* function)
+# knows exactly WHICH real sources actually returned content — that's
+# ground truth computed from the real payload, never guessed from what the
+# model claims — so data_source is always rebuilt from that fact, not
+# merely corrected when a naive text scan happens to catch it.
+_MI_SOURCE_LABELS = {"wikipedia_raw": "Wikipedia", "website_content": "website content (Firecrawl)"}
+_MI_TAVILY_LABEL = "Tavily research"
+_MI_NO_RESEARCH_LABEL = "not verified — no research data available, model knowledge only"
+
+
+def _mi_real_sources_used(research: dict, keys_used: tuple) -> list:
+    """Which of THIS call's actual research inputs were non-empty — ground
+    truth read directly from the payload. "decade_raw_group" in keys_used
+    expands to every dynamic decade_{year}_raw / decade_full_history_raw
+    key (all real Tavily queries); every other *_raw key not named in
+    _MI_SOURCE_LABELS is also a real Tavily query — the only two non-Tavily
+    sources in this pipeline (Wikipedia, Firecrawl-fetched website_content)
+    are named explicitly."""
+    found: list[str] = []
+    for key in keys_used:
+        if key == "decade_raw_group":
+            if any((v or "").strip() for k, v in research.items() if k.startswith("decade_") and k.endswith("_raw")):
+                found.append(_MI_TAVILY_LABEL)
+            continue
+        if (research.get(key) or "").strip():
+            found.append(_MI_SOURCE_LABELS.get(key, _MI_TAVILY_LABEL))
+    seen = set()
+    return [s for s in found if not (s in seen or seen.add(s))]
+
+
+def _mi_apply_research_ground_truth(result: dict, section_keys: tuple, research: dict, keys_used: tuple) -> dict:
+    """Mutates `result[key]` for every key in `section_keys` present in
+    `result`: stamps the real research_ran fact and unconditionally
+    rebuilds data_source from the actual sources that returned content for
+    THIS call — never trusting, and never merely spot-checking, what the
+    model itself claimed. Doesn't verify CONTENT fidelity (a real source
+    returning content doesn't guarantee every claim in the section came
+    from it) — only whether real research input existed at all."""
+    if not isinstance(result, dict):
+        return result
+    real_sources = _mi_real_sources_used(research, keys_used)
+    research_ran = bool(real_sources)
+    honest_source = " + ".join(real_sources) if real_sources else _MI_NO_RESEARCH_LABEL
+    for key in section_keys:
+        section = result.get(key)
+        if not isinstance(section, dict):
+            continue
+        claimed = section.get("data_source")
+        if str(claimed or "") != honest_source:
+            logger.info(f"[MI] {key}.data_source corrected: model claimed {claimed!r}, real sources were {real_sources!r}")
+        section["research_ran"] = research_ran
+        section["data_source"] = honest_source
+    return result
 
 
 async def _mi_sections_audience_channels_ads(company_name: str, research: dict) -> dict:
@@ -21446,6 +21524,8 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
     website_len   = len(cap('website_content'))
     logger.info(f"[MI] audience/channels/ads: marketing_data={marketing_len}c website={website_len}c")
 
+    _acads_keys_used = ("marketing_raw", "product_raw", "website_content")
+
     def _build_messages(correction):
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
         if correction:
@@ -21457,6 +21537,11 @@ async def _mi_sections_audience_channels_ads(company_name: str, research: dict) 
             _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.2, retries=1,
             label="MI audience/channels/ads",
         )
+        # Ground truth first (rebuilds data_source honestly), THEN the
+        # observed-fields check — so a section whose data_source only reads
+        # as verified BECAUSE of an uncorrected false claim still gets its
+        # observed arrays forced empty, not just its data_source relabeled.
+        result = _mi_apply_research_ground_truth(result, ("audience", "channels", "advertising"), research, _acads_keys_used)
         if isinstance(result, dict) and "advertising" in result:
             result["advertising"] = _mi_enforce_observed_fields(
                 result["advertising"],
@@ -21515,6 +21600,8 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
         '"referral_program": "the single word \'observed\' if directly evidenced, or \'inferred\' if a reasonable assumption — never both words, never a slash", '
         '"confidence": 60, "evidence": "...", "data_source": "..."}}'
     )
+    _seo_keys_used = ("website_content", "product_raw", "marketing_raw")
+
     def _build_messages(correction):
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
         if correction:
@@ -21526,6 +21613,7 @@ async def _mi_sections_seo_creatives_offers_funnels(company_name: str, research:
             _build_messages, model="gpt-4o", max_tokens=2000, temperature=0.2, retries=1,
             label="MI seo/creatives/offers/funnels",
         )
+        result = _mi_apply_research_ground_truth(result, ("seo", "creatives", "offers", "funnels"), research, _seo_keys_used)
         if isinstance(result, dict) and "offers" in result:
             result["offers"] = _mi_enforce_observed_fields(
                 result["offers"], ("promotions_observed",),

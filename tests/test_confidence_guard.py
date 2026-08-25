@@ -209,3 +209,68 @@ def test_quality_block_needs_review_false_when_all_sections_verified():
     assert report["_quality"]["needs_review"] is False
     assert report["_quality"]["overall_confidence"] == 70
     assert report["_quality"]["sections_guarded"] == 2
+
+
+# ── research_ran: caller-supplied ground truth overrides self-reported text ──
+# A live run with no TAVILY_API_KEY configured showed sections claiming
+# data_source: "Tavily research" when no research had actually run — the
+# model labeling its own training knowledge as research. Text-matching
+# against data_source can't catch this (the string looks exactly like real
+# evidence); only a fact the CALLER computed from real pipeline state can.
+
+def test_research_ran_false_forces_unverified_even_with_convincing_data_source():
+    section = _well_evidenced_section()
+    section["data_source"] = "Tavily research"  # exactly the false claim from the incident
+    section["research_ran"] = False  # ground truth: no research actually ran
+    report = {"sections": {"overview": section}}
+    guard_report(report)
+    result = report["sections"]["overview"]
+    assert result["data_label"] == "UNVERIFIED"
+    assert result["confidence"] == 25  # UNVERIFIED ceiling, not left at the well-evidenced 70
+
+
+def test_research_ran_true_does_not_force_a_label_still_uses_normal_heuristic():
+    section = _well_evidenced_section()
+    section["research_ran"] = True
+    report = {"sections": {"advertising": section}}
+    guard_report(report)
+    # research_ran=True doesn't grant automatic trust — it just doesn't
+    # veto; a genuinely well-evidenced section is still VERIFIED as before.
+    assert report["sections"]["advertising"]["data_label"] == "VERIFIED"
+
+
+def test_research_ran_absent_falls_back_to_text_heuristic_unchanged():
+    # Callers that don't supply research_ran at all (any future caller of
+    # guard_report, or a section this codebase doesn't yet wire it for)
+    # must behave exactly as before this fix — the exact original bug case.
+    report = {"sections": {"advertising": _resmed_advertising_section()}}
+    guard_report(report)
+    assert report["sections"]["advertising"]["data_label"] == "NO_DATA"
+    assert report["sections"]["advertising"]["confidence"] == 0
+
+
+def test_research_ran_is_not_treated_as_payload():
+    # The fact itself must not count toward "how much of this section is
+    # populated" — it's metadata about provenance, not a finding.
+    section = {
+        "estimated_spend": "not found in available data",
+        "confidence": 50,
+        "data_source": "not verified",
+        "research_ran": False,
+    }
+    report = {"sections": {"advertising": section}}
+    guard_report(report)
+    assert report["sections"]["advertising"]["data_label"] == "NO_DATA"  # still 0/1 real payload fields, not 1/2
+
+
+def test_research_ran_survives_idempotent_second_pass():
+    section = _well_evidenced_section()
+    section["data_source"] = "Tavily research"
+    section["research_ran"] = False
+    report = {"sections": {"overview": section}}
+    guard_report(report)
+    first = dict(report["sections"]["overview"])
+    guard_report(report)
+    second = report["sections"]["overview"]
+    assert second["confidence"] == first["confidence"] == 25
+    assert second["data_label"] == first["data_label"] == "UNVERIFIED"

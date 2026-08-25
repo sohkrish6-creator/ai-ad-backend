@@ -40,6 +40,21 @@ per-list-item confidence is a related but separate scope, not covered here.
 
 Pure stdlib, no dependencies, idempotent (safe to call twice on the same
 report), mutates in place and returns the same dict.
+
+Post-audit fix #2: a live run against an environment with no Tavily key
+configured showed sections self-labeling data_source: "Tavily research"
+while no research had actually run — the model was labeling its own
+training knowledge as research, which this guard's original text-matching
+against data_source/evidence has no way to catch (the string looked
+exactly like real evidence). The caller (main.py's _mi_apply_research_
+ground_truth) knows the real, verifiable ground truth — whether the raw
+research payload a section was built from was non-empty — and stamps that
+onto the section as `research_ran` BEFORE guard_report ever sees it.
+`research_ran: False` is now checked first and forces UNVERIFIED
+regardless of what data_source claims; text-pattern matching is only the
+fallback for callers that don't supply this fact. `research_ran` never
+raises trust — only `False` forces a result; `True`/absent still falls
+through to the existing evidence-text heuristic.
 """
 from typing import Any
 
@@ -72,6 +87,7 @@ _POLITE_EMPTY_PATTERNS = (
 _METADATA_KEYS = frozenset({
     "confidence", "confidence_reported", "confidence_reason",
     "data_label", "data_label_self_reported", "data_source", "evidence",
+    "research_ran",
 })
 
 # The four labels this guard assigns. Distinct from any free-text
@@ -119,6 +135,16 @@ def _source_text(section: dict) -> str:
 
 
 def _source_looks_unverified(section: dict) -> bool:
+    # Caller-supplied ground truth wins over the model's own words. A
+    # caller that knows research genuinely didn't run can say so directly —
+    # no data_source text, however convincing, can talk its way past that.
+    # `research_ran: True` (or the key being absent, for callers that don't
+    # supply this fact) falls through to the text heuristic below; only an
+    # explicit False short-circuits it.
+    research_ran = section.get("research_ran")
+    if research_ran is False:
+        return True
+
     text = _source_text(section)
     if not text.strip():
         return True  # no stated source at all — same as MI's own existing rule
