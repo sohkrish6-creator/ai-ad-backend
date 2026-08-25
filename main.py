@@ -41,6 +41,7 @@ from report_validators import (
     assert_retention_budget,
     RECURRING_KEYWORDS,
 )
+from confidence_guard import guard_report
 
 try:
     import jwt as _pyjwt
@@ -21858,7 +21859,7 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
     # analysis with no way for the reader to tell that had happened.
     # Additive fields — the report now states plainly which real domain/
     # region it analyzed and whether that site was actually reachable.
-    return {
+    response = {
         "success":              True,
         "company_name":         company_name,
         "company_input":        company_input,
@@ -21867,6 +21868,21 @@ async def marketing_intelligence(request: MarketingIntelligenceRequest):
         "analyzed_locale":      research.get("detected_locale"),
         "website_fetch_status": research.get("website_fetch_status"),
     }
+
+    # Post-audit fix: a live run for resmed.co.in returned six sections
+    # with every finding field empty, data_source honestly saying "not
+    # verified", and confidence still self-reported at 60 — the model has
+    # no reliable introspection into whether it found anything. Guarded
+    # here, at the parse boundary, right before the response is returned —
+    # MI has no server-side persistence (no DB write/cache for this
+    # report), so this is the only point that matters; the frontend's
+    # localStorage cache just stores whatever this endpoint returns, so it
+    # inherits the fix for free. Additive fields only (data_label,
+    # confidence_reported, confidence_reason per section; a top-level
+    # _quality block) — never removes or renames anything already here.
+    guard_report(response)
+
+    return response
 
 
 # ── Weekly Market Insight widget (public website) ────────────────────────────
