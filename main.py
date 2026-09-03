@@ -318,7 +318,20 @@ async def auth_middleware(request: Request, call_next):
                         token, _jwt_secret, algorithms=["HS256"],
                         options={"verify_aud": False},
                     )
-                user_id = payload.get("sub", "")
+                # Post-audit fix: a JWT that verifies cleanly (real
+                # signature, not expired) but carries an empty, missing, or
+                # whitespace-only `sub` claim used to pass through silently
+                # as user_id="" — identical to the local-dev no-JWT-secret
+                # case every "if uid: filter(...)" endpoint in this codebase
+                # trusts to mean "no tenant scoping needed". That's the root
+                # cause flagged in the Phase 0 tenancy audit: fixing it here
+                # closes the class at its source rather than patching each
+                # of the ~20 call sites individually. A validly-signed token
+                # with no real subject is not a legitimate anonymous
+                # request — it's rejected the same as an invalid signature.
+                user_id = (payload.get("sub") or "").strip()
+                if not user_id:
+                    return JSONResponse({"error": "Invalid authentication token — missing subject"}, status_code=401)
             except _pyjwt.ExpiredSignatureError:
                 return JSONResponse({"error": "Session expired — please log in again"}, status_code=401)
             except Exception:
