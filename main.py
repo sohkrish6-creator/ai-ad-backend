@@ -23246,6 +23246,111 @@ def _compute_recommendation(priority: str, gate_blocked: bool, service_fit) -> s
     return "IGNORE"
 
 
+# ── Next Best Action (Revenue Dashboard, Phase 2 of Revenue Engine) ─────────
+# Extends _compute_recommendation rather than replacing it — the base CALL/
+# FOLLOW_LATER/IGNORE call is still the deterministic core decision; this
+# adds the richer, validated shape the dashboard needs (reason, evidence,
+# urgency, target_route) without introducing a second scoring algorithm or
+# any new AI service. Deliberately fully deterministic, no GPT call: the
+# spec allows an LLM to phrase `reason` from structured inputs, but never
+# to decide the ranking, and a dashboard tile computing up to 10 of these
+# per page load has no room for a real GPT call's latency/cost/failure
+# surface for what is, in the end, a template over fields already known.
+class _NextBestActionEvidence(BaseModel):
+    type: str
+    value: str
+    confidence: float = 0.0
+
+
+class NextBestAction(BaseModel):
+    """Validated against this before ever being returned or stored — reject
+    and log rather than silently propagating a malformed shape. No other
+    module in this codebase enforces schema validation on a persisted AI/
+    derived output (all thirteen others do JSON-parse-retry only); this is
+    a deliberately stricter new write path, not a retrofit of the others."""
+    action_type: Literal["CALL", "SEND_FOLLOW_UP", "FOLLOW_LATER", "IGNORE"]
+    reason: str
+    evidence: list[_NextBestActionEvidence]
+    urgency: Literal["high", "medium", "low"]
+    target_route: str
+
+
+def _voice_prospect_has_pending_draft(user_id: str, prospect_id: int) -> bool:
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT 1 FROM revenue_outreach_drafts WHERE user_id=:uid AND prospect_id=:pid "
+            "AND status != 'sent' LIMIT 1"
+        ), {"uid": user_id, "pid": prospect_id}).first()
+    return row is not None
+
+
+def _next_best_action_urgency(action_type: str, priority: str, last_outcome_at: Optional[str]) -> str:
+    if action_type == "IGNORE":
+        return "low"
+    if action_type in ("CALL", "SEND_FOLLOW_UP") and priority == "high":
+        return "high"
+    # A high-priority prospect that's gone quiet for a while is more urgent
+    # than a freshly-scored one waiting its natural turn — never contacted
+    # counts as maximally stale, not as "no urgency signal".
+    if last_outcome_at:
+        try:
+            days_since = (datetime.utcnow() - datetime.fromisoformat(last_outcome_at)).days
+            if days_since >= 7 and priority in ("high", "medium"):
+                return "high"
+        except Exception:
+            pass
+    return "medium" if priority in ("high", "medium") else "low"
+
+
+def compute_next_best_action(prospect: dict, user_id: str) -> Optional[dict]:
+    """`prospect` is a _voice_parse_prospect_row()-shaped dict (real
+    voice_prospects columns + parsed weaknesses/evidence/signals). Returns
+    a validated dict per the NextBestAction schema, or None (logged) if the
+    computed shape somehow fails validation — never a malformed object."""
+    base_action = _compute_recommendation(
+        prospect.get("priority", ""), bool(prospect.get("gate_blocked")), prospect.get("service_fit"),
+    )
+    action_type = base_action
+    if base_action == "CALL" and _voice_prospect_has_pending_draft(user_id, prospect["id"]):
+        # A drafted-but-unsent outreach message is a more specific, more
+        # immediately actionable step than "call" when one already exists.
+        action_type = "SEND_FOLLOW_UP"
+
+    evidence_raw = prospect.get("evidence") or []
+    evidence = [
+        {"type": e.get("type", ""), "value": str(e.get("value", ""))[:200], "confidence": float(e.get("confidence") or 0.0)}
+        for e in evidence_raw if isinstance(e, dict)
+    ]
+
+    gap = _VOICE_WEAKNESS_LABELS.get(prospect.get("matched_weakness"), prospect.get("matched_weakness") or "")
+    service = _VOICE_SERVICE_LABEL_BY_KEY.get(prospect.get("matched_service"), prospect.get("matched_service") or "")
+    business = prospect.get("business_name", "this business")
+    if action_type == "IGNORE":
+        reason = f"{business}: gate-blocked or no matching service — not actionable right now."
+    elif action_type == "SEND_FOLLOW_UP":
+        reason = f"{business}: outreach already drafted and approved — send it, don't re-call from scratch."
+    elif gap and service:
+        reason = f"{business}: {gap} detected, {service.lower()} is a real fit — opportunity {prospect.get('opportunity_score', '—')}, need {prospect.get('need_score', '—')}."
+    else:
+        reason = f"{business}: opportunity {prospect.get('opportunity_score', '—')}, need {prospect.get('need_score', '—')}."
+
+    urgency = _next_best_action_urgency(action_type, prospect.get("priority", ""), prospect.get("last_outcome_at"))
+
+    candidate = {
+        "action_type": action_type,
+        "reason": reason,
+        "evidence": evidence,
+        "urgency": urgency,
+        "target_route": f"/revenue-engine/lead/{prospect['id']}",
+    }
+    try:
+        validated = NextBestAction(**candidate)
+    except Exception as _e:
+        logger.error(f"[REVENUE-DASHBOARD] Next Best Action failed schema validation for prospect id={prospect.get('id')}: {_e} — candidate={candidate!r}")
+        return None
+    return validated.model_dump()
+
+
 def _get_or_create_voice_settings(user_id: str) -> dict:
     with engine.connect() as conn:
         row = conn.execute(text(
@@ -24856,6 +24961,16 @@ CREATE TABLE IF NOT EXISTS revenue_outreach_drafts (
     sent_at TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prospect_suppressions (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    place_id TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'all',
+    reason TEXT,
+    source TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, place_id, channel)
+);
 """
 try:
     _rddl = _REVENUE_DDL
@@ -24866,9 +24981,36 @@ try:
             _rstmt = _rstmt.strip()
             if _rstmt:
                 _rconn.execute(text(_rstmt))
-    logger.info("[REVENUE] revenue_goals/revenue_rate_cards tables ready")
+    logger.info("[REVENUE] revenue_goals/revenue_rate_cards/prospect_suppressions tables ready")
 except Exception as _re:
     logger.error(f"[REVENUE] table creation failed: {_re}")
+
+
+def _is_prospect_suppressed(user_id: str, place_id: str, phone_e164: Optional[str] = None, channel: str = "all") -> bool:
+    """Channel-agnostic suppression check for the Revenue Dashboard's
+    Today's Priorities — a suppressed prospect must never be ranked.
+    voice_dnc_list (phone-only, Voice Outreach's own gate check) covers
+    calling; prospect_suppressions is the new table covering every other
+    channel (email/LinkedIn/WhatsApp/Instagram DM) plus phone if entered
+    here directly. Checks both, merges neither — voice_dnc_list keeps
+    working exactly as it always has."""
+    if not user_id or not place_id:
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT 1 FROM prospect_suppressions WHERE user_id=:uid AND place_id=:pid "
+            "AND (channel='all' OR channel=:ch)"
+        ), {"uid": user_id, "pid": place_id, "ch": channel}).first()
+        if row:
+            return True
+        if phone_e164:
+            row = conn.execute(text(
+                "SELECT 1 FROM voice_dnc_list WHERE user_id=:uid AND phone_e164=:p"
+            ), {"uid": user_id, "p": phone_e164}).first()
+            if row:
+                return True
+    return False
+
 
 # voice_calls.prospect_id must be nullable for test calls (no real prospect
 # involved) — Postgres-only syntax (SQLite has no ALTER COLUMN, but fresh
@@ -26365,7 +26507,75 @@ async def revenue_engine_discover(payload: RevenueDiscoverRequest, request: Requ
     return {"success": True, "batch_id": batch_id, "max_prospects": max_prospects}
 
 
-# ── Today's Priority ─────────────────────────────────────────────────────────
+# ── Today's Priority (Revenue Engine Phase 2: Revenue Dashboard) ────────────
+# Extended in place rather than duplicated into a new route — this endpoint
+# and RevenueEngineToday.jsx already were ~90% of "Today's Priorities"
+# (ranked list, deterministic ordering, links to the lead workspace) before
+# this pass. Added: suppression filtering (prospect_suppressions +
+# voice_dnc_list), the richer per-prospect Next Best Action (reason/
+# evidence/urgency/target_route) replacing the raw recommendation string,
+# and a `metrics` block for the dashboard tiles — computed from the WHOLE
+# open pipeline, not just the top `size` ranked here, since "Pipeline
+# value"/"Open opportunities"/"High-priority prospects" are pipeline-wide
+# facts, not properties of the top-10 slice.
+#
+# NOT changed: the existing `last_outcome IS NULL` filter — this list still
+# only surfaces never-yet-contacted prospects. A prospect with a logged
+# "callback" outcome whose follow-up is now due does not resurface here;
+# that would be a real, separate behavior change (whether/when a contacted
+# prospect re-enters the priority list) and wasn't part of what was asked.
+
+def _revenue_dashboard_metrics(conn, uid: str) -> dict:
+    # "Open" = still viable — not gate-blocked, not rejected/filtered, and
+    # not already marked not-interested. Regardless of contact history,
+    # unlike the ranked list above (which only shows never-contacted ones).
+    # Suppressed prospects are excluded here too, not just from the ranked
+    # list — counting a business you've been told not to contact toward
+    # "Open Opportunities" or "Pipeline Value" would overstate what's
+    # actually actionable.
+    open_rows = conn.execute(text(
+        "SELECT priority, opportunity_score, matched_service FROM voice_prospects vp "
+        "WHERE vp.user_id=:uid AND vp.channel='revenue_engine' AND vp.gate_blocked=FALSE "
+        "AND vp.approval_status NOT IN ('rejected', 'filtered') "
+        "AND (vp.service_fit IS NULL OR vp.service_fit=TRUE) "
+        "AND (vp.last_outcome IS NULL OR vp.last_outcome != 'not_interested') "
+        "AND NOT EXISTS (SELECT 1 FROM prospect_suppressions ps WHERE ps.user_id=vp.user_id AND ps.place_id=vp.place_id) "
+        "AND (vp.phone_e164 IS NULL OR NOT EXISTS (SELECT 1 FROM voice_dnc_list dnc WHERE dnc.user_id=vp.user_id AND dnc.phone_e164=vp.phone_e164))"
+    ), {"uid": uid}).fetchall()
+    open_count = len(open_rows)
+    high_priority_count = sum(1 for r in open_rows if r[0] == "high")
+
+    rate_rows = conn.execute(text(
+        "SELECT service_key, price_micros FROM revenue_rate_cards WHERE user_id=:uid"
+    ), {"uid": uid}).fetchall()
+    rate_card = {r[0]: r[1] for r in rate_rows}
+    if rate_card:
+        pipeline_value_micros = sum(rate_card.get(r[2], 0) for r in open_rows if r[2])
+        pipeline_value = {"available": True, "amount_micros": pipeline_value_micros, "currency": "INR"}
+    else:
+        # Matches the existing "Set your rates in Settings" empty-state
+        # pattern already used in the lead workspace's budget estimate —
+        # no rate card means no defensible number, not a fabricated one.
+        pipeline_value = {"available": False, "reason": "No rate card configured", "missing_module_route": "/revenue-engine/settings"}
+
+    followups_due = conn.execute(text(
+        "SELECT COUNT(*) FROM revenue_outreach_drafts WHERE user_id=:uid AND status != 'sent'"
+    ), {"uid": uid}).scalar() or 0
+
+    return {
+        "pipeline_value": pipeline_value,
+        "open_opportunities": {"available": True, "count": open_count},
+        "high_priority_prospects": {"available": True, "count": high_priority_count},
+        "followups_due": {"available": True, "count": followups_due},
+        # No structured meeting-date or proposal-status field exists
+        # anywhere in this schema (verified: meeting_booked is an outcome
+        # enum value with no attached date; "proposal" only appears as a
+        # GPT prompt field name, never a tracked stage) — honest empty
+        # state, never a fabricated zero.
+        "meetings_today": {"available": False, "reason": "No meeting-scheduling integration connected", "missing_module_route": None},
+        "proposals_pending": {"available": False, "reason": "No proposal-tracking stage exists yet", "missing_module_route": None},
+    }
+
 
 @app.get("/revenue-engine/todays-priority")
 async def revenue_engine_todays_priority(request: Request, size: int = 10):
@@ -26378,6 +26588,8 @@ async def revenue_engine_todays_priority(request: Request, size: int = 10):
         "COALESCE(need_score, 0) DESC"
     )
     with engine.connect() as conn:
+        # Over-fetch before suppression filtering so a suppressed prospect
+        # never silently shrinks the list below `size` when others exist.
         rows = conn.execute(text(
             f"SELECT {', '.join(_VOICE_PROSPECT_COLS)} FROM voice_prospects "
             "WHERE user_id=:uid AND channel='revenue_engine' AND gate_blocked=FALSE "
@@ -26385,13 +26597,38 @@ async def revenue_engine_todays_priority(request: Request, size: int = 10):
             "AND (service_fit IS NULL OR service_fit=TRUE) "
             "AND last_outcome IS NULL "
             f"ORDER BY {order_sql} LIMIT :n"
-        ), {"uid": uid, "n": size}).fetchall()
-    prospects = [_voice_parse_prospect_row(r) for r in rows]
-    counts = {"CALL": 0, "FOLLOW_LATER": 0, "IGNORE": 0}
+        ), {"uid": uid, "n": size * 3}).fetchall()
+
+        suppressed_place_ids = {
+            r[0] for r in conn.execute(
+                text("SELECT place_id FROM prospect_suppressions WHERE user_id=:uid"), {"uid": uid}
+            ).fetchall()
+        }
+        dnc_phones = {
+            r[0] for r in conn.execute(
+                text("SELECT phone_e164 FROM voice_dnc_list WHERE user_id=:uid"), {"uid": uid}
+            ).fetchall()
+        }
+
+        metrics = _revenue_dashboard_metrics(conn, uid)
+
+    prospects = []
+    for r in rows:
+        p = _voice_parse_prospect_row(r)
+        if p.get("place_id") in suppressed_place_ids or p.get("phone_e164") in dnc_phones:
+            continue
+        nba = compute_next_best_action(p, uid)
+        p["next_best_action"] = nba
+        prospects.append(p)
+        if len(prospects) >= size:
+            break
+
+    counts = {"CALL": 0, "SEND_FOLLOW_UP": 0, "FOLLOW_LATER": 0, "IGNORE": 0}
     for p in prospects:
-        if p.get("recommendation") in counts:
-            counts[p["recommendation"]] += 1
-    return {"success": True, "prospects": prospects, "counts": counts}
+        action_type = (p.get("next_best_action") or {}).get("action_type") or p.get("recommendation")
+        if action_type in counts:
+            counts[action_type] += 1
+    return {"success": True, "prospects": prospects, "counts": counts, "metrics": metrics}
 
 
 # ── Outreach drafts (email / WhatsApp / LinkedIn / Instagram DM) ────────────────
