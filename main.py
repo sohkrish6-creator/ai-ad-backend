@@ -9627,9 +9627,17 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 fetch_result,
             )
             detected_gap, sohscape_angle = _prospect_gap_and_angle(weaknesses, evidence, services_offered)
+            # Post-audit fix: _prospect_gap_and_angle only returns the
+            # human-readable label ("Website Development"); grounding
+            # expected_ltv in the tenant's real rate card needs the raw
+            # service_key it's actually priced under. Cheap, deterministic,
+            # no GPT call — same function _prospect_gap_and_angle already
+            # calls internally, just kept this time.
+            _, matched_service_key = _voice_match_service(weaknesses, evidence, services_offered)
             p["weaknesses"] = weaknesses
             p["detected_gap"] = detected_gap
             p["sohscape_angle"] = sohscape_angle
+            p["matched_service_key"] = matched_service_key
         # Post-incident fix: fetch_results/fetch_tasks hold every fetched
         # page's HTML (up to 150K chars each) — nothing below this point
         # needs them, but as ordinary local variables they'd otherwise stay
@@ -9676,7 +9684,6 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # retrying doesn't shrink the output. batch=8 × 233 ≈ 1864 tokens
         # against max_tokens=4000 is real, measured headroom (~53%
         # utilization at worst case), not a guess.
-        RS = "RS"
         SCORE_BATCH_SIZE = 8
         batches = [enriched[i:i + SCORE_BATCH_SIZE] for i in range(0, len(enriched), SCORE_BATCH_SIZE)]
 
@@ -9743,20 +9750,16 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 "DO NOT TEMPLATE SCORES BY CATEGORY: the ranges above are ranges, not a single fixed number to "
                 "reuse for every business that falls into the same weakness category. Two 'no website' businesses "
                 "with very different review_count/rating must NOT get identical opportunity_score, website_score, "
-                "closing_probability, or expected_ltv — pick the exact number WITHIN each range from this "
-                "business's actual review_count and rating, not a copy-pasted default. Use review_count as a "
-                "rough proxy for the business's real scale/demand: a business with thousands of reviews and no "
-                "website is an established, high-demand operation missing a website — a much bigger opportunity "
-                "(higher end of the range, higher expected_ltv) than a business with a few hundred reviews and "
-                "the same weakness (lower end of the range, smaller expected_ltv), even though both are still "
-                "genuinely HIGH opportunity. expected_ltv in particular must scale with the business's apparent "
-                "size (review_count/rating), never reuse the same rupee figure across businesses of different "
-                "scale just because they share a weakness category.\n\n"
+                "or closing_probability — pick the exact number WITHIN each range from this business's actual "
+                "review_count and rating, not a copy-pasted default. Use review_count as a rough proxy for the "
+                "business's real scale/demand: a business with thousands of reviews and no website is an "
+                "established, high-demand operation missing a website — a much bigger opportunity (higher end of "
+                "the range) than a business with a few hundred reviews and the same weakness (lower end of the "
+                "range), even though both are still genuinely HIGH opportunity.\n\n"
                 "For each business provide a SPECIFIC, PERSONALIZED analysis based on the actual data.\n"
                 "Suggested opening line must be specific to THAT business (mention their name, city, actual weakness) "
                 "AND must be consistent with the business's own Recommended Angle given above — never propose a "
-                "different service in the opening line than the one already given.\n"
-                "Use " + RS + " for Indian Rupee symbol in expected_ltv.\n\n"
+                "different service in the opening line than the one already given.\n\n"
                 "Businesses to score:\n" + biz_lines + "\n"
                 "Return JSON:\n"
                 "{\n"
@@ -9774,7 +9777,6 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                 '      "website_score": 30,\n'
                 '      "marketing_maturity": "low",\n'
                 '      "closing_probability": "75%",\n'
-                '      "expected_ltv": "' + RS + '25,000/month",\n'
                 '      "why_contact": "specific reason based on real data",\n'
                 '      "suggested_opening_line": "Hi [Name], I noticed [specific observation about their business] — I help [industry] businesses in ' + search_scope + ' get more customers through [the Recommended Angle given above]. Would love to show you what we did for similar businesses here."\n'
                 "    }\n"
@@ -9833,17 +9835,42 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # exact name it was given). A name that somehow doesn't match
         # falls back to an honest "not detected" pair rather than leaving
         # the field silently absent.
-        _gap_angle_by_name = {p["name"].strip().lower(): (p["detected_gap"], p["sohscape_angle"]) for p in enriched}
+        _gap_angle_by_name = {
+            p["name"].strip().lower(): (p["detected_gap"], p["sohscape_angle"], p["matched_service_key"])
+            for p in enriched
+        }
         # enriched (per-business weaknesses/evidence/recent_reviews etc. for
         # every scanned business) isn't needed past this lookup — freed
         # before the response gets built and JSON-serialized below.
         del enriched
         for p in prospects:
-            gap, angle = _gap_angle_by_name.get((p.get("name") or "").strip().lower(), ("Not detected", _PROSPECT_NO_SERVICE_FIT))
+            gap, angle, matched_service_key = _gap_angle_by_name.get(
+                (p.get("name") or "").strip().lower(), ("Not detected", _PROSPECT_NO_SERVICE_FIT, None)
+            )
             p["weakness_found"] = gap
             p["recommended_service"] = angle
+            p["matched_service_key"] = matched_service_key
 
         _apply_no_service_fit_guard(prospects)
+
+        # Post-audit fix: expected_ltv used to be a GPT-invented rupee
+        # figure with zero connection to what this tenant actually charges
+        # — dropped from the prompt/schema above entirely (see _score_batch),
+        # but this is the real guarantee: unconditionally overwrite whatever
+        # GPT put there (or didn't) with the tenant's real rate-card price
+        # for the prospect's matched service, or an explicit "not
+        # configured" state — never a fabricated number, same discipline as
+        # _apply_no_service_fit_guard. Fetched once for the whole scan, not
+        # once per business. closing_probability has no equivalent real
+        # signal to ground it in, so it's capped instead — same pattern as
+        # Revenue Engine's _consistent_closing_estimate — never allowed to
+        # show higher than the prospect's own (possibly guard-adjusted)
+        # opportunity_score.
+        _rate_card = _fetch_rate_card_map(_uid) if _uid else {}
+        for p in prospects:
+            p["expected_ltv"], p["pricing_configured"] = _ground_expected_ltv(p.get("matched_service_key"), _rate_card)
+            p["expected_ltv_note"] = None if p["pricing_configured"] else "Set your rates in Settings to see estimated value."
+            p["closing_probability"] = _cap_closing_probability(p.get("closing_probability"), p.get("opportunity_score"))
 
         # Re-rank across the merged set — each batch only ranked within
         # itself, so the final order/rank must be resolved globally.
@@ -23619,9 +23646,6 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
             "- business_score (0-100): how mature/established this business appears from its reviews, rating, "
             "and listing status — independent of the weaknesses found.\n"
             "- priority: 'high' if opportunity_score > 75, 'medium' if 50-75, 'low' if under 50.\n"
-            "- estimated_roi: a realistic monthly INR revenue-gain estimate from fixing the detected weaknesses, "
-            "scaled to this business's real size (use 'RS' for the rupee symbol) — never reuse the same figure "
-            "across businesses of different scale.\n"
             "- estimated_call_success: a realistic percentage string for how likely this business is to answer "
             "and meaningfully engage with a cold outreach call, based on its type/size/data completeness.\n"
             "- reason: ONE specific sentence citing this business's actual detected weakness(es) — never generic.\n"
@@ -23635,7 +23659,6 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
             '      "business_score": 60,\n'
             '      "priority": "high",\n'
             '      "reason": "specific sentence citing a real detected weakness",\n'
-            '      "estimated_roi": "RS 20,000/month",\n'
             '      "estimated_call_success": "45%"\n'
             "    }\n"
             "  ]\n"
@@ -23891,13 +23914,20 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         total_qualified = 0
         ts = datetime.utcnow().isoformat()
         services_offered = settings.get("services_offered") or []
+        # Post-audit fix: estimated_roi used to be a GPT-invented rupee
+        # figure carried straight through from `score`/`cached` — same bug
+        # as Prospect Discovery's expected_ltv (see _ground_expected_ltv),
+        # same fix. Fetched once for this whole batch, not once per
+        # business, and overwrites whatever the model produced (or a stale
+        # cached value from before this fix) regardless.
+        _rate_card = _fetch_rate_card_map(user_id)
         for p in enriched:
             cached = cache_hits.get(p["place_id"])
             if cached:
                 score = {
                     "opportunity_score": cached["opportunity_score"], "business_score": cached["business_score"],
                     "priority": cached["priority"], "reason": cached["reason"],
-                    "estimated_roi": cached["estimated_roi"], "estimated_call_success": cached["estimated_call_success"],
+                    "estimated_call_success": cached["estimated_call_success"],
                 }
                 confidence_score = cached["confidence_score"]
             else:
@@ -23910,6 +23940,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 total_qualified += 1
             matched_weakness, matched_service = _voice_match_service(p["weaknesses"], p["evidence"], services_offered)
             priority_capped = _voice_cap_priority(score.get("priority"), confidence_score)
+            estimated_roi, _roi_configured = _ground_expected_ltv(matched_service, _rate_card)
             row = {
                 "batch_id": batch_id, "user_id": user_id, "place_id": p["place_id"],
                 "business_name": p["business_name"], "address": p["address"],
@@ -23919,7 +23950,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "opportunity_score": score.get("opportunity_score"), "business_score": score.get("business_score"),
                 "confidence_score": confidence_score,
                 "priority": priority_capped,
-                "reason": score.get("reason"), "estimated_roi": score.get("estimated_roi"),
+                "reason": score.get("reason"), "estimated_roi": estimated_roi,
                 "estimated_call_success": score.get("estimated_call_success"),
                 "weaknesses_json": json.dumps(p["weaknesses"]), "evidence_json": json.dumps(p["evidence"]),
                 "dnc_status": "listed" if "dnc" in gate["reasons"] else "clear",
@@ -24032,6 +24063,9 @@ async def _voice_rescore_existing_prospects(user_id: str, limit: int) -> dict:
     call (Item 5) — the rest are left untouched for a follow-up run, never
     silently skipped forever."""
     services_offered = _get_or_create_voice_settings(user_id).get("services_offered") or []
+    # Same rate-card grounding as the initial batch build (_run_voice_batch_job)
+    # — fetched once for this whole rescore run, not once per prospect.
+    _rate_card = _fetch_rate_card_map(user_id)
 
     with engine.connect() as conn:
         rows = conn.execute(text(
@@ -24097,6 +24131,7 @@ async def _voice_rescore_existing_prospects(user_id: str, limit: int) -> dict:
                         note += " Reverted to pending review — score dropped below threshold."
 
                 matched_weakness, matched_service = _voice_match_service(p["weaknesses"], p["evidence"], services_offered)
+                estimated_roi, _roi_configured = _ground_expected_ltv(matched_service, _rate_card)
 
                 conn.execute(text(
                     "UPDATE voice_prospects SET weaknesses_json=:w, evidence_json=:e, opportunity_score=:score, "
@@ -24110,7 +24145,7 @@ async def _voice_rescore_existing_prospects(user_id: str, limit: int) -> dict:
                     "score": new.get("opportunity_score", old_score), "bscore": new.get("business_score"),
                     "conf": new_confidence, "prio": _voice_cap_priority(new.get("priority"), new_confidence),
                     "reason": new.get("reason"),
-                    "roi": new.get("estimated_roi"), "succ": new.get("estimated_call_success"),
+                    "roi": estimated_roi, "succ": new.get("estimated_call_success"),
                     "note": note, "mw": matched_weakness, "ms": matched_service, "fit": matched_service is not None,
                     "appr": ("pending" if revert else p["approval_status"]),
                     "revert": revert, "ts": now, "id": p["id"],
@@ -25408,6 +25443,63 @@ def _apply_outreach_service_fit_guard(outreach: dict, services_offered: list) ->
         setter(_OUTREACH_VIOLATION_REPLACEMENT)
         removed.append((field_label, phrase))
     return removed
+
+
+# ── Rate-card-grounded LTV (Prospect Discovery + Revenue Engine) ────────────
+# Post-audit fix: expected_ltv (Prospect Discovery) and estimated_roi
+# (Revenue Engine, shown on-screen as "Expected LTV" on RevenueEnginePipeline
+# and "Est. ROI" on VoiceOutreachReview) were both GPT-invented rupee
+# figures with zero connection to what the tenant actually charges — same
+# bug, two screens. Dropped from both prompts/schemas entirely; this is the
+# real guarantee, same discipline as _apply_no_service_fit_guard: ground it
+# in the tenant's real revenue_rate_cards price for the prospect's matched
+# service when one exists, or an explicit "pricing not configured" state —
+# never a fabricated number, never a silent blank either.
+
+def _fetch_rate_card_map(user_id: str) -> dict:
+    """{service_key: (price_micros, currency, unit)} for one tenant, fetched
+    once per scan/batch — callers must not call this per-business."""
+    if not user_id:
+        return {}
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT service_key, price_micros, currency, unit FROM revenue_rate_cards WHERE user_id=:uid"
+        ), {"uid": user_id}).fetchall()
+    return {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+
+def _ground_expected_ltv(matched_service_key, rate_card: dict) -> tuple:
+    """Returns (expected_ltv_string_or_None, pricing_configured_bool).
+    None/False whenever there's no real number to show — no matched
+    service (including the "No service fit" case) or no price set for it —
+    rather than ever falling back to an invented figure."""
+    if not matched_service_key:
+        return None, False
+    entry = rate_card.get(matched_service_key)
+    if not entry:
+        return None, False
+    price_micros, currency, unit = entry
+    price = (price_micros or 0) / 1_000_000
+    symbol = "₹" if currency == "INR" else f"{currency} "
+    return f"{symbol}{price:,.0f}/{unit}", True
+
+
+def _cap_closing_probability(raw, opportunity_score) -> str:
+    """closing_probability/estimated_call_success has no real-world signal
+    to ground it in the way rate-card price grounds expected_ltv — same
+    fix Revenue Engine already applies to estimated_call_success via
+    _consistent_closing_estimate (main.py, found a prospect scored
+    Opportunity 0 still showing a 70% closing chance). Caps the GPT-
+    invented percentage to never exceed the prospect's own (possibly
+    guard-adjusted) opportunity_score — a cold prospect can never display a
+    high closing probability, even though the number itself still isn't
+    grounded in anything real."""
+    m = re.search(r'(\d+)', str(raw or ''))
+    if not m:
+        return raw
+    pct = int(m.group(1))
+    ceiling = opportunity_score or 0
+    return f"{min(pct, ceiling)}%"
 
 
 def _voice_effective_call_mode(settings: dict) -> str:
