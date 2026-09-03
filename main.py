@@ -5133,16 +5133,21 @@ def update_lead(
 ):
     # FIX 1 (bug-fix pass): this previously had NO user_id/ownership filter
     # at all — any authenticated user could modify any other tenant's lead —
-    # and accepted any free-text status. Brought in line with the same
-    # "if _uid: filter" convention GET /leads and GET /leads/stats already
-    # use (both correctly scoped), plus a validated status enum matching the
-    # real values used everywhere else (LeadModel default 'New', Leads.jsx's
-    # statusColor map, and _voice_crm_sync's Contacted-only writes).
+    # and accepted any free-text status. Brought in line with a validated
+    # status enum matching the real values used everywhere else (LeadModel
+    # default 'New', Leads.jsx's statusColor map, and _voice_crm_sync's
+    # Contacted-only writes).
+    #
+    # Post-audit fix (tenancy follow-up #2): the ownership filter above was
+    # itself still conditional (`if _uid: filter(...)`) — the exact same
+    # bug already fixed in GET /leads and GET /leads/stats, except here it
+    # was a cross-tenant *mutation*, not just a read: an empty/missing
+    # user_id let a request update ANY tenant's lead status. Unconditional
+    # now, same shape as the GET fix.
     _uid = getattr(request.state, "user_id", "")
-    q = db.query(LeadModel).filter(LeadModel.id == lead_id)
-    if _uid:
-        q = q.filter(LeadModel.user_id == _uid)
-    lead = q.first()
+    if not _uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    lead = db.query(LeadModel).filter(LeadModel.id == lead_id, LeadModel.user_id == _uid).first()
     if not lead:
         # 404 regardless of whether the id doesn't exist or belongs to
         # another tenant — never leak existence across tenants, same
