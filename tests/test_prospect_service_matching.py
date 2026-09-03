@@ -7,13 +7,23 @@ services_offered excluded it. _prospect_gap_and_angle is the one function
 both the on-screen card and the DOCX/Excel export now go through, reusing
 _voice_match_service (Revenue Engine's own enforcement) rather than a
 second, drift-prone implementation.
+
+Follow-up bug, same root cause, one level up: a live scan had every one of
+5 hot prospects pitch "website development" in suggested_opening_line
+despite recommended_service correctly reading "No service fit" on the same
+card — _prospect_gap_and_angle was already right, but nothing stopped GPT
+from inventing a service for the free-text opening line anyway.
+_apply_no_service_fit_guard is the deterministic fix: never trust the
+model to have honored the "No service fit" instruction, overwrite
+regardless, and lower the score too (a prospect this tenant can't act on
+isn't a good prospect for them).
 """
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import _prospect_gap_and_angle
+from main import _prospect_gap_and_angle, _apply_no_service_fit_guard, _PROSPECT_NO_SERVICE_FIT_SCORE_CAP
 
 
 def _evidence(type_, confidence):
@@ -82,3 +92,75 @@ def test_unknown_weakness_code_falls_back_to_the_raw_code_as_label():
     gap, angle = _prospect_gap_and_angle(["some_future_code"], [_evidence("some_future_code", 0.9)], [])
     assert gap == "some_future_code"  # no crash, no fabricated pretty label
     assert angle == "No service fit"
+
+
+# ── _apply_no_service_fit_guard ──────────────────────────────────────────────
+
+def _prospect(recommended_service, opportunity_score=90, suggested_opening_line="Hi! I noticed...", classification="hot"):
+    return {
+        "name": "Test Biz", "recommended_service": recommended_service,
+        "opportunity_score": opportunity_score, "suggested_opening_line": suggested_opening_line,
+        "classification": classification,
+    }
+
+
+def test_the_exact_reported_bug_opening_line_is_cleared_for_no_service_fit():
+    prospects = [_prospect("No service fit", suggested_opening_line="Hi! We can build you a website...")]
+    _apply_no_service_fit_guard(prospects)
+    assert prospects[0]["suggested_opening_line"] == ""
+
+
+def test_score_is_capped_for_no_service_fit():
+    prospects = [_prospect("No service fit", opportunity_score=92)]
+    _apply_no_service_fit_guard(prospects)
+    assert prospects[0]["opportunity_score"] == _PROSPECT_NO_SERVICE_FIT_SCORE_CAP
+    assert prospects[0]["opportunity_score"] < 50  # never HOT (>75) or WARM (50-75) again
+
+
+def test_classification_forced_to_cold_for_no_service_fit():
+    prospects = [_prospect("No service fit", classification="hot")]
+    _apply_no_service_fit_guard(prospects)
+    assert prospects[0]["classification"] == "cold"
+
+
+def test_a_real_matched_service_is_completely_untouched():
+    prospects = [_prospect("Reputation Management", opportunity_score=88, suggested_opening_line="Hi! Real pitch here.")]
+    _apply_no_service_fit_guard(prospects)
+    p = prospects[0]
+    assert p["opportunity_score"] == 88
+    assert p["classification"] == "hot"
+    assert p["suggested_opening_line"] == "Hi! Real pitch here."
+
+
+def test_score_already_below_cap_is_not_raised():
+    # The guard only ever lowers — a prospect GPT already scored low for
+    # its own reasons must not be pulled UP to the cap.
+    prospects = [_prospect("No service fit", opportunity_score=10)]
+    _apply_no_service_fit_guard(prospects)
+    assert prospects[0]["opportunity_score"] == 10
+
+
+def test_mixed_batch_only_no_fit_prospects_are_touched():
+    prospects = [
+        _prospect("No service fit", opportunity_score=95, suggested_opening_line="invented pitch"),
+        _prospect("SEO", opportunity_score=80, suggested_opening_line="real pitch"),
+    ]
+    _apply_no_service_fit_guard(prospects)
+    assert prospects[0]["suggested_opening_line"] == ""
+    assert prospects[0]["classification"] == "cold"
+    assert prospects[1]["suggested_opening_line"] == "real pitch"
+    assert prospects[1]["classification"] == "hot"
+    assert prospects[1]["opportunity_score"] == 80
+
+
+def test_missing_recommended_service_key_is_not_touched_not_a_crash():
+    prospects = [{"name": "No key at all", "opportunity_score": 80}]
+    _apply_no_service_fit_guard(prospects)  # must not raise
+    assert prospects[0]["opportunity_score"] == 80
+    assert "suggested_opening_line" not in prospects[0]
+
+
+def test_empty_prospect_list_is_a_safe_noop():
+    prospects = []
+    _apply_no_service_fit_guard(prospects)
+    assert prospects == []

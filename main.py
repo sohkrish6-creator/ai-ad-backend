@@ -9629,6 +9629,35 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             biz_lines = ""
             for i, p in enumerate(batch):
                 tv = tavily_results.get(p["name"], {})
+                # Post-audit fix: a live scan had every one of 5 hot
+                # prospects pitch "website development" in
+                # suggested_opening_line despite the tenant not offering it
+                # — the card's own recommended_service correctly said "No
+                # service fit", but the prompt still injected that literal
+                # string into the "Recommended Angle" slot as if it were a
+                # real service to weave into a pitch ("...get more customers
+                # through No service fit..."), which is nonsensical, so GPT
+                # fell back to inventing the most visually obvious service
+                # instead. Explicit branch now: when there's genuinely
+                # nothing to pitch, say so plainly and forbid naming ANY
+                # service — never hand GPT a placeholder string and hope it
+                # infers what to do with it. This is defense in depth, not
+                # the actual guarantee: the real guarantee is the
+                # deterministic post-scoring override below, which
+                # overwrites suggested_opening_line regardless of what GPT
+                # does here.
+                if p["sohscape_angle"] == _PROSPECT_NO_SERVICE_FIT:
+                    angle_line = (
+                        "Recommended Angle: NONE — this agency's configured services do not match this business's "
+                        "detected gap. suggested_opening_line for this business must NOT name or imply ANY specific "
+                        "service (no website, no SEO, no social media, no ads, nothing) — write general interest "
+                        "only, mentioning the business by name, never proposing a fix this agency cannot deliver.\n"
+                    )
+                else:
+                    angle_line = (
+                        "Recommended Angle (the ONE service this agency actually offers that fits — reference this specifically, "
+                        "do not suggest a different service): " + p["sohscape_angle"] + "\n"
+                    )
                 biz_lines += (
                     "\n---\n"
                     "Business " + str(i + 1) + ": " + p["name"] + "\n"
@@ -9641,8 +9670,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     "Social Media Intel: " + (tv.get("social") or "no data")[:300] + "\n"
                     "Ads/Marketing Intel: " + (tv.get("ads") or "no data")[:300] + "\n"
                     "Detected Gap (real, already verified — reference this specifically, do not invent a different one): " + p["detected_gap"] + "\n"
-                    "Recommended Angle (the ONE service this agency actually offers that fits — reference this specifically, "
-                    "do not suggest a different service): " + p["sohscape_angle"] + "\n"
+                    + angle_line
                 )
             prompt_base = (
                 "You are a B2B prospect scoring expert for a digital marketing agency in " + search_scope + ".\n"
@@ -9756,9 +9784,11 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
         # before the response gets built and JSON-serialized below.
         del enriched
         for p in prospects:
-            gap, angle = _gap_angle_by_name.get((p.get("name") or "").strip().lower(), ("Not detected", "No service fit"))
+            gap, angle = _gap_angle_by_name.get((p.get("name") or "").strip().lower(), ("Not detected", _PROSPECT_NO_SERVICE_FIT))
             p["weakness_found"] = gap
             p["recommended_service"] = angle
+
+        _apply_no_service_fit_guard(prospects)
 
         # Re-rank across the merged set — each batch only ranked within
         # itself, so the final order/rank must be resolved globally.
@@ -25150,6 +25180,36 @@ def _prospect_gap_and_angle(weaknesses: list, evidence: list, services_offered: 
     _, matched_service_key = _voice_match_service(weaknesses, evidence, services_offered)
     sohscape_angle = _VOICE_SERVICE_LABEL_BY_KEY.get(matched_service_key, "No service fit") if matched_service_key else "No service fit"
     return detected_gap, sohscape_angle
+
+
+_PROSPECT_NO_SERVICE_FIT = "No service fit"
+_PROSPECT_NO_SERVICE_FIT_SCORE_CAP = 25  # solidly COLD (<50) — never HOT/WARM
+
+
+def _apply_no_service_fit_guard(prospects: list) -> None:
+    """Post-audit fix: a live scan had every one of 5 hot prospects pitch
+    'website development' in suggested_opening_line despite the tenant not
+    offering it — the card's own recommended_service correctly said 'No
+    service fit' (computed by _prospect_gap_and_angle above), but GPT still
+    invented a service to weave into the opening line regardless of what
+    the prompt told it. Prompting alone is never a guarantee (a defense-in-
+    depth prompt branch exists at the _score_batch call site too, but this
+    is the actual one): mutates `prospects` in place, unconditionally,
+    after scoring — never trusts GPT to have honored the instruction.
+
+    Also caps opportunity_score and forces classification to 'cold': a
+    score computed purely from the business's own weakness signals doesn't
+    reflect whether THIS tenant can act on it — a prospect whose only real
+    gap maps to a service the tenant doesn't sell isn't a good prospect for
+    them, however real the underlying weakness is. Must run before the
+    final sort/rank so the re-ranking reflects the adjusted, honest score."""
+    for p in prospects:
+        if p.get("recommended_service") != _PROSPECT_NO_SERVICE_FIT:
+            continue
+        p["suggested_opening_line"] = ""
+        if (p.get("opportunity_score") or 0) > _PROSPECT_NO_SERVICE_FIT_SCORE_CAP:
+            p["opportunity_score"] = _PROSPECT_NO_SERVICE_FIT_SCORE_CAP
+        p["classification"] = "cold"
 
 
 def _voice_effective_call_mode(settings: dict) -> str:
