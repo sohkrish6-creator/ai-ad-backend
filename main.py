@@ -6488,6 +6488,25 @@ async def outreach_ai(request: OutreachAIRequest, http_request: Request):
             ),
         }
 
+    # Post-audit fix: this endpoint used to build its GPT context entirely
+    # from generic memory tables with zero awareness of what the calling
+    # tenant actually sells — the same bug already fixed in Prospect
+    # Discovery (a live scan pitched "website development" to every hot
+    # prospect regardless of the tenant's configured services). Block
+    # before any GPT call if nothing is configured, rather than shipping a
+    # generic (or worse, invented-service) draft.
+    _oa_uid = getattr(http_request.state, "user_id", "")
+    _oa_settings = _get_or_create_voice_settings(_oa_uid) if _oa_uid else {}
+    services_offered = _oa_settings.get("services_offered") or []
+    if not services_offered:
+        return {
+            "success":        False,
+            "blocked_reason": "services_not_configured",
+            "message":        "Add your services in Business Profile before generating outreach — Outreach AI needs to know what you actually sell before it can pitch anything.",
+            "settings_url":   "/voice-outreach/settings",
+        }
+    services_offered_line = _voice_services_offered_line(services_offered)
+
     # ── Build rich context string from all tables ────────────────────────────
     _bm   = memory.get("business", {})
     _mm   = memory.get("market",   {})
@@ -6579,7 +6598,6 @@ WEBSITE STATUS:
     # keys stay present either way (this endpoint's frontend consumer reads
     # them directly by key; dropping a key is a bigger API-shape change
     # than redirecting its content, and P0.2 only requires the latter).
-    _oa_uid = getattr(http_request.state, "user_id", "")
     _oa_case_study = get_case_study_for_prompt(_oa_uid, industry)
     if _oa_case_study:
         _oa_cs_text = _format_case_study_for_prompt(_oa_case_study)
@@ -6596,6 +6614,11 @@ WEBSITE STATUS:
     # ── GPT-4o ───────────────────────────────────────────────────────────────
     prompt = f"""You are a senior B2B sales copywriter specialising in Indian market outreach for digital marketing agencies.
 Generate a complete, personalised outreach kit based on the business context below. Every message must feel written for a real human, not a template.
+
+Services the sender actually offers — ONLY ever pitch, propose, or offer to do work from this exact list, NEVER
+mention, imply, or offer to do ANY other kind of work (no website builds, no SEO, no ad management, no social
+media management, nothing outside this list) anywhere in ANY field below:
+{services_offered_line}
 
 {context}
 
@@ -6677,6 +6700,38 @@ RULES:
     except Exception as _e:
         logger.error(f"[OUTREACH-AI] GPT call failed: {_e}")
         return {"success": False, "error": "Could not generate outreach scripts right now — please try again."}
+
+    # Post-audit fix: prompting alone is never a guarantee GPT respects the
+    # services constraint above — same lesson as Prospect Discovery's
+    # _apply_no_service_fit_guard. One retry naming the exact violating
+    # phrase(s), then a deterministic field-level override if it still
+    # slips through — never ship an invented pitch either way.
+    _oa_violations = _outreach_offered_service_violations(outreach, services_offered)
+    if _oa_violations:
+        _oa_violation_desc = "; ".join(f"{label} said {phrase!r}" for _, label, phrase in _oa_violations)
+        logger.warning(f"[OUTREACH-AI] service-fit violation, retrying once: {_oa_violation_desc}")
+
+        def _build_messages_corrected(correction):
+            msgs = _build_messages(correction)
+            msgs.append({"role": "user", "content": (
+                f"Your previous response named a service outside what the sender actually offers "
+                f"({services_offered_line}): {_oa_violation_desc}. Rewrite the ENTIRE JSON object — every "
+                "field must stay strictly within the offered services list, or stay generic with no "
+                "specific service named at all."
+            )})
+            return msgs
+
+        try:
+            outreach = await _call_gpt_json_with_retry(
+                _build_messages_corrected, model="gpt-4o", max_tokens=2800, temperature=0.5, retries=1,
+                label="outreach AI (service-fit retry)",
+            )
+        except Exception as _e:
+            logger.error(f"[OUTREACH-AI] service-fit retry GPT call failed: {_e} — deterministic guard will neutralize the original violations instead")
+
+        _oa_removed = _apply_outreach_service_fit_guard(outreach, services_offered)
+        if _oa_removed:
+            logger.warning(f"[OUTREACH-AI] service-fit guard neutralized after retry: {_oa_removed}")
 
     save_to_memory("outreach", norm_key, {"outreach_data": outreach})
     logger.info(f"[OUTREACH-AI] Done: key={norm_key!r} confidence={outreach.get('confidence')}")
@@ -24486,8 +24541,7 @@ async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str
     # Instagram drafts as "your site is down").
     real_evidence = _real_weakness_evidence(weaknesses, evidence)
     weakness_lines = "\n".join(f"- {e['type']}: {e['value']} (confidence {e['confidence']})" for e in real_evidence) or "- none detected"
-    offered_labels = [lbl for k, lbl in _VOICE_SERVICE_CATALOG if k in services_offered]
-    services_line = ", ".join(offered_labels) if offered_labels else "(no services configured — every draft must stay generic and not name a specific service)"
+    services_line = _voice_services_offered_line(services_offered)
     if matched_service:
         matched_label = dict(_VOICE_SERVICE_CATALOG).get(matched_service, matched_service)
         focus_line = (
@@ -25153,6 +25207,15 @@ def _voice_match_service(weaknesses: list, evidence: list, services_offered: lis
 _VOICE_SERVICE_LABEL_BY_KEY = dict(_VOICE_SERVICE_CATALOG)
 
 
+def _voice_services_offered_line(services_offered: list) -> str:
+    """Shared by every outreach-drafting prompt (_revenue_generate_outreach_drafts,
+    outreach_ai) that needs to tell GPT exactly what the tenant sells — one
+    place so the "ONLY ever pitch from this exact list" instruction can't
+    drift between call sites."""
+    offered_labels = [lbl for k, lbl in _VOICE_SERVICE_CATALOG if k in services_offered]
+    return ", ".join(offered_labels) if offered_labels else "(no services configured — every draft must stay generic and not name a specific service)"
+
+
 def _prospect_gap_and_angle(weaknesses: list, evidence: list, services_offered: list) -> tuple:
     """Post-audit fix: Prospect Discovery used to let GPT invent both the
     'detected gap' and the recommended service from scratch, unconstrained
@@ -25210,6 +25273,141 @@ def _apply_no_service_fit_guard(prospects: list) -> None:
         if (p.get("opportunity_score") or 0) > _PROSPECT_NO_SERVICE_FIT_SCORE_CAP:
             p["opportunity_score"] = _PROSPECT_NO_SERVICE_FIT_SCORE_CAP
         p["classification"] = "cold"
+
+
+# ── Outreach AI service-fit guard ────────────────────────────────────────────
+# Post-audit fix, same bug class and same discipline as
+# _apply_no_service_fit_guard above, applied to outreach_ai() (standalone
+# /outreach-ai). Unlike Prospect Discovery — where the pitch lives in one
+# structured field (recommended_service / suggested_opening_line) — this
+# endpoint's output is a multi-field free-text kit (email, WhatsApp,
+# LinkedIn, Instagram, call script, proposal opener), so there is no single
+# slot to override. Phrases below are deliberately offer-shaped ("build you
+# a website", "run your ads") rather than bare nouns ("website", "ads") —
+# a bare-noun match would also strip legitimate pain-point framing (e.g.
+# "I noticed your website has no clear CTA", which is a real, honest
+# observation, not a pitch for a service the tenant doesn't sell).
+_OUTREACH_SERVICE_OFFER_PHRASES = {
+    "website_development": (
+        "build you a website", "build your website", "building your website",
+        "web development", "website development", "design your website",
+        "redesign your website", "a new website for", "developing a website",
+        "building a website", "get you a website", "website for your business",
+    ),
+    "seo": (
+        "seo services", "search engine optimization", "improve your seo",
+        "boost your google ranking", "rank higher on google", "organic search traffic",
+    ),
+    "paid_ads": (
+        "run ads for you", "run your ads", "google ads campaign", "meta ads campaign",
+        "facebook ads campaign", "instagram ads campaign", "paid ad campaign", "ppc campaign",
+    ),
+    "social_media_management": (
+        "manage your social media", "manage your instagram", "manage your facebook",
+        "social media management", "handle your social media", "run your social media",
+    ),
+    "content_creation": (
+        "content creation for you", "shoot your reels", "produce your reels",
+        "photography and videography", "create your content",
+    ),
+    "influencer_marketing": (
+        "influencer marketing", "influencer campaign", "connect you with influencers",
+    ),
+    "reputation_management": (
+        "reputation management", "manage your reviews", "review management",
+    ),
+    "email_marketing": (
+        "email marketing", "email campaigns for you", "build your email list",
+    ),
+}
+
+# (top-level key, sub-key) pairs covering every free-text field in
+# outreach_ai()'s response schema, excluding "why_it_works"/"confidence"
+# meta-fields which never carry a pitch themselves.
+_OUTREACH_TEXT_FIELDS = [
+    ("cold_email", "subject"), ("cold_email", "body"), ("cold_email", "ps_line"),
+    ("linkedin_message", "connection_request"), ("linkedin_message", "follow_up_message"),
+    ("whatsapp", "message_1_pain"), ("whatsapp", "message_2_proof"),
+    ("whatsapp", "follow_up_day3"), ("whatsapp", "follow_up_day7"),
+    ("instagram_dm", "opener"), ("instagram_dm", "follow_up"),
+    ("call_script", "opener_10sec"), ("call_script", "pain_question"),
+    ("call_script", "value_statement"), ("call_script", "close"),
+    ("follow_up_sequence", "day1"), ("follow_up_sequence", "day3"),
+    ("follow_up_sequence", "day7"), ("follow_up_sequence", "day14"),
+]
+
+_OUTREACH_VIOLATION_REPLACEMENT = "(removed — referenced a service outside this agency's configured offering)"
+
+
+def _outreach_offered_service_violations(outreach: dict, services_offered: list) -> list:
+    """Deterministic scan — never trusts GPT's own adherence to the prompt's
+    service constraint. Returns [(setter, field_label, matched_phrase), ...]
+    for every free-text field that names a service NOT in services_offered
+    via an offer-shaped phrase. `setter(new_value)` mutates `outreach` in
+    place to replace just that field."""
+    offered = set(services_offered or [])
+
+    def _match(text_val):
+        low = (text_val or "").lower()
+        for service_key, phrases in _OUTREACH_SERVICE_OFFER_PHRASES.items():
+            if service_key in offered:
+                continue
+            for phrase in phrases:
+                if phrase in low:
+                    return phrase
+        return None
+
+    violations = []
+
+    for top, sub in _OUTREACH_TEXT_FIELDS:
+        block = outreach.get(top)
+        if not isinstance(block, dict):
+            continue
+        val = block.get(sub)
+        if not isinstance(val, str):
+            continue
+        phrase = _match(val)
+        if phrase:
+            def _setter(new_val, _block=block, _sub=sub):
+                _block[_sub] = new_val
+            violations.append((_setter, f"{top}.{sub}", phrase))
+
+    prop = outreach.get("proposal_opener")
+    if isinstance(prop, str):
+        phrase = _match(prop)
+        if phrase:
+            def _setter(new_val, _outreach=outreach):
+                _outreach["proposal_opener"] = new_val
+            violations.append((_setter, "proposal_opener", phrase))
+
+    obj_list = outreach.get("objection_handling")
+    if isinstance(obj_list, list):
+        for i, item in enumerate(obj_list):
+            if not isinstance(item, dict):
+                continue
+            val = item.get("response")
+            if not isinstance(val, str):
+                continue
+            phrase = _match(val)
+            if phrase:
+                def _setter(new_val, _item=item):
+                    _item["response"] = new_val
+                violations.append((_setter, f"objection_handling[{i}].response", phrase))
+
+    return violations
+
+
+def _apply_outreach_service_fit_guard(outreach: dict, services_offered: list) -> list:
+    """Mutates `outreach` in place, replacing any field that names an
+    unsold service with a safe generic placeholder instead of shipping an
+    invented pitch. Returns the list of (field_label, matched_phrase)
+    actually neutralized, for logging — empty list means nothing to fix."""
+    violations = _outreach_offered_service_violations(outreach, services_offered)
+    removed = []
+    for setter, field_label, phrase in violations:
+        setter(_OUTREACH_VIOLATION_REPLACEMENT)
+        removed.append((field_label, phrase))
+    return removed
 
 
 def _voice_effective_call_mode(settings: dict) -> str:
