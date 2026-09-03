@@ -5092,20 +5092,25 @@ def add_lead(request: Request, lead: LeadCreate, db: Session = Depends(get_db)):
 
 @app.get("/leads")
 def get_leads(request: Request, db: Session = Depends(get_db)):
+    # Post-audit fix: was `if _uid: filter(...)` — an empty/missing user_id
+    # (a JWT that decodes but carries no `sub`, or any future auth-middleware
+    # regression) silently returned every tenant's leads instead of none.
+    # Unconditional now: no real user_id, no data. PUT /leads/{lead_id} has
+    # the identical conditional-filter pattern and was flagged separately —
+    # not fixed here, out of scope for this specific change.
     _uid = getattr(request.state, "user_id", "")
-    q = db.query(LeadModel).order_by(LeadModel.id.desc())
-    if _uid:
-        q = q.filter(LeadModel.user_id == _uid)
-    leads = q.all()
+    if not _uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    leads = db.query(LeadModel).filter(LeadModel.user_id == _uid).order_by(LeadModel.id.desc()).all()
     return {"leads": [{"id": l.id, "name": l.name, "phone": l.phone, "email": l.email, "source": l.source, "message": l.message, "status": l.status, "created_at": l.created_at} for l in leads], "total": len(leads)}
 
 @app.get("/leads/stats")
 def get_stats(request: Request, db: Session = Depends(get_db)):
+    # Post-audit fix: same unconditional-filter fix as GET /leads above.
     _uid = getattr(request.state, "user_id", "")
-    q = db.query(LeadModel)
-    if _uid:
-        q = q.filter(LeadModel.user_id == _uid)
-    leads = q.all()
+    if not _uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    leads = db.query(LeadModel).filter(LeadModel.user_id == _uid).all()
     return {"total": len(leads), "whatsapp": len([l for l in leads if l.source == "whatsapp"]), "website": len([l for l in leads if l.source == "website"]), "form": len([l for l in leads if l.source == "form"]), "new": len([l for l in leads if l.status == "New"]), "converted": len([l for l in leads if l.status == "Converted"])}
 
 @app.put("/leads/{lead_id}")
