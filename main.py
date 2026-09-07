@@ -9635,6 +9635,7 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
             # calls internally, just kept this time.
             _, matched_service_key = _voice_match_service(weaknesses, evidence, services_offered)
             p["weaknesses"] = weaknesses
+            p["evidence"] = evidence
             p["detected_gap"] = detected_gap
             p["sohscape_angle"] = sohscape_angle
             p["matched_service_key"] = matched_service_key
@@ -9664,6 +9665,48 @@ async def prospect_discovery(request: ProspectDiscoveryRequest):
                     "social": social_data[i] if isinstance(social_data[i], str) else "",
                     "ads":    ads_data[i]    if isinstance(ads_data[i],    str) else "",
                 }
+
+        # 3b. Post-audit fix: weak_social_presence — deterministic, not a
+        # GPT judgement call. Definition: this business's own Tavily social
+        # search ("{name} {city} Instagram Facebook social media", the same
+        # call already made above for GPT scoring context, zero extra API
+        # cost) contains NO real profile link matched by
+        # _sie_extract_social_links (the same regex used for
+        # no_social_links_on_website, applied here to Tavily's search-result
+        # text instead of the business's own homepage HTML) — i.e. even a
+        # targeted external search turns up no findable social profile.
+        #
+        # An empty Tavily result is NOT treated as a confirmed negative — it
+        # is indistinguishable from a failed/empty API call (fetch_tavily
+        # returns "" either way), so it's skipped, not scored, same
+        # discipline as site_unverifiable. Only fires when Tavily was
+        # actually configured and actually returned something to check.
+        if TAVILY_API_KEY:
+            for p in enriched:
+                social_text = tavily_results.get(p["name"], {}).get("social") or ""
+                if not social_text:
+                    continue
+                if _sie_extract_social_links(social_text):
+                    continue
+                p["weaknesses"].append("weak_social_presence")
+                p["evidence"].append({
+                    "type": "weak_social_presence",
+                    "value": (
+                        f"no Instagram/Facebook/LinkedIn/YouTube profile link found in Tavily search results "
+                        f"for '{p['name']} {search_scope} Instagram Facebook social media'"
+                    ),
+                    "confidence": 0.6, "page": "tavily_social_search",
+                    "detected_at": datetime.utcnow().isoformat(),
+                })
+                # Re-derive now that a new weakness signal is available —
+                # this weakness was found AFTER the first gap/angle pass
+                # above ran (it needs Tavily data, which wasn't fetched
+                # yet at that point).
+                detected_gap, sohscape_angle = _prospect_gap_and_angle(p["weaknesses"], p["evidence"], services_offered)
+                _, matched_service_key = _voice_match_service(p["weaknesses"], p["evidence"], services_offered)
+                p["detected_gap"] = detected_gap
+                p["sohscape_angle"] = sohscape_angle
+                p["matched_service_key"] = matched_service_key
 
         # 4. Score in parallel batches of up to 8 businesses per GPT-4o call
         # instead of one single call for all of them — scoring 50 in one
@@ -23310,6 +23353,17 @@ def _detect_voice_weaknesses(prospect: dict, fetch_result: dict) -> tuple:
             if not any(p in html_lower for p in _VOICE_CTA_PHRASES):
                 _add("no_cta", "no recognizable call-to-action phrase found on homepage", 0.55, "homepage")
 
+            # Post-audit fix: a business with a working, well-built website
+            # used to read as "no detected gaps" even with zero social
+            # presence, because no signal here ever checked for it. Reuses
+            # _sie_extract_social_links (built for Social Intelligence
+            # Engine, same regex, no GPT) against the SAME homepage HTML
+            # already fetched above — zero extra network cost. Deterministic:
+            # a real Instagram/Facebook/LinkedIn/YouTube profile link either
+            # is or isn't present in the page source.
+            if not _sie_extract_social_links(html):
+                _add("no_social_links_on_website", "no Instagram/Facebook/LinkedIn/YouTube profile link found anywhere in the homepage HTML", 0.65, "homepage")
+
     return weaknesses, evidence
 
 
@@ -23347,6 +23401,7 @@ _VOICE_NEED_WEIGHTS = {
     "no_website": 30, "site_unreachable": 25, "poor_reviews": 25,
     "inactive_listing": 20, "low_review_count": 15, "missing_tracking": 15,
     "weak_seo_title": 10, "weak_seo_meta": 10, "no_cta": 10,
+    "no_social_links_on_website": 15, "weak_social_presence": 10,
 }
 
 
@@ -25185,10 +25240,23 @@ _VOICE_WEAKNESS_SERVICE_MAP = {
     "missing_tracking": "paid_ads",
     "weak_seo_title": "seo",
     "weak_seo_meta": "seo",
-    "no_cta": "content_creation",
+    # Post-audit fix: no_cta ("no call-to-action phrase found on homepage")
+    # used to map to content_creation — but this tenant's content_creation
+    # means reels/photography/videography, and a missing homepage CTA has
+    # nothing to do with any of those. It's a site-copy/conversion issue,
+    # the same category as no_website/site_unreachable — remapped there.
+    # A wrong mapping produces a wrong pitch, not just an imprecise one.
+    "no_cta": "website_development",
     "poor_reviews": "reputation_management",
     "low_review_count": "reputation_management",
     "inactive_listing": "social_media_management",
+    # Post-audit fix: neither of these existed before — a business with a
+    # working website and decent reviews used to read as "no detected
+    # gaps" even with zero real social presence, because nothing checked
+    # for it. See _detect_voice_weaknesses (website HTML) and
+    # prospect_discovery's post-Tavily pass (external search visibility).
+    "no_social_links_on_website": "social_media_management",
+    "weak_social_presence": "social_media_management",
 }
 
 # Human-readable labels for the same weakness codes — mirrors
@@ -25201,6 +25269,7 @@ _VOICE_WEAKNESS_LABELS = {
     "inactive_listing": "Inactive Listing", "missing_tracking": "No Ad Tracking",
     "weak_seo_meta": "Weak SEO Meta", "weak_seo_title": "Weak SEO Title", "no_cta": "No Clear CTA",
     "site_unreachable": "Site Unreachable",
+    "no_social_links_on_website": "No Social Links On Site", "weak_social_presence": "Weak Social Presence",
 }
 
 
