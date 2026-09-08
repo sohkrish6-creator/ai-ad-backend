@@ -23687,6 +23687,24 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
     (main.py _score_batch) but keyed to this module's own fields."""
     biz_lines = ""
     for i, p in enumerate(batch):
+        # Post-audit fix: the Hot/Warm/Cold tabs (ported from legacy
+        # Prospect Discovery) show a per-prospect suggested_opening_line —
+        # new surface area on this prompt, so it gets the exact same
+        # defense-in-depth treatment already proven necessary there: never
+        # hand GPT a placeholder and hope, tell it explicitly whether a
+        # real service fit exists and forbid inventing one when it doesn't.
+        # _apply_revenue_no_service_fit_guard below is the actual
+        # guarantee, not this instruction alone.
+        angle = p.get("matched_service_label")
+        angle_line = (
+            f"Recommended angle (the ONE service this agency actually offers that fits — reference this "
+            f"specifically in suggested_opening_line, do not suggest a different service): {angle}\n"
+            if angle else
+            "Recommended angle: NONE — this agency's configured services do not match this business's detected "
+            "gap. suggested_opening_line for this business must NOT name or imply ANY specific service — write "
+            "general interest only, mentioning the business by name, never proposing a fix this agency cannot "
+            "deliver.\n"
+        )
         biz_lines += (
             "\n---\n"
             f"Business {i + 1}: {p['business_name']}\n"
@@ -23697,6 +23715,7 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
             f"Status: {p['business_status'] or 'unknown'}\n"
             f"Detected weaknesses (REAL, already verified — do not add others): "
             f"{', '.join(p['weaknesses']) or 'none detected'}\n"
+            + angle_line
         )
 
     def _build_messages(correction):
@@ -23717,6 +23736,8 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
             "- estimated_call_success: a realistic percentage string for how likely this business is to answer "
             "and meaningfully engage with a cold outreach call, based on its type/size/data completeness.\n"
             "- reason: ONE specific sentence citing this business's actual detected weakness(es) — never generic.\n"
+            "- suggested_opening_line: a short (under 250 characters), specific opening line for a first cold "
+            "outreach touch — follow that business's own 'Recommended angle' line above exactly.\n"
             + (f"\n{correction}\n" if correction else "") +
             "\nReturn JSON:\n"
             "{\n"
@@ -23727,7 +23748,8 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
             '      "business_score": 60,\n'
             '      "priority": "high",\n'
             '      "reason": "specific sentence citing a real detected weakness",\n'
-            '      "estimated_call_success": "45%"\n'
+            '      "estimated_call_success": "45%",\n'
+            '      "suggested_opening_line": "Hi [Name], I noticed ... — following the Recommended angle above"\n'
             "    }\n"
             "  ]\n"
             "}\n"
@@ -23740,6 +23762,28 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
         label="voice-outreach batch scoring",
     )
     return _fix_rs(result.get("prospects", []))
+
+
+def _apply_revenue_no_service_fit_guard(scores_by_name: dict, to_scan: list) -> None:
+    """Same discipline, same bug class as Prospect Discovery's
+    _apply_no_service_fit_guard — different field names (matched_service_label
+    vs recommended_service's string sentinel), same guarantee: never trust
+    GPT to have honored the "stay generic" prompt instruction above on its
+    own. _compute_recommendation already forces IGNORE for a no-fit
+    prospect regardless of score (existing, unrelated guard, for
+    actionability), but the new Hot/Warm/Cold tabs display opportunity_score/
+    priority directly — without this, a no-fit prospect could still render
+    as misleadingly "Hot". Mutates scores_by_name's dict values in place."""
+    for p in to_scan:
+        if p.get("matched_service_label"):
+            continue  # a real service fit — GPT is allowed to be specific
+        score = scores_by_name.get(p["business_name"])
+        if not score:
+            continue
+        score["suggested_opening_line"] = ""
+        if (score.get("opportunity_score") or 0) > _PROSPECT_NO_SERVICE_FIT_SCORE_CAP:
+            score["opportunity_score"] = _PROSPECT_NO_SERVICE_FIT_SCORE_CAP
+        score["priority"] = "low"
 
 
 # Fix 4 (bug-fix pass): common global chain/hotel-brand keywords — a small,
@@ -23821,6 +23865,25 @@ _QUICK_SCAN_CACHE_DAYS = int(os.getenv("QUICK_SCAN_CACHE_DAYS", "7"))
 _QUICK_SCAN_CONCURRENCY = int(os.getenv("QUICK_SCAN_CONCURRENCY", "5"))
 
 
+def _revenue_previously_discovered_place_ids(user_id: str, industry: str, city: str) -> set:
+    """Revenue Engine's own 'Find More' de-dup — same purpose as Prospect
+    Discovery's _prospect_get_previously_discovered_place_ids, reading from
+    voice_prospects/voice_batches (Revenue Engine's own store) instead of
+    prospect_scan_history, which Revenue Engine scans never write to. Every
+    place_id ever surfaced for this tenant+industry+city across past
+    Revenue Engine batches, so re-running Discover for the same segment
+    only re-fetches Details for genuinely new businesses — Text Search
+    itself has no dedup, so without this "Find More" would just return the
+    same handful of results again."""
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT vp.place_id FROM voice_prospects vp JOIN voice_batches vb ON vb.id = vp.batch_id "
+            "WHERE vp.user_id=:uid AND vb.channel='revenue_engine' AND vb.industry=:industry AND vb.city=:city "
+            "AND vp.place_id IS NOT NULL AND vp.place_id != ''"
+        ), {"uid": user_id, "industry": industry, "city": city or ""}).fetchall()
+    return {r[0] for r in rows}
+
+
 def _quick_scan_cache_lookup(user_id: str, place_ids: list) -> dict:
     """Revenue Engine only: the most recent row per place_id (any channel —
     a business's own weaknesses don't depend on which module scanned it)
@@ -23879,8 +23942,22 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                     seen_place_ids.add(pid)
                 raw_places.append(p)
 
+        # "Find More" de-dup, Revenue Engine only — Text Search itself has
+        # no memory of past scans, so without this a re-run for the same
+        # industry+city would just return the same businesses again.
+        already_discovered_count = 0
+        if channel == "revenue_engine":
+            already_seen = _revenue_previously_discovered_place_ids(user_id, industry, city or "")
+            if already_seen:
+                before = len(raw_places)
+                raw_places = [p for p in raw_places if p.get("place_id") not in already_seen]
+                already_discovered_count = before - len(raw_places)
+
         total_found = len(raw_places)
-        _voice_batch_update(batch_id, current_step="Enriching business details", progress_pct=20, total_found=total_found)
+        _voice_batch_update(
+            batch_id, current_step="Enriching business details", progress_pct=20,
+            total_found=total_found, already_discovered_count=already_discovered_count,
+        )
 
         top_places = raw_places[:max_prospects]
         places_with_id = [p for p in top_places if p.get("place_id")]
@@ -23920,13 +23997,23 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             with engine.begin() as conn:
                 conn.execute(text(
                     "INSERT INTO voice_prospects (batch_id, user_id, place_id, business_name, address, "
-                    "phone_raw, website, google_rating, total_reviews, business_status, approval_status, "
+                    "phone_raw, phone_e164, website, google_rating, total_reviews, business_status, approval_status, "
                     "filter_reason, created_at, updated_at) "
-                    "VALUES (:batch_id, :user_id, :place_id, :business_name, :address, :phone_raw, :website, "
+                    "VALUES (:batch_id, :user_id, :place_id, :business_name, :address, :phone_raw, :phone_e164, :website, "
                     ":google_rating, :total_reviews, :business_status, 'filtered', :filter_reason, :ts, :ts)"
                 ), [{
                     "batch_id": batch_id, "user_id": user_id, "place_id": p["place_id"],
                     "business_name": p["business_name"], "address": p["address"], "phone_raw": p["phone_raw"],
+                    # Post-audit fix: this INSERT never computed phone_e164 at all —
+                    # every enterprise/chain-filtered prospect (still shown in the
+                    # Pipeline list, approval_status='filtered' is visible-not-hidden
+                    # by design) permanently displayed "No phone number" regardless
+                    # of what Google actually returned, because the WhatsApp
+                    # eligibility check reads phone_e164, not phone_raw. A "hotels"
+                    # search is close to worst-case for this — Jaipur alone surfaces
+                    # several _VOICE_CHAIN_BRAND_KEYWORDS-listed chains (Taj, ITC,
+                    # Marriott, Hyatt...) plus heavy generic-name collisions.
+                    "phone_e164": _normalize_phone_e164(p["phone_raw"]),
                     "website": p["website"], "google_rating": p["google_rating"], "total_reviews": p["total_reviews"],
                     "business_status": p["business_status"], "filter_reason": p["filter_reason"], "ts": ts_f,
                 } for p in filtered_out])
@@ -23951,6 +24038,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         )
 
         _voice_batch_update(batch_id, current_step="Detecting weaknesses", progress_pct=45)
+        services_offered = settings.get("services_offered") or []
         for i, p in enumerate(to_scan):
             fetch_result = homepages[i] if isinstance(homepages[i], dict) else _empty_fetch
             weaknesses, evidence = _detect_voice_weaknesses(p, fetch_result)
@@ -23959,6 +24047,17 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             if channel == "revenue_engine":
                 p["signals"] = _quick_scan_extra_signals(p, fetch_result, weaknesses)
                 p["scanned_at"] = datetime.utcnow().isoformat()
+                # Post-audit fix: computed early (before scoring, not just at
+                # row-build time below) so the scoring prompt itself can be
+                # constrained to it — see _score_voice_prospect_batch's new
+                # matched_service_label param and _apply_revenue_no_service_fit_guard.
+                # _voice_match_service is pure/cheap (no GPT, no I/O); the
+                # row-build loop below still recomputes it independently as
+                # the canonical source for the stored columns — this earlier
+                # call is additive, not a replacement.
+                _mw, _ms = _voice_match_service(weaknesses, evidence, services_offered)
+                p["matched_weakness"] = _mw
+                p["matched_service_label"] = _VOICE_SERVICE_LABEL_BY_KEY.get(_ms) if _ms else None
 
         for p in enriched:
             c = cache_hits.get(p["place_id"])
@@ -23975,13 +24074,14 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             *[_score_voice_prospect_batch(industry, search_scope, b) for b in score_batches]
         ) if to_scan else []
         scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
+        if channel == "revenue_engine":
+            _apply_revenue_no_service_fit_guard(scores_by_name, to_scan)
 
         _voice_batch_update(batch_id, current_step="Normalizing phone numbers & compliance gates", progress_pct=80)
 
         rows = []
         total_qualified = 0
         ts = datetime.utcnow().isoformat()
-        services_offered = settings.get("services_offered") or []
         # Post-audit fix: estimated_roi used to be a GPT-invented rupee
         # figure carried straight through from `score`/`cached` — same bug
         # as Prospect Discovery's expected_ltv (see _ground_expected_ltv),
@@ -24029,13 +24129,14 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "service_fit": matched_service is not None,
                 "created_at": ts, "updated_at": ts,
                 "channel": channel, "signals_json": None, "need_score": None,
-                "recommendation": None, "scanned_at": None,
+                "recommendation": None, "scanned_at": None, "suggested_opening_line": None,
             }
             if channel == "revenue_engine":
                 row["signals_json"] = json.dumps(p.get("signals") or {})
                 row["need_score"] = _compute_need_score(p["weaknesses"], p["evidence"])
                 row["recommendation"] = _compute_recommendation(priority_capped, gate["blocked"], row["service_fit"])
                 row["scanned_at"] = p.get("scanned_at") or ts
+                row["suggested_opening_line"] = score.get("suggested_opening_line") or ""
             rows.append(row)
 
         _voice_batch_update(batch_id, current_step="Saving prospects", progress_pct=92)
@@ -24048,14 +24149,14 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                     "estimated_call_success, weaknesses_json, evidence_json, dnc_status, cooldown_status, "
                     "missing_phone, gate_blocked, gate_block_reasons_json, matched_weakness, matched_service, "
                     "service_fit, created_at, updated_at, channel, signals_json, need_score, recommendation, "
-                    "scanned_at) "
+                    "scanned_at, suggested_opening_line) "
                     "VALUES (:batch_id, :user_id, :place_id, :business_name, :address, "
                     ":phone_raw, :phone_e164, :website, :google_rating, :total_reviews, :business_status, "
                     ":opportunity_score, :business_score, :confidence_score, :priority, :reason, :estimated_roi, "
                     ":estimated_call_success, :weaknesses_json, :evidence_json, :dnc_status, :cooldown_status, "
                     ":missing_phone, :gate_blocked, :gate_block_reasons_json, :matched_weakness, :matched_service, "
                     ":service_fit, :created_at, :updated_at, :channel, :signals_json, :need_score, "
-                    ":recommendation, :scanned_at)"
+                    ":recommendation, :scanned_at, :suggested_opening_line)"
                 ), rows)
 
         finished = datetime.utcnow().isoformat()
@@ -24283,7 +24384,7 @@ async def voice_outreach_build_batch(payload: VoiceBatchBuildRequest, request: R
 
 _VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "status", "progress_pct",
                      "current_step", "total_found", "total_qualified", "error", "started_at",
-                     "finished_at", "created_at", "channel", "goal_json"]
+                     "finished_at", "created_at", "channel", "goal_json", "already_discovered_count"]
 
 _VOICE_PROSPECT_COLS = [
     "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
@@ -24295,7 +24396,7 @@ _VOICE_PROSPECT_COLS = [
     "created_at", "updated_at", "rescore_note", "filter_reason",
     "matched_weakness", "matched_service", "service_fit",
     "channel", "signals_json", "need_score", "recommendation", "scanned_at",
-    "last_outcome", "last_outcome_at",
+    "last_outcome", "last_outcome_at", "suggested_opening_line",
 ]
 
 
@@ -25116,6 +25217,11 @@ for _vtbl, _vcol, _vtype in [
     # unchanged by this addition.
     ("voice_batches", "channel", "TEXT DEFAULT 'voice'"),
     ("voice_batches", "goal_json", "TEXT"),
+    # "Find More" de-dup count (Revenue Engine only, see
+    # _revenue_previously_discovered_place_ids) — how many raw Text Search
+    # results this run excluded as already-seen for this industry+city,
+    # mirrors legacy Prospect Discovery's already_discovered_count.
+    ("voice_batches", "already_discovered_count", "INTEGER DEFAULT 0"),
     ("voice_prospects", "channel", "TEXT DEFAULT 'voice'"),
     # Extra Quick Scan signals (mobile-friendly/HTTPS/tracking) that Voice
     # Outreach's own weakness taxonomy never needed — kept in a separate
@@ -25136,6 +25242,12 @@ for _vtbl, _vcol, _vtype in [
     # already actioned without a separate "actioned" table.
     ("voice_prospects", "last_outcome", "TEXT"),
     ("voice_prospects", "last_outcome_at", "TEXT"),
+    # Revenue Engine's own scoring call now produces this directly (see
+    # _score_voice_prospect_batch / _apply_revenue_no_service_fit_guard) —
+    # the Hot/Warm/Cold tabs port from legacy Prospect Discovery need a
+    # per-prospect opening line, and this reuses the existing scoring GPT
+    # call rather than adding a second one.
+    ("voice_prospects", "suggested_opening_line", "TEXT"),
 ]:
     try:
         with engine.begin() as _vmc:
