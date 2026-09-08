@@ -23570,6 +23570,19 @@ def _get_or_create_voice_settings(user_id: str) -> dict:
     return _get_or_create_voice_settings(user_id)
 
 
+def _whatsapp_eligibility(user_id: str, phone_e164: Optional[str], last_outcome_at: Optional[str], settings: dict) -> tuple:
+    """Live WhatsApp bulk-send eligibility — phone present, not on the DNC
+    list, not within the cooldown window. Deliberately passes last_outcome_at
+    (the real, actively-written contact signal) into _voice_check_gates'
+    last_contacted_at parameter rather than voice_prospects.last_contacted_at
+    itself, which nothing in this codebase ever writes — using it here would
+    make the cooldown check a permanent no-op. Returns (eligible, reason)."""
+    gate = _voice_check_gates(user_id, phone_e164, last_outcome_at, settings)
+    if not gate["blocked"]:
+        return True, None
+    return False, gate["reasons"][0]
+
+
 def _voice_check_gates(user_id: str, phone_e164: Optional[str], last_contacted_at: Optional[str], settings: dict) -> dict:
     """The single gate-checking function — called BOTH when a batch is built
     (writing a snapshot into voice_prospects.gate_blocked) AND again, freshly,
@@ -24374,6 +24387,17 @@ async def voice_outreach_get_batch(batch_id: str, request: Request):
         ), {"id": batch_id, "uid": uid}).fetchall()
         prospects = [_voice_parse_prospect_row(r) for r in prospect_rows]
 
+        # Post-audit fix: live WhatsApp-send eligibility, additive fields —
+        # the bulk WhatsApp outreach flow's "ineligible rows visibly
+        # disabled with reason" needs this computed fresh (DNC list can
+        # change, cooldown is time-based), not read off a stale snapshot.
+        if prospects:
+            _wa_settings = _get_or_create_voice_settings(uid)
+            for p in prospects:
+                p["whatsapp_eligible"], p["whatsapp_ineligible_reason"] = _whatsapp_eligibility(
+                    uid, p.get("phone_e164"), p.get("last_outcome_at"), _wa_settings
+                )
+
     return {"success": True, "batch": batch, "prospects": prospects}
 
 
@@ -24670,7 +24694,7 @@ async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str
             "generator that already exists — do not include one here):\n"
             "{\n"
             '  "cold_email": {"subject": "...", "body": "..."},\n'
-            f'  "whatsapp": {{"message_1": "opening pain-point message", "message_2": "{_rd_message2_instruction}"}},\n'
+            f'  "whatsapp": {{"message_1": "First-contact WhatsApp opener — MUST explicitly name the specific real detected weakness listed above in plain natural language (e.g. mention the missing website, the low review count, whichever is real for THIS business) — a generic greeting that could be sent to any business unchanged is a failure. Keep it SHORT: well under 400 characters total, 3-4 lines, end with a soft question or a simple next step.", "message_2": "{_rd_message2_instruction}"}},\n'
             '  "linkedin": {"connection_note": "under 300 chars", "follow_up_message": "..."},\n'
             '  "instagram_dm": {"opener": "...", "follow_up": "..."}\n'
             "}\nReturn ONLY valid JSON."
@@ -25163,6 +25187,24 @@ CREATE TABLE IF NOT EXISTS prospect_suppressions (
     created_at TEXT NOT NULL,
     UNIQUE(user_id, place_id, channel)
 );
+CREATE TABLE IF NOT EXISTS whatsapp_outreach_sessions (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    batch_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    current_index INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS whatsapp_outreach_session_items (
+    id SERIAL PRIMARY KEY,
+    session_id INTEGER NOT NULL,
+    prospect_id BIGINT NOT NULL,
+    position INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    updated_at TEXT NOT NULL,
+    UNIQUE(session_id, prospect_id)
+);
 """
 try:
     _rddl = _REVENUE_DDL
@@ -25173,7 +25215,7 @@ try:
             _rstmt = _rstmt.strip()
             if _rstmt:
                 _rconn.execute(text(_rstmt))
-    logger.info("[REVENUE] revenue_goals/revenue_rate_cards/prospect_suppressions tables ready")
+    logger.info("[REVENUE] revenue_goals/revenue_rate_cards/prospect_suppressions/whatsapp_outreach_sessions tables ready")
 except Exception as _re:
     logger.error(f"[REVENUE] table creation failed: {_re}")
 
@@ -27136,37 +27178,268 @@ class RevenueMarkSentRequest(BaseModel):
     pass
 
 
+def _revenue_mark_draft_sent_core(conn, draft_id: int, uid: str) -> Optional[dict]:
+    """Shared by the standalone mark-sent endpoint and the WhatsApp bulk-send
+    session's advance step — one real "I sent this" write, not two drifting
+    copies. Returns None if the draft doesn't belong to this tenant.
+
+    Nothing sends automatically anywhere in this module — this is the
+    one-tap user action that records "I sent this myself" after copying (or,
+    for WhatsApp, tapping through wa.me) the draft into email/WhatsApp/
+    LinkedIn/Instagram, same discipline as Voice Outreach's
+    voice_followups.status flow.
+
+    Post-audit fix: also marks the prospect contacted on voice_prospects
+    (last_outcome/last_outcome_at) — a real outbound message on ANY channel
+    should start the cooldown and drop the prospect off Today's Priority's
+    never-yet-contacted list, exactly like a logged call outcome already
+    does. Caller-agnostic: last_outcome becomes "{channel}_sent" (e.g.
+    "whatsapp_sent"), not hardcoded to one channel."""
+    now = datetime.utcnow().isoformat()
+    row = conn.execute(text(
+        "SELECT prospect_id, channel FROM revenue_outreach_drafts WHERE id=:id AND user_id=:uid"
+    ), {"id": draft_id, "uid": uid}).fetchone()
+    if not row:
+        return None
+    prospect_id, channel = row
+    conn.execute(text(
+        "UPDATE revenue_outreach_drafts SET status='sent', sent_at=:ts WHERE id=:id"
+    ), {"ts": now, "id": draft_id})
+    conn.execute(text(
+        "UPDATE voice_prospects SET last_outcome=:o, last_outcome_at=:ts, updated_at=:ts WHERE id=:id AND user_id=:uid"
+    ), {"o": f"{channel}_sent", "ts": now, "id": prospect_id, "uid": uid})
+
+    lead_id = None
+    prow = conn.execute(text("SELECT business_name, phone_e164, lead_id FROM voice_prospects WHERE id=:id"), {"id": prospect_id}).fetchone()
+    if prow:
+        business_name, phone_e164, lead_id = prow
+        lead_id = _revenue_find_or_create_lead(conn, uid, lead_id, prospect_id, business_name, phone_e164, now)
+        conn.execute(text(
+            "INSERT INTO lead_timeline_events (lead_id, user_id, event_type, event_data_json, source, created_at) "
+            "VALUES (:lid, :uid, 'outreach_sent', :data, 'revenue_engine', :ts)"
+        ), {"lid": lead_id, "uid": uid, "data": json.dumps({"draft_id": draft_id, "channel": channel}), "ts": now})
+
+    return {"prospect_id": prospect_id, "channel": channel, "lead_id": lead_id, "ts": now}
+
+
 @app.post("/revenue-engine/outreach-drafts/{draft_id}/mark-sent")
 async def revenue_engine_mark_draft_sent(draft_id: int, request: Request):
-    """Nothing sends automatically anywhere in this module — this is the
-    one-tap user action that records "I sent this myself" after copying the
-    draft into email/WhatsApp/LinkedIn/Instagram, same discipline as Voice
-    Outreach's voice_followups.status flow."""
     uid = getattr(request.state, "user_id", "")
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    now = datetime.utcnow().isoformat()
     with engine.begin() as conn:
-        row = conn.execute(text(
-            "SELECT prospect_id, channel FROM revenue_outreach_drafts WHERE id=:id AND user_id=:uid"
-        ), {"id": draft_id, "uid": uid}).fetchone()
-        if not row:
+        result = _revenue_mark_draft_sent_core(conn, draft_id, uid)
+        if result is None:
             raise HTTPException(status_code=404, detail="Draft not found")
-        prospect_id, channel = row
-        conn.execute(text(
-            "UPDATE revenue_outreach_drafts SET status='sent', sent_at=:ts WHERE id=:id"
-        ), {"ts": now, "id": draft_id})
-
-        prow = conn.execute(text("SELECT business_name, phone_e164, lead_id FROM voice_prospects WHERE id=:id"), {"id": prospect_id}).fetchone()
-        if prow:
-            business_name, phone_e164, lead_id = prow
-            lead_id = _revenue_find_or_create_lead(conn, uid, lead_id, prospect_id, business_name, phone_e164, now)
-            conn.execute(text(
-                "INSERT INTO lead_timeline_events (lead_id, user_id, event_type, event_data_json, source, created_at) "
-                "VALUES (:lid, :uid, 'outreach_sent', :data, 'revenue_engine', :ts)"
-            ), {"lid": lead_id, "uid": uid, "data": json.dumps({"draft_id": draft_id, "channel": channel}), "ts": now})
 
     return {"success": True, "status": "sent"}
+
+
+# ── WhatsApp bulk outreach (wa.me click-to-chat — no browser automation) ────
+# Session = an ordered queue of prospects for one Send-view pass. Holds ONLY
+# position and per-item status — no prospect data (lives in voice_prospects,
+# read live) and no draft content (lives in revenue_outreach_drafts, read
+# live via the existing GET /revenue-engine/prospects/{id}/outreach-drafts).
+
+class WhatsAppSessionCreateRequest(BaseModel):
+    prospect_ids: list[int]
+    batch_id: str = ""
+
+
+@app.post("/revenue-engine/whatsapp-outreach/sessions")
+async def whatsapp_outreach_create_session(payload: WhatsAppSessionCreateRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not payload.prospect_ids:
+        raise HTTPException(status_code=400, detail="prospect_ids is required")
+    if len(payload.prospect_ids) > 100:
+        raise HTTPException(status_code=400, detail="Too many prospects in one session (max 100)")
+
+    settings = _get_or_create_voice_settings(uid)
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        # Never trust the client's selection alone — re-check live, same
+        # "re-validate server-side" discipline as approval-time gate
+        # re-checks elsewhere in this module. The frontend's checkbox state
+        # may be stale (DNC added, cooldown started) by the time this call
+        # actually lands.
+        id_params = {f"pid{i}": pid for i, pid in enumerate(payload.prospect_ids)}
+        placeholders = ", ".join(f":{k}" for k in id_params)
+        rows = conn.execute(text(
+            f"SELECT id, phone_e164, last_outcome_at FROM voice_prospects "
+            f"WHERE user_id=:uid AND id IN ({placeholders})"
+        ), {"uid": uid, **id_params}).fetchall()
+        by_id = {r[0]: r for r in rows}
+
+        eligible_ids, dropped = [], []
+        for pid in payload.prospect_ids:
+            row = by_id.get(pid)
+            if not row:
+                dropped.append({"prospect_id": pid, "reason": "not_found"})
+                continue
+            _, phone_e164, last_outcome_at = row
+            ok, reason = _whatsapp_eligibility(uid, phone_e164, last_outcome_at, settings)
+            if ok:
+                eligible_ids.append(pid)
+            else:
+                dropped.append({"prospect_id": pid, "reason": reason})
+
+        if not eligible_ids:
+            raise HTTPException(status_code=400, detail="None of the selected prospects are eligible for WhatsApp send")
+
+        session_id = conn.execute(text(
+            "INSERT INTO whatsapp_outreach_sessions (user_id, batch_id, status, current_index, created_at, updated_at) "
+            "VALUES (:uid, :bid, 'active', 0, :ts, :ts) RETURNING id"
+        ), {"uid": uid, "bid": payload.batch_id or None, "ts": now}).scalar()
+
+        for i, pid in enumerate(eligible_ids):
+            conn.execute(text(
+                "INSERT INTO whatsapp_outreach_session_items (session_id, prospect_id, position, status, updated_at) "
+                "VALUES (:sid, :pid, :pos, 'pending', :ts)"
+            ), {"sid": session_id, "pid": pid, "pos": i, "ts": now})
+
+    return {"success": True, "session_id": session_id, "eligible_count": len(eligible_ids), "dropped": dropped}
+
+
+@app.get("/revenue-engine/whatsapp-outreach/sessions/active")
+async def whatsapp_outreach_active_session(request: Request):
+    """Resume support — the Pipeline page checks this on load to offer
+    "resume where you left off" instead of silently losing an in-progress
+    send queue on a closed tab or reload."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT id FROM whatsapp_outreach_sessions WHERE user_id=:uid AND status='active' "
+            "ORDER BY id DESC LIMIT 1"
+        ), {"uid": uid}).fetchone()
+    return {"success": True, "session_id": row[0] if row else None}
+
+
+@app.get("/revenue-engine/whatsapp-outreach/sessions/{session_id}")
+async def whatsapp_outreach_get_session(session_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        session_row = conn.execute(text(
+            "SELECT id, status, current_index, created_at, updated_at FROM whatsapp_outreach_sessions "
+            "WHERE id=:id AND user_id=:uid"
+        ), {"id": session_id, "uid": uid}).fetchone()
+        if not session_row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        _, status, current_index, created_at, updated_at = session_row
+
+        item_rows = conn.execute(text(
+            "SELECT si.prospect_id, si.position, si.status, "
+            "vp.business_name, vp.phone_e164, vp.matched_weakness, vp.opportunity_score "
+            "FROM whatsapp_outreach_session_items si "
+            "JOIN voice_prospects vp ON vp.id = si.prospect_id "
+            "WHERE si.session_id=:sid ORDER BY si.position ASC"
+        ), {"sid": session_id}).fetchall()
+
+    items = [{
+        "prospect_id": prospect_id, "position": position, "status": item_status,
+        "business_name": business_name, "phone_e164": phone_e164,
+        "detected_gap": (_VOICE_WEAKNESS_LABELS.get(matched_weakness, matched_weakness) if matched_weakness else None),
+        "opportunity_score": opportunity_score,
+    } for prospect_id, position, item_status, business_name, phone_e164, matched_weakness, opportunity_score in item_rows]
+
+    return {
+        "success": True,
+        "session": {"id": session_id, "status": status, "current_index": current_index,
+                     "created_at": created_at, "updated_at": updated_at},
+        "items": items,
+    }
+
+
+_WHATSAPP_ADVANCE_OUTCOMES = {"sent", "skipped", "no_number"}
+
+
+class WhatsAppSessionAdvanceRequest(BaseModel):
+    outcome: str
+    draft_id: Optional[int] = None
+    note: str = ""
+
+
+@app.post("/revenue-engine/whatsapp-outreach/sessions/{session_id}/advance")
+async def whatsapp_outreach_advance_session(session_id: int, payload: WhatsAppSessionAdvanceRequest, request: Request):
+    """Records one Send-view action for the prospect currently at the
+    session's position, then advances. 'sent' reuses
+    _revenue_mark_draft_sent_core (the exact same write the standalone
+    mark-sent button makes — starts the cooldown via last_outcome/
+    last_outcome_at). 'skipped'/'no_number' write their own lead-timeline
+    entry but deliberately never touch last_outcome — only a real send
+    starts the cooldown, per explicit instruction."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    outcome = (payload.outcome or "").strip().lower()
+    if outcome not in _WHATSAPP_ADVANCE_OUTCOMES:
+        raise HTTPException(status_code=400, detail=f"outcome must be one of {sorted(_WHATSAPP_ADVANCE_OUTCOMES)}")
+    if outcome == "sent" and not payload.draft_id:
+        raise HTTPException(status_code=400, detail="draft_id is required when outcome is 'sent'")
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        session_row = conn.execute(text(
+            "SELECT status, current_index FROM whatsapp_outreach_sessions WHERE id=:id AND user_id=:uid"
+        ), {"id": session_id, "uid": uid}).fetchone()
+        if not session_row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        session_status, current_index = session_row
+        if session_status != "active":
+            raise HTTPException(status_code=400, detail="Session is already completed")
+
+        item_row = conn.execute(text(
+            "SELECT id, prospect_id, status FROM whatsapp_outreach_session_items "
+            "WHERE session_id=:sid AND position=:pos"
+        ), {"sid": session_id, "pos": current_index}).fetchone()
+        if not item_row:
+            raise HTTPException(status_code=400, detail="No prospect at the current position")
+        item_id, prospect_id, item_status = item_row
+        if item_status != "pending":
+            raise HTTPException(status_code=409, detail="This item was already processed")
+
+        if outcome == "sent":
+            result = _revenue_mark_draft_sent_core(conn, payload.draft_id, uid)
+            if result is None:
+                raise HTTPException(status_code=404, detail="Draft not found")
+            if result["prospect_id"] != prospect_id:
+                raise HTTPException(status_code=400, detail="draft_id does not belong to the current prospect")
+        else:
+            prow = conn.execute(text(
+                "SELECT business_name, phone_e164, lead_id FROM voice_prospects WHERE id=:id"
+            ), {"id": prospect_id}).fetchone()
+            if prow:
+                business_name, phone_e164, lead_id = prow
+                lead_id = _revenue_find_or_create_lead(conn, uid, lead_id, prospect_id, business_name, phone_e164, now)
+                event_type = "outreach_skipped" if outcome == "skipped" else "outreach_no_number"
+                conn.execute(text(
+                    "INSERT INTO lead_timeline_events (lead_id, user_id, event_type, event_data_json, source, created_at) "
+                    "VALUES (:lid, :uid, :et, :data, 'revenue_engine', :ts)"
+                ), {
+                    "lid": lead_id, "uid": uid, "et": event_type,
+                    "data": json.dumps({"prospect_id": prospect_id, "channel": "whatsapp", "note": payload.note}),
+                    "ts": now,
+                })
+
+        conn.execute(text(
+            "UPDATE whatsapp_outreach_session_items SET status=:st, updated_at=:ts WHERE id=:id"
+        ), {"st": outcome, "ts": now, "id": item_id})
+
+        next_index = current_index + 1
+        total = conn.execute(text(
+            "SELECT COUNT(*) FROM whatsapp_outreach_session_items WHERE session_id=:sid"
+        ), {"sid": session_id}).scalar()
+        new_status = "completed" if next_index >= total else "active"
+        conn.execute(text(
+            "UPDATE whatsapp_outreach_sessions SET current_index=:idx, status=:st, updated_at=:ts WHERE id=:id"
+        ), {"idx": next_index, "st": new_status, "ts": now, "id": session_id})
+
+    return {"success": True, "current_index": next_index, "session_status": new_status}
 
 
 def _revenue_find_or_create_lead(conn, user_id: str, lead_id, prospect_id: int, business_name: str, phone_e164: str, now: str) -> int:
