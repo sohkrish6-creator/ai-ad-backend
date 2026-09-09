@@ -23890,7 +23890,20 @@ def _quick_scan_cache_lookup(user_id: str, place_ids: list) -> dict:
     within the cache window, so re-running a segment never re-fetches a
     fresh scan for a business already scanned recently. Returns
     {place_id: row_dict}; callers skip the homepage-fetch + weakness-
-    detection + GPT-scoring steps entirely for any place_id present here."""
+    detection + GPT-scoring steps entirely for any place_id present here.
+
+    Post-audit fix: this had no filter excluding enterprise/chain-filtered
+    rows (approval_status='filtered') or otherwise-incomplete rows —
+    filtered rows never go through weakness detection at all (filtering
+    happens before it), so weaknesses_json is NULL on them. A business
+    filtered in one scan (e.g. an unrelated earlier search whose Places
+    Text Search terms happened to overlap) could "poison" a later scan for
+    a completely different segment: picked up as the most recent row,
+    served as a cache hit, and its NULL weaknesses_json read back as "[]" —
+    every downstream number (opportunity_score, need_score, recommendation)
+    then legitimately computes to zero/IGNORE from a real absence of
+    weaknesses, not a fabrication, but the absence itself was wrong. Now
+    only ever matches a row that actually completed weakness detection."""
     place_ids = [p for p in place_ids if p]
     if not place_ids:
         return {}
@@ -23907,6 +23920,7 @@ def _quick_scan_cache_lookup(user_id: str, place_ids: list) -> dict:
             "confidence_score, priority, reason, estimated_roi, estimated_call_success, signals_json, "
             "scanned_at, created_at FROM voice_prospects "
             f"WHERE user_id=:uid AND place_id IN ({placeholders}) AND COALESCE(scanned_at, created_at) >= :cutoff "
+            "AND approval_status != 'filtered' AND weaknesses_json IS NOT NULL "
             "ORDER BY COALESCE(scanned_at, created_at) DESC"
         ), params).fetchall()
     cols = ["place_id", "weaknesses_json", "evidence_json", "opportunity_score", "business_score",
