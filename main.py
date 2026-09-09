@@ -23921,7 +23921,7 @@ def _quick_scan_cache_lookup(user_id: str, place_ids: list) -> dict:
 
 
 async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int,
-                                channel: str = "voice"):
+                                channel: str = "voice", exclude_previously_discovered: bool = False):
     now = datetime.utcnow().isoformat()
     _voice_batch_update(batch_id, status="running", started_at=now, current_step="Searching Google Places", progress_pct=5)
     try:
@@ -23942,11 +23942,24 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                     seen_place_ids.add(pid)
                 raw_places.append(p)
 
-        # "Find More" de-dup, Revenue Engine only — Text Search itself has
-        # no memory of past scans, so without this a re-run for the same
-        # industry+city would just return the same businesses again.
+        # Post-audit fix: raw_found_count is BEFORE the "Find More" de-dup
+        # below — without it, a fresh Quick Scan that happened to collide
+        # entirely with a past batch for this segment showed "Scanned 0"
+        # with no way to tell that apart from Google Places genuinely
+        # finding nothing. Both are surfaced to the frontend so the empty
+        # state can say which one actually happened.
+        raw_found_count = len(raw_places)
+
+        # "Find More" de-dup, Revenue Engine only, and ONLY when explicitly
+        # requested (exclude_previously_discovered) — Text Search itself
+        # has no memory of past scans, so without this a "Find More" click
+        # would just return the same businesses again. Applying it
+        # unconditionally to every scan was the actual bug: a plain fresh
+        # Quick Scan for a segment already scanned once before silently
+        # excluded every match, returning "Scanned 0" with no indication
+        # anything had even been found.
         already_discovered_count = 0
-        if channel == "revenue_engine":
+        if channel == "revenue_engine" and exclude_previously_discovered:
             already_seen = _revenue_previously_discovered_place_ids(user_id, industry, city or "")
             if already_seen:
                 before = len(raw_places)
@@ -23956,7 +23969,8 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         total_found = len(raw_places)
         _voice_batch_update(
             batch_id, current_step="Enriching business details", progress_pct=20,
-            total_found=total_found, already_discovered_count=already_discovered_count,
+            total_found=total_found, raw_found_count=raw_found_count,
+            already_discovered_count=already_discovered_count,
         )
 
         top_places = raw_places[:max_prospects]
@@ -23991,6 +24005,8 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             if key:
                 name_counts[key] = name_counts.get(key, 0) + 1
         enriched, filtered_out = _voice_apply_enterprise_filter(enriched, name_counts, settings)
+        if filtered_out:
+            _voice_batch_update(batch_id, enterprise_filtered_count=len(filtered_out))
 
         if filtered_out:
             ts_f = datetime.utcnow().isoformat()
@@ -24172,7 +24188,8 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
 
 
 def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: int,
-                        channel: str = "voice", goal_json: str = None) -> str:
+                        channel: str = "voice", goal_json: str = None,
+                        exclude_previously_discovered: bool = False) -> str:
     batch_id = uuid.uuid4().hex
     now = datetime.utcnow().isoformat()
     with engine.begin() as conn:
@@ -24182,7 +24199,10 @@ def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: in
             "'queued', 0, 'Queued', :ts, :channel, :goal_json)"
         ), {"id": batch_id, "uid": user_id, "industry": industry, "city": city,
             "max_prospects": max_prospects, "ts": now, "channel": channel, "goal_json": goal_json})
-    asyncio.create_task(_run_voice_batch_job(batch_id, user_id, industry, city, max_prospects, channel=channel))
+    asyncio.create_task(_run_voice_batch_job(
+        batch_id, user_id, industry, city, max_prospects, channel=channel,
+        exclude_previously_discovered=exclude_previously_discovered,
+    ))
     return batch_id
 
 
@@ -24384,7 +24404,8 @@ async def voice_outreach_build_batch(payload: VoiceBatchBuildRequest, request: R
 
 _VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "status", "progress_pct",
                      "current_step", "total_found", "total_qualified", "error", "started_at",
-                     "finished_at", "created_at", "channel", "goal_json", "already_discovered_count"]
+                     "finished_at", "created_at", "channel", "goal_json", "already_discovered_count",
+                     "raw_found_count", "enterprise_filtered_count"]
 
 _VOICE_PROSPECT_COLS = [
     "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
@@ -25222,6 +25243,15 @@ for _vtbl, _vcol, _vtype in [
     # results this run excluded as already-seen for this industry+city,
     # mirrors legacy Prospect Discovery's already_discovered_count.
     ("voice_batches", "already_discovered_count", "INTEGER DEFAULT 0"),
+    # Post-audit fix: total_found is AFTER the already-discovered de-dup —
+    # raw_found_count is the real Google Places result count before it, so
+    # the frontend can tell "Google found nothing" apart from "found some,
+    # all excluded as already-discovered" instead of both looking like a
+    # flat "Scanned 0". enterprise_filtered_count is the same idea for the
+    # chain/enterprise filter, computed after total_found is already fixed
+    # so it can never be the reason total_found reads 0.
+    ("voice_batches", "raw_found_count", "INTEGER DEFAULT 0"),
+    ("voice_batches", "enterprise_filtered_count", "INTEGER DEFAULT 0"),
     ("voice_prospects", "channel", "TEXT DEFAULT 'voice'"),
     # Extra Quick Scan signals (mobile-friendly/HTTPS/tracking) that Voice
     # Outreach's own weakness taxonomy never needed — kept in a separate
@@ -27042,6 +27072,13 @@ class RevenueDiscoverRequest(BaseModel):
     city: str = ""
     target_count: int | None = None
     target_amount: int | None = None
+    # Post-audit fix: this used to always exclude place_ids already seen in
+    # a past Revenue Engine batch for this industry+city — correct for an
+    # explicit "Find More" continuation, wrong for a fresh Quick Scan of a
+    # segment already scanned once before, which silently returned zero
+    # results (every match excluded as "already discovered") with no
+    # indication why. Only the Pipeline's "Find More" button sets this true.
+    exclude_previously_discovered: bool = False
 
 
 # Phase 1 fallback ONLY, used to size a revenue-goal discovery batch before
@@ -27083,7 +27120,8 @@ async def revenue_engine_discover(payload: RevenueDiscoverRequest, request: Requ
         "target_count": payload.target_count, "target_amount": payload.target_amount,
     })
     batch_id = _start_voice_batch(uid, industry, (payload.city or "").strip(), max_prospects,
-                                   channel="revenue_engine", goal_json=goal_json)
+                                   channel="revenue_engine", goal_json=goal_json,
+                                   exclude_previously_discovered=payload.exclude_previously_discovered)
 
     with engine.begin() as conn:
         conn.execute(text(

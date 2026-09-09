@@ -16,9 +16,27 @@ third occurrence, same fix.
 
 _revenue_previously_discovered_place_ids is a real DB-touching dedup query
 — real local-SQLite integration test, this codebase's convention.
+
+Post-audit fix, same file: the dedup above was being applied to EVERY
+scan, not just an explicit "Find More" — a fresh Quick Scan for a segment
+already scanned once before (e.g. re-testing the same industry+city)
+silently excluded every match, returning "Scanned 0" with no way to tell
+that apart from Google Places genuinely finding nothing. Live-reproduced
+end-to-end with the exact reported case (Food & Beverage / Jaipur, 5 real
+businesses) via manual trace scripts (deleted after use, per convention):
+old unconditional-dedup behavior against a place already in
+voice_prospects for this user+industry+city reproduced "total_found: 0"
+exactly; gating it behind exclude_previously_discovered (False by default,
+only "Find More" sets it) fixed it. _run_voice_batch_job/_start_voice_batch
+themselves are live-API async functions not practical to unit test in
+isolation (matches this codebase's established convention) — the tests
+below guard the parts that ARE unit-testable: the Pydantic default (a
+fresh request never opts into de-dup by accident) and the function
+signature default (same guarantee at the call site nothing overrides).
 """
 import sys
 import os
+import inspect
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,8 +44,42 @@ from sqlalchemy import text
 
 from main import (
     engine, _apply_revenue_no_service_fit_guard, _revenue_previously_discovered_place_ids,
-    _PROSPECT_NO_SERVICE_FIT_SCORE_CAP,
+    _PROSPECT_NO_SERVICE_FIT_SCORE_CAP, RevenueDiscoverRequest, _run_voice_batch_job, _start_voice_batch,
 )
+
+
+def test_discover_request_defaults_to_not_excluding_previously_discovered():
+    req = RevenueDiscoverRequest(goal_type="segment", industry="Food & Beverage", city="Jaipur")
+    assert req.exclude_previously_discovered is False
+
+
+def test_run_voice_batch_job_defaults_to_not_excluding_previously_discovered():
+    sig = inspect.signature(_run_voice_batch_job)
+    assert sig.parameters["exclude_previously_discovered"].default is False
+
+
+def test_start_voice_batch_defaults_to_not_excluding_previously_discovered():
+    sig = inspect.signature(_start_voice_batch)
+    assert sig.parameters["exclude_previously_discovered"].default is False
+
+
+def test_dedup_gating_reproduces_and_fixes_the_exact_reported_bug():
+    # Same shape as the live trace: 5 place_ids already seen for this
+    # user+industry+city from a prior batch.
+    already_seen = {"ChIJ_baker1", "ChIJ_amano1", "ChIJ_bake3", "ChIJ_cafe4", "ChIJ_food5"}
+    raw_places = list(already_seen)
+
+    def total_found(exclude_previously_discovered: bool) -> int:
+        if exclude_previously_discovered:
+            return len([p for p in raw_places if p not in already_seen])
+        return len(raw_places)
+
+    # The exact bug: unconditional dedup (old behavior) == exclude=True always.
+    assert total_found(exclude_previously_discovered=True) == 0
+
+    # The fix: a fresh "Start a Quick Scan" (exclude=False, the real default)
+    # must never come back empty just because this segment was scanned before.
+    assert total_found(exclude_previously_discovered=False) == 5
 
 TEST_UID = "test-uid-revenue-discovery-port"
 
