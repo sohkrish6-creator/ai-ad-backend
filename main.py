@@ -24222,7 +24222,8 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
 
         if channel == "revenue_engine":
             scored_count = sum(1 for r in rows if r.get("opportunity_score") is not None)
-            _voice_batch_update(batch_id, scored_count=scored_count)
+            phone_populated_count = sum(1 for r in rows if r.get("phone_e164"))
+            _voice_batch_update(batch_id, scored_count=scored_count, phone_populated_count=phone_populated_count)
 
         finished = datetime.utcnow().isoformat()
         _voice_batch_update(
@@ -24455,7 +24456,8 @@ _VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "stat
                      "current_step", "total_found", "total_qualified", "error", "started_at",
                      "finished_at", "created_at", "channel", "goal_json", "already_discovered_count",
                      "raw_found_count", "enterprise_filtered_count", "enriched_count",
-                     "homepage_attempted_count", "homepage_ok_count", "weaknesses_detected_count", "scored_count"]
+                     "homepage_attempted_count", "homepage_ok_count", "weaknesses_detected_count", "scored_count",
+                     "phone_populated_count"]
 
 _VOICE_PROSPECT_COLS = [
     "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
@@ -25318,6 +25320,12 @@ for _vtbl, _vcol, _vtype in [
     ("voice_batches", "homepage_ok_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "weaknesses_detected_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "scored_count", "INTEGER DEFAULT 0"),
+    # Completes the funnel for "is this a data-collection problem, not a
+    # model problem" questions — phone_e164 population rate is exactly as
+    # diagnostic as homepage-fetch success and weakness-detection rate, and
+    # wasn't tracked at the batch level even though it's the one number a
+    # WhatsApp-flow question always comes back to.
+    ("voice_batches", "phone_populated_count", "INTEGER DEFAULT 0"),
     ("voice_prospects", "channel", "TEXT DEFAULT 'voice'"),
     # Extra Quick Scan signals (mobile-friendly/HTTPS/tracking) that Voice
     # Outreach's own weakness taxonomy never needed — kept in a separate
