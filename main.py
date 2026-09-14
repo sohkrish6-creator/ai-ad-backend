@@ -23987,7 +23987,21 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             already_discovered_count=already_discovered_count,
         )
 
+        # Post-audit fix: "Scanned" (total_found/raw_found_count) reports
+        # EVERY raw Places result — but only the first max_prospects of
+        # them ever get enriched, weakness-detected, or scored, silently.
+        # A tenant's plain "Start a Quick Scan" (no target_count) always
+        # defaults to max_prospects=15 with no UI control to raise it
+        # (unlike legacy's own form, which had one) — a segment large
+        # enough to find 38 real businesses (real case: Wedding & Events /
+        # Jaipur) quietly processed only the first 15, with the other 23
+        # never even attempted, and nothing distinguished that from "no
+        # real weaknesses found". enriched_count is that real ceiling,
+        # surfaced so the gap between it and raw_found_count is visible
+        # instead of looking like a normal, if disappointing, empty result.
         top_places = raw_places[:max_prospects]
+        enriched_count = len(top_places)
+        _voice_batch_update(batch_id, enriched_count=enriched_count)
         places_with_id = [p for p in top_places if p.get("place_id")]
         details_list = await _gather_in_chunks(
             [fetch_place_details(p["place_id"]) for p in places_with_id], chunk_size=15
@@ -24066,6 +24080,19 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             [_fetch_homepage_html_safe(p["website"]) if p["website"] else asyncio.sleep(0, result=_empty_fetch) for p in to_scan],
             chunk_size=_QUICK_SCAN_CONCURRENCY if channel == "revenue_engine" else 10,
         )
+        # homepage_attempted: had a website, so a real fetch was made (as
+        # opposed to no_website, where there's nothing to fetch at all).
+        # homepage_ok: that fetch actually succeeded (fetch_status='ok') —
+        # distinct from attempted, since 403/timeout/bot-challenge/DNS
+        # failures are real attempts that yielded no usable page content.
+        homepage_attempted_count = sum(1 for p in to_scan if p.get("website"))
+        homepage_ok_count = sum(
+            1 for h in homepages if isinstance(h, dict) and h.get("fetch_status") == "ok" and h.get("html")
+        )
+        if channel == "revenue_engine":
+            _voice_batch_update(
+                batch_id, homepage_attempted_count=homepage_attempted_count, homepage_ok_count=homepage_ok_count,
+            )
 
         _voice_batch_update(batch_id, current_step="Detecting weaknesses", progress_pct=45)
         services_offered = settings.get("services_offered") or []
@@ -24096,6 +24123,10 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 p["evidence"] = json.loads(c["evidence_json"] or "[]")
                 p["signals"] = json.loads(c["signals_json"] or "{}")
                 p["scanned_at"] = c["scanned_at"] or c["created_at"]
+
+        if channel == "revenue_engine":
+            weaknesses_detected_count = sum(1 for p in enriched if p.get("weaknesses"))
+            _voice_batch_update(batch_id, weaknesses_detected_count=weaknesses_detected_count)
 
         _voice_batch_update(batch_id, current_step="Scoring & qualifying prospects", progress_pct=60)
         SCORE_BATCH_SIZE = 15
@@ -24188,6 +24219,10 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                     ":service_fit, :created_at, :updated_at, :channel, :signals_json, :need_score, "
                     ":recommendation, :scanned_at, :suggested_opening_line)"
                 ), rows)
+
+        if channel == "revenue_engine":
+            scored_count = sum(1 for r in rows if r.get("opportunity_score") is not None)
+            _voice_batch_update(batch_id, scored_count=scored_count)
 
         finished = datetime.utcnow().isoformat()
         _voice_batch_update(
@@ -24419,7 +24454,8 @@ async def voice_outreach_build_batch(payload: VoiceBatchBuildRequest, request: R
 _VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "status", "progress_pct",
                      "current_step", "total_found", "total_qualified", "error", "started_at",
                      "finished_at", "created_at", "channel", "goal_json", "already_discovered_count",
-                     "raw_found_count", "enterprise_filtered_count"]
+                     "raw_found_count", "enterprise_filtered_count", "enriched_count",
+                     "homepage_attempted_count", "homepage_ok_count", "weaknesses_detected_count", "scored_count"]
 
 _VOICE_PROSPECT_COLS = [
     "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
@@ -25266,6 +25302,22 @@ for _vtbl, _vcol, _vtype in [
     # so it can never be the reason total_found reads 0.
     ("voice_batches", "raw_found_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "enterprise_filtered_count", "INTEGER DEFAULT 0"),
+    # Post-audit fix: a permanent stage-by-stage diagnostic, not another
+    # point fix — real case (Wedding & Events / Jaipur): raw_found_count=38
+    # but the plain Quick Scan form never sends target_count, so
+    # max_prospects silently defaulted to 15 with no UI control to raise
+    # it (unlike legacy's own form, which had one) — 23 of 38 were never
+    # enriched, weakness-detected, or scored at all, and nothing
+    # distinguished that from "no real weaknesses found". Each column is
+    # one funnel stage (found -> enriched -> homepage fetched -> weaknesses
+    # detected -> scored -> bucketed, the last visible via the existing
+    # Hot/Warm/Cold counts) so a silent drop at any stage is visible
+    # immediately instead of rendering as a normal, if disappointing, result.
+    ("voice_batches", "enriched_count", "INTEGER DEFAULT 0"),
+    ("voice_batches", "homepage_attempted_count", "INTEGER DEFAULT 0"),
+    ("voice_batches", "homepage_ok_count", "INTEGER DEFAULT 0"),
+    ("voice_batches", "weaknesses_detected_count", "INTEGER DEFAULT 0"),
+    ("voice_batches", "scored_count", "INTEGER DEFAULT 0"),
     ("voice_prospects", "channel", "TEXT DEFAULT 'voice'"),
     # Extra Quick Scan signals (mobile-friendly/HTTPS/tracking) that Voice
     # Outreach's own weakness taxonomy never needed — kept in a separate
