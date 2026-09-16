@@ -63,6 +63,34 @@ def test_start_voice_batch_defaults_to_not_excluding_previously_discovered():
     assert sig.parameters["exclude_previously_discovered"].default is False
 
 
+# ── force_fresh (bypass the 7-day scan cache) ────────────────────────────────
+# Post-audit fix. Real reported case: Healthcare & Clinics / Jaipur — 6 of 15
+# enriched businesses were silently served from the 7-day scan cache with no
+# way to force a brand-new scan. A fresh scan must default to using the
+# cache (the cache is a real, wanted optimization normally) — force_fresh is
+# opt-in only, same "safe unless explicitly requested" shape as
+# exclude_previously_discovered above.
+
+def test_discover_request_defaults_to_not_forcing_fresh():
+    req = RevenueDiscoverRequest(goal_type="segment", industry="Salon & Beauty", city="Jaipur")
+    assert req.force_fresh is False
+
+
+def test_run_voice_batch_job_defaults_to_not_forcing_fresh():
+    sig = inspect.signature(_run_voice_batch_job)
+    assert sig.parameters["force_fresh"].default is False
+
+
+def test_start_voice_batch_defaults_to_not_forcing_fresh():
+    sig = inspect.signature(_start_voice_batch)
+    assert sig.parameters["force_fresh"].default is False
+
+
+def test_force_fresh_true_is_accepted_on_the_request():
+    req = RevenueDiscoverRequest(goal_type="segment", industry="Salon & Beauty", city="Jaipur", force_fresh=True)
+    assert req.force_fresh is True
+
+
 def test_dedup_gating_reproduces_and_fixes_the_exact_reported_bug():
     # Same shape as the live trace: 5 place_ids already seen for this
     # user+industry+city from a prior batch.

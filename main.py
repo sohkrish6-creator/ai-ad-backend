@@ -1855,7 +1855,8 @@ async def fetch_place_details(place_id: str) -> dict:
                 "https://maps.googleapis.com/maps/api/place/details/json",
                 params={
                     "place_id": place_id,
-                    "fields": "name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,opening_hours,reviews",
+                    "fields": "name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,"
+                              "opening_hours,reviews,photos,editorial_summary",
                     "key": GOOGLE_PLACES_API_KEY,
                 },
             )
@@ -23297,19 +23298,62 @@ _VOICE_TRACKING_MARKERS = ("gtag(", "gtag.js", "fbq(", "googletagmanager.com/gtm
 _VOICE_CTA_PHRASES = ("book now", "contact us", "call now", "get a quote", "enquire", "whatsapp us", "order now")
 
 
-def _detect_voice_weaknesses(prospect: dict, fetch_result: dict) -> tuple:
+_VOICE_PEER_MIN_SAMPLE = 5   # below this, a batch's own average is too noisy to compare against
+_VOICE_FEW_PHOTOS_THRESHOLD = 3
+
+
+def _voice_compute_peer_stats(enriched: list) -> dict:
+    """Real, deterministic peer baseline for THIS scan's own businesses —
+    "below category average" means below what this exact batch of local
+    competitors actually shows, not an arbitrary fixed number. Computed once
+    per batch (not per business) to stay O(n), and over every business the
+    scan found (cache-hit ones too — they're still real local peers, not
+    just the freshly-scanned subset)."""
+    ratings = [p["google_rating"] for p in enriched if p.get("google_rating") is not None]
+    reviews = [p["total_reviews"] for p in enriched if p.get("total_reviews") is not None]
+    return {
+        "avg_rating": (sum(ratings) / len(ratings)) if ratings else None,
+        "avg_reviews": (sum(reviews) / len(reviews)) if reviews else None,
+        "sample_size": len(enriched),
+    }
+
+
+def _detect_voice_weaknesses(prospect: dict, fetch_result: dict, peer_stats: dict = None) -> tuple:
     """Real detected signals only — every weakness maps to an actual checked
     condition with evidence, never fabricated. Evidence shape mirrors the real
     precedent in gather_bi_data()'s extract_evidence() (type/value/confidence/
     page), plus a detected_at timestamp for this module's audit needs (that
     field doesn't exist on the original precedent — deliberate small addition).
 
-    Explicitly NOT attempted here (no real signal available, cut rather than
-    faked): "no Google Ads" (Tavily text is unverified prose, not an ad-network
-    API result), "inactive Instagram"/"no recent content" (no social API
-    integrated), "no WhatsApp" (no WhatsApp Business API check exists),
-    "no landing pages" (needs a real sitemap crawl + page classification, a
-    genuine future feature, not a copy-paste)."""
+    Post-audit fix: every signal below the website-fetch block used to
+    require a website to even attempt detection — a websiteless business
+    (the norm for small Indian local businesses: clinics, salons, cafes,
+    preschools; confirmed live, Healthcare & Clinics/Jaipur — 8 of 9
+    freshly-scanned had no website at all) had exactly ONE detectable
+    weakness (no_website) and nothing else to judge it by, capping its need/
+    opportunity score regardless of how many other real gaps it had. The
+    Google Business Profile signals section below reads ONLY fields already
+    fetched via Place Details for every business regardless of website
+    (rating, review count, photos, hours, description) — real for every
+    business, not homepage-dependent.
+
+    Explicitly NOT attempted here (no real signal available via the Places
+    API this codebase integrates, cut rather than faked): "unanswered
+    reviews" and "unanswered Q&A" (owner replies and the Maps Q&A feature
+    are not exposed by the Places API at all — only the separate, OAuth-
+    gated Google Business Profile API can see them, which requires the
+    business's own consent and cannot be checked for an arbitrary
+    prospect), "no recent Google Posts" (Posts content is likewise Business-
+    Profile-only, not in Places API), "old photos" (photo objects returned
+    by Place Details carry no timestamp — photo COUNT is real and used
+    below, photo AGE is not obtainable), "missing services" (no general
+    services field exists for most business categories in the Places API).
+    Also still cut from the original list: "no Google Ads" (Tavily text is
+    unverified prose, not an ad-network API result), "inactive Instagram"/
+    "no recent content" (no social API integrated), "no WhatsApp" (no
+    WhatsApp Business API check exists), "no landing pages" (needs a real
+    sitemap crawl + page classification, a genuine future feature, not a
+    copy-paste)."""
     now = datetime.utcnow().isoformat()
     weaknesses = []
     evidence = []
@@ -23338,6 +23382,37 @@ def _detect_voice_weaknesses(prospect: dict, fetch_result: dict) -> tuple:
         _add("low_review_count", f"{total_reviews} total reviews", 0.95, "google_places")
     if business_status and business_status != "OPERATIONAL":
         _add("inactive_listing", f"business_status={business_status}", 0.90, "google_places")
+
+    # Google Business Profile signals — real for every business Place
+    # Details returned data for, independent of whether it has a website.
+    # Deliberately outside the `if website:` gate below: a websiteless
+    # business must still be judgeable on more than the single no_website
+    # signal.
+    peer_stats = peer_stats or {}
+    peer_sample = peer_stats.get("sample_size") or 0
+    if peer_sample >= _VOICE_PEER_MIN_SAMPLE:
+        peer_avg_rating = peer_stats.get("avg_rating")
+        if peer_avg_rating is not None and rating is not None and rating < peer_avg_rating:
+            _add("below_peer_rating",
+                 f"rating={rating} vs {peer_avg_rating:.1f} average across {peer_sample} businesses in this scan",
+                 0.85, "google_places")
+        peer_avg_reviews = peer_stats.get("avg_reviews")
+        if peer_avg_reviews is not None and total_reviews < peer_avg_reviews:
+            _add("below_peer_review_count",
+                 f"{total_reviews} reviews vs {peer_avg_reviews:.0f} average across {peer_sample} businesses in this scan",
+                 0.85, "google_places")
+
+    photo_count = prospect.get("photo_count")
+    if photo_count is not None and photo_count < _VOICE_FEW_PHOTOS_THRESHOLD:
+        _add("few_photos", f"{photo_count} photo(s) on Google Business listing", 0.90, "google_places")
+
+    has_hours = prospect.get("has_hours")
+    if has_hours is False:
+        _add("missing_hours", "no business hours listed on Google Business listing", 0.90, "google_places")
+
+    has_description = prospect.get("has_description")
+    if has_description is False:
+        _add("missing_description", "no business description on Google Business listing", 0.75, "google_places")
 
     if website:
         fetch_status = fetch_result.get("fetch_status", "ok")
@@ -23411,10 +23486,18 @@ def _quick_scan_extra_signals(prospect: dict, fetch_result: dict, weaknesses: li
 # GPT-judged, per the Item 3 stability check already on record). Mirrors
 # the evidence-confidence ordering already used by _voice_match_service.
 _VOICE_NEED_WEIGHTS = {
-    "no_website": 30, "site_unreachable": 25, "poor_reviews": 25,
+    # Post-audit fix: no_website bumped to clearly the highest weight — it
+    # should be the strongest signal a websiteless business has, not one
+    # among equals, now that it's no longer the only signal available for
+    # such a business (see the Google Business Profile signals below).
+    "no_website": 35, "site_unreachable": 25, "poor_reviews": 25,
     "inactive_listing": 20, "low_review_count": 15, "missing_tracking": 15,
     "weak_seo_title": 10, "weak_seo_meta": 10, "no_cta": 10,
     "no_social_links_on_website": 15, "weak_social_presence": 10,
+    # Google Business Profile signals — real for every business regardless
+    # of website.
+    "below_peer_rating": 20, "below_peer_review_count": 15,
+    "few_photos": 12, "missing_hours": 10, "missing_description": 8,
 }
 
 
@@ -23954,7 +24037,8 @@ def _quick_scan_cache_lookup(user_id: str, place_ids: list) -> dict:
 
 
 async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city: str, max_prospects: int,
-                                channel: str = "voice", exclude_previously_discovered: bool = False):
+                                channel: str = "voice", exclude_previously_discovered: bool = False,
+                                force_fresh: bool = False):
     now = datetime.utcnow().isoformat()
     _voice_batch_update(batch_id, status="running", started_at=now, current_step="Searching Google Places", progress_pct=5)
     try:
@@ -24042,6 +24126,19 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 "google_rating":    det.get("rating") if det.get("rating") is not None else place.get("rating"),
                 "total_reviews":    det.get("user_ratings_total") or place.get("user_ratings_total", 0),
                 "business_status":  place.get("business_status", ""),
+                # Post-audit fix: Google Business Profile signals that exist
+                # for every business regardless of whether it has a website
+                # — a websiteless business (the norm for small Indian local
+                # businesses: clinics, salons, cafes, preschools) used to
+                # have exactly one detectable weakness (no_website) and
+                # nothing else to judge it by. photo_count/has_hours/
+                # has_description are None only when Place Details itself
+                # returned nothing (fetch failure) — never treated as a
+                # weakness in that case, only when the field is genuinely
+                # empty on a business Google DID return details for.
+                "photo_count":      len(det.get("photos") or []) if det else None,
+                "has_hours":        bool(det.get("opening_hours")) if det else None,
+                "has_description":  bool((det.get("editorial_summary") or {}).get("overview")) if det else None,
             })
 
         _voice_batch_update(batch_id, current_step="Filtering enterprise/chain businesses", progress_pct=32)
@@ -24088,7 +24185,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         # homepage-fetch + weakness-detection + GPT-scoring steps entirely
         # for any business scanned within the last _QUICK_SCAN_CACHE_DAYS.
         cache_hits = {}
-        if channel == "revenue_engine":
+        if channel == "revenue_engine" and not force_fresh:
             _voice_batch_update(batch_id, current_step="Checking scan cache", progress_pct=34)
             cache_hits = _quick_scan_cache_lookup(user_id, [p["place_id"] for p in enriched])
             _voice_batch_update(batch_id, cache_skipped_count=len(cache_hits))
@@ -24116,9 +24213,17 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
 
         _voice_batch_update(batch_id, current_step="Detecting weaknesses", progress_pct=45)
         services_offered = settings.get("services_offered") or []
+        # Post-audit fix: "low reviews"/"low rating" used to be fixed
+        # absolute thresholds (rating<3.5, reviews<20) — real but blind to
+        # what's actually normal for this industry+city. peer_stats is
+        # computed once across every business THIS scan found (not just the
+        # freshly-scanned subset — a cache-hit business is still a real
+        # peer), so below_peer_rating/below_peer_review_count compare each
+        # business against its actual local competition, not a generic bar.
+        peer_stats = _voice_compute_peer_stats(enriched)
         for i, p in enumerate(to_scan):
             fetch_result = homepages[i] if isinstance(homepages[i], dict) else _empty_fetch
-            weaknesses, evidence = _detect_voice_weaknesses(p, fetch_result)
+            weaknesses, evidence = _detect_voice_weaknesses(p, fetch_result, peer_stats)
             p["weaknesses"] = weaknesses
             p["evidence"] = evidence
             if channel == "revenue_engine":
@@ -24280,7 +24385,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
 
 def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: int,
                         channel: str = "voice", goal_json: str = None,
-                        exclude_previously_discovered: bool = False) -> str:
+                        exclude_previously_discovered: bool = False, force_fresh: bool = False) -> str:
     batch_id = uuid.uuid4().hex
     now = datetime.utcnow().isoformat()
     with engine.begin() as conn:
@@ -24292,7 +24397,7 @@ def _start_voice_batch(user_id: str, industry: str, city: str, max_prospects: in
             "max_prospects": max_prospects, "ts": now, "channel": channel, "goal_json": goal_json})
     asyncio.create_task(_run_voice_batch_job(
         batch_id, user_id, industry, city, max_prospects, channel=channel,
-        exclude_previously_discovered=exclude_previously_discovered,
+        exclude_previously_discovered=exclude_previously_discovered, force_fresh=force_fresh,
     ))
     return batch_id
 
@@ -27220,6 +27325,12 @@ class RevenueDiscoverRequest(BaseModel):
     # prospects" override so a plain segment scan doesn't have to reverse-
     # engineer that padding math to get a bigger batch.
     max_prospects: int | None = None
+    # Post-audit fix: the 7-day scan cache (_quick_scan_cache_lookup) is a
+    # real win for a genuinely repeated segment, but it also means "Force a
+    # brand-new scan right now" had no way to actually force one — real
+    # case (Healthcare & Clinics / Jaipur): 6 of 15 enriched businesses were
+    # silently served from cache with no way to bypass it for this one run.
+    force_fresh: bool = False
 
 
 # Phase 1 fallback ONLY, used to size a revenue-goal discovery batch before
@@ -27264,7 +27375,8 @@ async def revenue_engine_discover(payload: RevenueDiscoverRequest, request: Requ
     })
     batch_id = _start_voice_batch(uid, industry, (payload.city or "").strip(), max_prospects,
                                    channel="revenue_engine", goal_json=goal_json,
-                                   exclude_previously_discovered=payload.exclude_previously_discovered)
+                                   exclude_previously_discovered=payload.exclude_previously_discovered,
+                                   force_fresh=payload.force_fresh)
 
     with engine.begin() as conn:
         conn.execute(text(
