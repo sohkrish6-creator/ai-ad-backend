@@ -41,8 +41,8 @@ from main import _VOICE_BATCH_COLS
 
 _NEW_FUNNEL_COLUMNS = [
     "raw_found_count", "enterprise_filtered_count", "enriched_count",
-    "homepage_attempted_count", "homepage_ok_count", "weaknesses_detected_count", "scored_count",
-    "phone_populated_count",
+    "homepage_attempted_count", "homepage_ok_count", "cache_skipped_count",
+    "weaknesses_detected_count", "scored_count", "phone_populated_count",
 ]
 
 
