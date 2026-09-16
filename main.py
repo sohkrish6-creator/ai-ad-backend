@@ -23708,6 +23708,8 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
         biz_lines += (
             "\n---\n"
             f"Business {i + 1}: {p['business_name']}\n"
+            f"Reference ID (copy EXACTLY into your JSON response's \"ref\" field for this business — this is "
+            f"how your answer is matched back to it, never alter or invent one): {p['_score_ref']}\n"
             f"Address: {p['address']}\n"
             f"Website: {p['website'] or 'NONE'}\n"
             f"Google Rating: {p['google_rating'] if p['google_rating'] is not None else 'no rating'} "
@@ -23743,6 +23745,7 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
             "{\n"
             '  "prospects": [\n'
             "    {\n"
+            '      "ref": "the exact Reference ID given for this business above, copied verbatim",\n'
             '      "business_name": "exact name from data",\n'
             '      "opportunity_score": 85,\n'
             '      "business_score": 60,\n'
@@ -23764,7 +23767,7 @@ async def _score_voice_prospect_batch(industry: str, search_scope: str, batch: l
     return _fix_rs(result.get("prospects", []))
 
 
-def _apply_revenue_no_service_fit_guard(scores_by_name: dict, to_scan: list) -> None:
+def _apply_revenue_no_service_fit_guard(scores_by_ref: dict, to_scan: list) -> None:
     """Same discipline, same bug class as Prospect Discovery's
     _apply_no_service_fit_guard — different field names (matched_service_label
     vs recommended_service's string sentinel), same guarantee: never trust
@@ -23773,11 +23776,14 @@ def _apply_revenue_no_service_fit_guard(scores_by_name: dict, to_scan: list) -> 
     prospect regardless of score (existing, unrelated guard, for
     actionability), but the new Hot/Warm/Cold tabs display opportunity_score/
     priority directly — without this, a no-fit prospect could still render
-    as misleadingly "Hot". Mutates scores_by_name's dict values in place."""
+    as misleadingly "Hot". Mutates scores_by_ref's dict values in place.
+    Keyed by _score_ref (place_id), not business_name — a name is not a
+    unique key (GPT paraphrasing or two businesses sharing a name can
+    silently miss or cross-wire scores; see _run_voice_batch_job)."""
     for p in to_scan:
         if p.get("matched_service_label"):
             continue  # a real service fit — GPT is allowed to be specific
-        score = scores_by_name.get(p["business_name"])
+        score = scores_by_ref.get(p["_score_ref"])
         if not score:
             continue
         score["suggested_opening_line"] = ""
@@ -24129,14 +24135,35 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
             _voice_batch_update(batch_id, weaknesses_detected_count=weaknesses_detected_count)
 
         _voice_batch_update(batch_id, current_step="Scoring & qualifying prospects", progress_pct=60)
+        # Post-audit fix: GPT scoring results used to be re-merged onto
+        # businesses by business_name (a non-unique string) — a paraphrased
+        # echo silently lost a score (falls back to {}), and two businesses
+        # sharing a name silently cross-wired scores (last-write-wins in the
+        # dict comprehension), producing exactly the "Opportunity 100 with
+        # zero detected weaknesses" symptom reported in production. place_id
+        # is the unique key used everywhere else in this pipeline (dedup,
+        # scan cache, voice_prospects itself) — used here too, via an
+        # explicit _score_ref GPT is required to echo back verbatim.
+        for p in to_scan:
+            p["_score_ref"] = p["place_id"]
         SCORE_BATCH_SIZE = 15
         score_batches = [to_scan[i:i + SCORE_BATCH_SIZE] for i in range(0, len(to_scan), SCORE_BATCH_SIZE)]
         batch_results = await asyncio.gather(
             *[_score_voice_prospect_batch(industry, search_scope, b) for b in score_batches]
         ) if to_scan else []
-        scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
+        scores_by_ref = {s["ref"]: s for batch in batch_results for s in batch if s.get("ref")}
+        # Deterministic guard, not just a prompt instruction (same discipline
+        # as the no-service-fit guard below): make a silent scoring miss
+        # visible instead of letting it render as an unexplained blank/zero
+        # score.
+        missing_refs = [p["place_id"] for p in to_scan if p["place_id"] not in scores_by_ref]
+        if missing_refs:
+            logger.warning(
+                "voice batch %s: %d/%d prospects got no GPT score back (ref mismatch or dropped) — %s",
+                batch_id, len(missing_refs), len(to_scan), missing_refs[:10],
+            )
         if channel == "revenue_engine":
-            _apply_revenue_no_service_fit_guard(scores_by_name, to_scan)
+            _apply_revenue_no_service_fit_guard(scores_by_ref, to_scan)
 
         _voice_batch_update(batch_id, current_step="Normalizing phone numbers & compliance gates", progress_pct=80)
 
@@ -24160,7 +24187,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
                 }
                 confidence_score = cached["confidence_score"]
             else:
-                score = scores_by_name.get(p["business_name"], {})
+                score = scores_by_ref.get(p["place_id"], {})
                 confidences = [e.get("confidence", 0) for e in p["evidence"]]
                 confidence_score = int(round(100 * (sum(confidences) / len(confidences)))) if confidences else 50
             phone_e164 = _normalize_phone_e164(p["phone_raw"])
@@ -24345,17 +24372,26 @@ async def _voice_rescore_existing_prospects(user_id: str, limit: int) -> dict:
                 "id": pid, "business_name": business_name, "address": address, "website": website,
                 "google_rating": google_rating, "total_reviews": total_reviews, "business_status": business_status,
                 "weaknesses": weaknesses, "evidence": evidence, "old_score": old_score,
-                "approval_status": approval_status,
+                "approval_status": approval_status, "_score_ref": str(pid),
             })
 
         SCORE_BATCH_SIZE = 15
         score_batches = [prospects[i:i + SCORE_BATCH_SIZE] for i in range(0, len(prospects), SCORE_BATCH_SIZE)]
         batch_results = await asyncio.gather(*[_score_voice_prospect_batch(industry, search_scope, b) for b in score_batches])
-        scores_by_name = {s["business_name"]: s for batch in batch_results for s in batch if s.get("business_name")}
+        # Keyed by _score_ref (this prospect's own voice_prospects.id, unique
+        # by definition), not business_name — see _run_voice_batch_job for
+        # why a name-keyed re-merge silently loses/cross-wires scores.
+        scores_by_ref = {s["ref"]: s for batch in batch_results for s in batch if s.get("ref")}
+        missing_refs = [p["id"] for p in prospects if str(p["id"]) not in scores_by_ref]
+        if missing_refs:
+            logger.warning(
+                "voice rescore: %d/%d prospects got no GPT score back (ref mismatch or dropped) — %s",
+                len(missing_refs), len(prospects), missing_refs[:10],
+            )
 
         with engine.begin() as conn:
             for p in prospects:
-                new = scores_by_name.get(p["business_name"], {})
+                new = scores_by_ref.get(str(p["id"]), {})
                 new_score = new.get("opportunity_score")
                 old_score = p["old_score"]
                 confidences = [e.get("confidence", 0) for e in p["evidence"]]

@@ -96,63 +96,87 @@ def teardown_function():
 
 # ── _apply_revenue_no_service_fit_guard ──────────────────────────────────────
 
-def _to_scan_item(name, matched_service_label=None):
-    return {"business_name": name, "matched_service_label": matched_service_label}
+def _to_scan_item(ref, matched_service_label=None):
+    # Post-audit fix: keyed by _score_ref (place_id in production), not
+    # business_name — a name is not a unique key. See
+    # test_revenue_scoring_ref_keying.py for the bug this guards against.
+    return {"_score_ref": ref, "matched_service_label": matched_service_label}
 
 
 def _score(opportunity_score=90, priority="high", suggested_opening_line="Hi! We noticed..."):
     return {
-        "business_name": "x", "opportunity_score": opportunity_score, "priority": priority,
+        "ref": "x", "opportunity_score": opportunity_score, "priority": priority,
         "suggested_opening_line": suggested_opening_line,
     }
 
 
 def test_no_service_fit_clears_opening_line_caps_score_and_priority():
-    to_scan = [_to_scan_item("Hotel A", matched_service_label=None)]
-    scores_by_name = {"Hotel A": _score(opportunity_score=92, priority="high")}
-    _apply_revenue_no_service_fit_guard(scores_by_name, to_scan)
-    s = scores_by_name["Hotel A"]
+    to_scan = [_to_scan_item("place-a", matched_service_label=None)]
+    scores_by_ref = {"place-a": _score(opportunity_score=92, priority="high")}
+    _apply_revenue_no_service_fit_guard(scores_by_ref, to_scan)
+    s = scores_by_ref["place-a"]
     assert s["suggested_opening_line"] == ""
     assert s["opportunity_score"] == _PROSPECT_NO_SERVICE_FIT_SCORE_CAP
     assert s["priority"] == "low"
 
 
 def test_a_real_service_fit_is_left_completely_untouched():
-    to_scan = [_to_scan_item("Hotel B", matched_service_label="Website Development")]
-    scores_by_name = {"Hotel B": _score(opportunity_score=88, priority="high", suggested_opening_line="Real pitch")}
-    _apply_revenue_no_service_fit_guard(scores_by_name, to_scan)
-    s = scores_by_name["Hotel B"]
+    to_scan = [_to_scan_item("place-b", matched_service_label="Website Development")]
+    scores_by_ref = {"place-b": _score(opportunity_score=88, priority="high", suggested_opening_line="Real pitch")}
+    _apply_revenue_no_service_fit_guard(scores_by_ref, to_scan)
+    s = scores_by_ref["place-b"]
     assert s["suggested_opening_line"] == "Real pitch"
     assert s["opportunity_score"] == 88
     assert s["priority"] == "high"
 
 
 def test_score_already_below_cap_is_not_raised():
-    to_scan = [_to_scan_item("Hotel C", matched_service_label=None)]
-    scores_by_name = {"Hotel C": _score(opportunity_score=10, priority="low")}
-    _apply_revenue_no_service_fit_guard(scores_by_name, to_scan)
-    assert scores_by_name["Hotel C"]["opportunity_score"] == 10
+    to_scan = [_to_scan_item("place-c", matched_service_label=None)]
+    scores_by_ref = {"place-c": _score(opportunity_score=10, priority="low")}
+    _apply_revenue_no_service_fit_guard(scores_by_ref, to_scan)
+    assert scores_by_ref["place-c"]["opportunity_score"] == 10
 
 
 def test_missing_score_entry_is_not_a_crash():
-    to_scan = [_to_scan_item("Hotel D", matched_service_label=None)]
+    to_scan = [_to_scan_item("place-d", matched_service_label=None)]
     _apply_revenue_no_service_fit_guard({}, to_scan)  # must not raise
 
 
 def test_mixed_batch_only_no_fit_entries_are_touched():
     to_scan = [
-        _to_scan_item("Hotel E", matched_service_label=None),
-        _to_scan_item("Hotel F", matched_service_label="SEO"),
+        _to_scan_item("place-e", matched_service_label=None),
+        _to_scan_item("place-f", matched_service_label="SEO"),
     ]
-    scores_by_name = {
-        "Hotel E": _score(opportunity_score=95, priority="high", suggested_opening_line="invented"),
-        "Hotel F": _score(opportunity_score=80, priority="high", suggested_opening_line="real"),
+    scores_by_ref = {
+        "place-e": _score(opportunity_score=95, priority="high", suggested_opening_line="invented"),
+        "place-f": _score(opportunity_score=80, priority="high", suggested_opening_line="real"),
     }
-    _apply_revenue_no_service_fit_guard(scores_by_name, to_scan)
-    assert scores_by_name["Hotel E"]["suggested_opening_line"] == ""
-    assert scores_by_name["Hotel E"]["priority"] == "low"
-    assert scores_by_name["Hotel F"]["suggested_opening_line"] == "real"
-    assert scores_by_name["Hotel F"]["priority"] == "high"
+    _apply_revenue_no_service_fit_guard(scores_by_ref, to_scan)
+    assert scores_by_ref["place-e"]["suggested_opening_line"] == ""
+    assert scores_by_ref["place-e"]["priority"] == "low"
+    assert scores_by_ref["place-f"]["suggested_opening_line"] == "real"
+    assert scores_by_ref["place-f"]["priority"] == "high"
+
+
+def test_same_business_name_no_longer_collides_across_two_businesses():
+    # The exact bug class this whole fix targets: two DIFFERENT businesses
+    # that happen to share a name (a real, unremarkable occurrence — e.g.
+    # two independent "City Dental Clinic"s in the same city) used to
+    # collide in a business_name-keyed dict, silently overwriting one
+    # business's real score onto the other's row. Keyed by place_id (the
+    # actual unique identifier), they no longer collide even with identical
+    # names.
+    to_scan = [
+        _to_scan_item("place-dup-1", matched_service_label="SEO"),
+        _to_scan_item("place-dup-2", matched_service_label="SEO"),
+    ]
+    scores_by_ref = {
+        "place-dup-1": {**_score(opportunity_score=91, priority="high"), "ref": "place-dup-1"},
+        "place-dup-2": {**_score(opportunity_score=12, priority="low"), "ref": "place-dup-2"},
+    }
+    _apply_revenue_no_service_fit_guard(scores_by_ref, to_scan)
+    assert scores_by_ref["place-dup-1"]["opportunity_score"] == 91
+    assert scores_by_ref["place-dup-2"]["opportunity_score"] == 12
 
 
 # ── _revenue_previously_discovered_place_ids ─────────────────────────────────
