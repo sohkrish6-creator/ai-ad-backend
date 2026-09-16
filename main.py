@@ -23177,14 +23177,27 @@ def _normalize_phone_e164(raw: Optional[str], region: str = "IN") -> Optional[st
     """Real E.164 validation via Google's libphonenumber — no phone-number
     handling of any kind existed anywhere in this codebase before this module
     (LeadModel.phone is untyped free text). Returns None for anything that
-    doesn't parse to a genuinely valid, dialable number — never guesses."""
+    doesn't parse to a genuinely valid, dialable number — never guesses.
+
+    Post-audit fix: Google Place Details' formatted_phone_number isn't
+    always a single number — a business listing a reception line and an
+    emergency/alternate line (common for clinics) can come back as
+    "9876543210, 9123456789" or similar. phonenumbers.parse() on the WHOLE
+    string either raises or fails is_valid_number on the combined garbage,
+    so the strict single-number parse used here previously returned None
+    for a business that Google actually gave a perfectly real, dialable
+    number for — legacy prospect_discovery shows formatted_phone_number
+    raw/unvalidated, so it never hit this at all, which is part of why it
+    reads as more phone-reliable for the same businesses. PhoneNumberMatcher
+    scans the raw text for the first genuinely valid number embedded in it
+    (comma/slash/"or"/label-separated or a single bare number alike)
+    instead of requiring the entire string to parse as exactly one number."""
     if not raw:
         return None
     try:
-        p = phonenumbers.parse(raw, region)
-        if phonenumbers.is_valid_number(p):
-            return phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.E164)
-    except phonenumbers.NumberParseException:
+        for match in phonenumbers.PhoneNumberMatcher(raw, region):
+            return phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
         pass
     return None
 
@@ -24078,6 +24091,7 @@ async def _run_voice_batch_job(batch_id: str, user_id: str, industry: str, city:
         if channel == "revenue_engine":
             _voice_batch_update(batch_id, current_step="Checking scan cache", progress_pct=34)
             cache_hits = _quick_scan_cache_lookup(user_id, [p["place_id"] for p in enriched])
+            _voice_batch_update(batch_id, cache_skipped_count=len(cache_hits))
         to_scan = [p for p in enriched if p["place_id"] not in cache_hits]
 
         _voice_batch_update(batch_id, current_step="Fetching homepages", progress_pct=35)
@@ -24492,8 +24506,8 @@ _VOICE_BATCH_COLS = ["id", "user_id", "industry", "city", "max_prospects", "stat
                      "current_step", "total_found", "total_qualified", "error", "started_at",
                      "finished_at", "created_at", "channel", "goal_json", "already_discovered_count",
                      "raw_found_count", "enterprise_filtered_count", "enriched_count",
-                     "homepage_attempted_count", "homepage_ok_count", "weaknesses_detected_count", "scored_count",
-                     "phone_populated_count"]
+                     "homepage_attempted_count", "homepage_ok_count", "cache_skipped_count",
+                     "weaknesses_detected_count", "scored_count", "phone_populated_count"]
 
 _VOICE_PROSPECT_COLS = [
     "id", "batch_id", "user_id", "place_id", "business_name", "address", "phone_raw", "phone_e164",
@@ -25354,6 +25368,14 @@ for _vtbl, _vcol, _vtype in [
     ("voice_batches", "enriched_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "homepage_attempted_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "homepage_ok_count", "INTEGER DEFAULT 0"),
+    # Post-audit fix: homepage_attempted_count/homepage_ok_count alone can't
+    # tell "the scan-cache skipped a fresh fetch for a business scanned
+    # recently" apart from "nothing had a website to fetch" — both render
+    # as the same flat 0/enriched_count. cache_skipped_count makes that
+    # split visible: to_scan count = enriched_count - cache_skipped_count,
+    # so (that number) - homepage_attempted_count is exactly how many
+    # to_scan businesses had no website field at all.
+    ("voice_batches", "cache_skipped_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "weaknesses_detected_count", "INTEGER DEFAULT 0"),
     ("voice_batches", "scored_count", "INTEGER DEFAULT 0"),
     # Completes the funnel for "is this a data-collection problem, not a
@@ -27189,6 +27211,15 @@ class RevenueDiscoverRequest(BaseModel):
     # results (every match excluded as "already discovered") with no
     # indication why. Only the Pipeline's "Find More" button sets this true.
     exclude_previously_discovered: bool = False
+    # Post-audit fix: the plain "Start a Quick Scan" form had no way to
+    # raise the 15-prospect default at all — real case (Wedding & Events /
+    # Jaipur): 38 found, only the first 15 ever enriched, with nothing in
+    # the UI to ask for more. target_count already has a DIFFERENT meaning
+    # for goal_type='revenue' (desired client count, padded 3x/5x into a
+    # scan size) — this is a separate, explicit "scan exactly this many
+    # prospects" override so a plain segment scan doesn't have to reverse-
+    # engineer that padding math to get a bigger batch.
+    max_prospects: int | None = None
 
 
 # Phase 1 fallback ONLY, used to size a revenue-goal discovery batch before
@@ -27212,7 +27243,9 @@ async def revenue_engine_discover(payload: RevenueDiscoverRequest, request: Requ
         raise HTTPException(status_code=400, detail="goal_type must be 'segment' or 'revenue'")
 
     max_prospects = 15
-    if payload.target_count:
+    if payload.max_prospects:
+        max_prospects = min(50, max(5, payload.max_prospects))  # explicit override, takes priority
+    elif payload.target_count:
         max_prospects = min(50, max(5, payload.target_count * 3))  # rough prospect-to-client funnel padding
     elif goal_type == "revenue" and payload.target_amount:
         with engine.connect() as conn:
