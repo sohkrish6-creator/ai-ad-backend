@@ -23711,24 +23711,38 @@ def _voice_check_gates(user_id: str, phone_e164: Optional[str], last_contacted_a
 
 
 async def _call_gpt_json_with_retry(build_messages_fn, model: str = "gpt-4o", max_tokens: int = 3500,
-                                     temperature: float = 0.3, retries: int = 1, label: str = "") -> dict:
+                                     temperature: float = 0.3, retries: int = 1, label: str = "",
+                                     timeout: float = None) -> dict:
     """New shared infrastructure — confirmed via exhaustive grep that NO
     retry-on-JSON-parse-failure pattern exists anywhere else in this 21,000+
     line codebase (every other json.loads(gpt_response) call site has zero
     retry on JSONDecodeError). Wraps the existing _retry_openai_call (transport-
     error retry only) with a genuine parse-failure retry: on JSONDecodeError,
     re-calls with a correction message telling GPT its last response was
-    invalid JSON, up to `retries` more times, before giving up."""
+    invalid JSON, up to `retries` more times, before giving up.
+
+    Post-audit fix: `timeout` is opt-in (None = unchanged, client's own
+    default) rather than a new blanket default for this whole 30+ call-site
+    shared function — the reported hang (bulk WhatsApp draft generation
+    stuck at "Generating 0/1..." indefinitely) only has evidence at one
+    call site; tightening every caller's timeout without evidence they need
+    it risks breaking a legitimately slower prompt elsewhere. Passed
+    straight to the OpenAI SDK, which raises APITimeoutError on expiry —
+    already caught and retried by _retry_openai_call below, so a real
+    timeout becomes a clean retry-then-raise instead of an indefinite hang."""
     last_err = None
     correction = None
     for attempt in range(retries + 1):
         messages = build_messages_fn(correction)
 
         def _call():
-            return client.chat.completions.create(
+            kwargs = dict(
                 model=model, messages=messages, max_tokens=max_tokens,
                 temperature=temperature, response_format={"type": "json_object"},
-            ).choices[0].message.content
+            )
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            return client.chat.completions.create(**kwargs).choices[0].message.content
 
         raw = await _retry_openai_call(_call, label=f"{label} (json attempt {attempt + 1}/{retries + 1})")
         try:
@@ -25032,7 +25046,7 @@ async def _revenue_generate_outreach_drafts(prospect_id: int, business_name: str
 
     return await _call_gpt_json_with_retry(
         _build_messages, model="gpt-4o-mini", max_tokens=1500, temperature=0.4, retries=1,
-        label=f"revenue-engine outreach drafts (prospect {prospect_id})",
+        label=f"revenue-engine outreach drafts (prospect {prospect_id})", timeout=45.0,
     )
 
 
@@ -27723,6 +27737,39 @@ async def whatsapp_outreach_active_session(request: Request):
     return {"success": True, "session_id": row[0] if row else None}
 
 
+@app.post("/revenue-engine/whatsapp-outreach/sessions/{session_id}/discard")
+async def whatsapp_outreach_discard_session(session_id: int, request: Request):
+    """Post-audit fix. Real reported case: the "Resume" banner
+    (GET .../sessions/active, which surfaces the most recent status='active'
+    row with no age cutoff) showed continuously for days across every batch
+    with no way to clear it — a user who abandons a send queue (closes the
+    tab mid-flow, the queue was created from a stale/bad selection, etc.)
+    had no way to tell the app "I'm not resuming this." Confirmed in code
+    that a stale active session does NOT block a new one from being created
+    (whatsapp_outreach_create_session has no active-session check, and the
+    table has no unique constraint on (user_id, status) — the actual bug
+    was purely that nothing could ever un-stick the banner, not that it
+    blocked anything). 'discarded' is excluded from .../sessions/active's
+    status='active' filter, same as 'completed' already is — no other query
+    needed updating."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT status FROM whatsapp_outreach_sessions WHERE id=:id AND user_id=:uid"
+        ), {"id": session_id, "uid": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if row[0] != "active":
+            return {"success": True, "already_resolved": True}
+        conn.execute(text(
+            "UPDATE whatsapp_outreach_sessions SET status='discarded', updated_at=:ts WHERE id=:id"
+        ), {"ts": now, "id": session_id})
+    return {"success": True}
+
+
 @app.get("/revenue-engine/whatsapp-outreach/sessions/{session_id}")
 async def whatsapp_outreach_get_session(session_id: int, request: Request):
     uid = getattr(request.state, "user_id", "")
@@ -27796,7 +27843,7 @@ async def whatsapp_outreach_advance_session(session_id: int, payload: WhatsAppSe
             raise HTTPException(status_code=404, detail="Session not found")
         session_status, current_index = session_row
         if session_status != "active":
-            raise HTTPException(status_code=400, detail="Session is already completed")
+            raise HTTPException(status_code=400, detail=f"Session is already {session_status}")
 
         item_row = conn.execute(text(
             "SELECT id, prospect_id, status FROM whatsapp_outreach_session_items "

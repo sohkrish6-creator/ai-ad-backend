@@ -317,6 +317,82 @@ def test_active_session_is_null_once_completed():
     assert resp.json()["session_id"] is None
 
 
+# ── discard (post-audit fix) ─────────────────────────────────────────────────
+# Real reported case: the "Resume" banner (GET .../sessions/active — the most
+# recent status='active' row, no age cutoff) showed continuously for days
+# across every batch with no way to clear it. First verified in code that a
+# stale active session does NOT block a new one from being created — session
+# creation has no active-session check and the table has no unique
+# constraint on (user_id, status) — so the actual bug was purely "nothing
+# can ever un-stick the banner," not that it blocked anything. Discard is
+# the fix: an explicit way to mark a stale session resolved.
+
+def test_discard_marks_an_active_session_resolved_and_clears_the_resume_banner():
+    _insert_prospect(900070, phone_e164="+919828676825")
+    session_id = client.post("/revenue-engine/whatsapp-outreach/sessions",
+                              json={"prospect_ids": [900070]}, headers=_AUTH).json()["session_id"]
+    assert client.get("/revenue-engine/whatsapp-outreach/sessions/active", headers=_AUTH).json()["session_id"] == session_id
+
+    resp = client.post(f"/revenue-engine/whatsapp-outreach/sessions/{session_id}/discard", headers=_AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+
+    assert client.get("/revenue-engine/whatsapp-outreach/sessions/active", headers=_AUTH).json()["session_id"] is None
+
+
+def test_a_stale_active_session_does_not_block_creating_a_new_one():
+    # The user's own hypothesis, checked directly: an old, never-resolved
+    # active session must not prevent a brand-new one for a different (or
+    # even the same) prospect selection.
+    _insert_prospect(900071, phone_e164="+919828676825")
+    _insert_prospect(900072, phone_e164="+919828676826")
+    old_session_id = client.post("/revenue-engine/whatsapp-outreach/sessions",
+                                  json={"prospect_ids": [900071]}, headers=_AUTH).json()["session_id"]
+    resp = client.post("/revenue-engine/whatsapp-outreach/sessions",
+                        json={"prospect_ids": [900072]}, headers=_AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+    new_session_id = resp.json()["session_id"]
+    assert new_session_id != old_session_id
+
+
+def test_discarding_an_already_completed_session_is_not_an_error():
+    _insert_prospect(900073, phone_e164="+919828676825")
+    session_id = client.post("/revenue-engine/whatsapp-outreach/sessions",
+                              json={"prospect_ids": [900073]}, headers=_AUTH).json()["session_id"]
+    client.post(f"/revenue-engine/whatsapp-outreach/sessions/{session_id}/advance",
+                json={"outcome": "skipped"}, headers=_AUTH)
+    resp = client.post(f"/revenue-engine/whatsapp-outreach/sessions/{session_id}/discard", headers=_AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+    assert resp.json().get("already_resolved") is True
+
+
+def test_discarding_someone_elses_session_is_not_found():
+    _insert_prospect(900074, phone_e164="+919828676825")
+    session_id = client.post("/revenue-engine/whatsapp-outreach/sessions",
+                              json={"prospect_ids": [900074]}, headers=_AUTH).json()["session_id"]
+    other_auth = {"Authorization": f"Bearer {_token('some-other-uid')}"}
+    resp = client.post(f"/revenue-engine/whatsapp-outreach/sessions/{session_id}/discard", headers=other_auth)
+    assert resp.status_code == 404
+
+
+def test_discard_requires_auth():
+    resp = client.post("/revenue-engine/whatsapp-outreach/sessions/1/discard")
+    assert resp.status_code == 401
+
+
+def test_advancing_a_discarded_session_gives_a_clear_status_message_not_a_generic_one():
+    _insert_prospect(900075, phone_e164="+919828676825")
+    session_id = client.post("/revenue-engine/whatsapp-outreach/sessions",
+                              json={"prospect_ids": [900075]}, headers=_AUTH).json()["session_id"]
+    client.post(f"/revenue-engine/whatsapp-outreach/sessions/{session_id}/discard", headers=_AUTH)
+    resp = client.post(f"/revenue-engine/whatsapp-outreach/sessions/{session_id}/advance",
+                        json={"outcome": "skipped"}, headers=_AUTH)
+    assert resp.status_code == 400
+    assert "discarded" in resp.json()["detail"].lower()
+
+
 # ── session detail ────────────────────────────────────────────────────────────
 
 def test_session_detail_returns_items_with_prospect_summary():

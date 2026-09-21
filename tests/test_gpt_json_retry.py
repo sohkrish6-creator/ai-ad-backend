@@ -39,16 +39,21 @@ class _FakeResponse:
 def _make_fake_create(responses):
     """Returns a fake client.chat.completions.create that yields each item
     in `responses` in order (as raw response text), recording every call's
-    messages for inspection."""
+    messages for inspection. Accepts an optional `timeout` kwarg (unused by
+    the fake itself, but real callers pass it) and records the full kwargs
+    of each call so timeout-plumbing tests can inspect it."""
     calls = []
+    kwargs_seen = []
 
-    def _fake_create(model, messages, max_tokens, temperature, response_format):
+    def _fake_create(model, messages, max_tokens, temperature, response_format, **kwargs):
         calls.append(messages)
+        kwargs_seen.append(kwargs)
         idx = len(calls) - 1
         content = responses[min(idx, len(responses) - 1)]
         return _FakeResponse(content)
 
     _fake_create.calls = calls
+    _fake_create.kwargs_seen = kwargs_seen
     return _fake_create
 
 
@@ -98,6 +103,39 @@ async def test_exhausts_retries_and_raises_decode_error(monkeypatch):
             label="test", retries=1,
         )
     assert len(fake.calls) == 2  # 1 initial + 1 retry, then gives up
+
+
+# ── timeout plumbing (post-audit fix) ────────────────────────────────────────
+# Real reported case: bulk "Generate WhatsApp Drafts" stuck at "Generating
+# 0/1..." indefinitely on production. `timeout` is opt-in (None by default,
+# unchanged behavior for every other call site) so it must actually reach
+# the OpenAI call when a caller does pass one, and must NOT appear at all
+# when a caller doesn't (some SDK versions treat an explicit `timeout=None`
+# as "no timeout" rather than "use the client default," which would make
+# things worse, not better).
+
+@pytest.mark.asyncio
+async def test_timeout_is_forwarded_to_the_openai_call_when_given(monkeypatch):
+    fake = _make_fake_create(['{"ok": true}'])
+    monkeypatch.setattr(main.client.chat.completions, "create", fake)
+
+    await main._call_gpt_json_with_retry(
+        lambda correction: [{"role": "user", "content": "x"}],
+        label="test", timeout=45.0,
+    )
+    assert fake.kwargs_seen[0].get("timeout") == 45.0
+
+
+@pytest.mark.asyncio
+async def test_no_timeout_kwarg_is_sent_when_none_is_given(monkeypatch):
+    fake = _make_fake_create(['{"ok": true}'])
+    monkeypatch.setattr(main.client.chat.completions, "create", fake)
+
+    await main._call_gpt_json_with_retry(
+        lambda correction: [{"role": "user", "content": "x"}],
+        label="test",
+    )
+    assert "timeout" not in fake.kwargs_seen[0]
 
 
 @pytest.mark.asyncio
