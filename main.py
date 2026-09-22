@@ -1376,6 +1376,31 @@ def home():
     return {"message": "Adsoh Backend chal raha hai!"}
 
 
+def _system_capabilities() -> dict:
+    """Real, cheap, read-only checks of the actual running host — never
+    guessed. ffmpeg presence via shutil.which (path only checked for
+    existence, never returned — no path/version string leaked). CPU count
+    via os.cpu_count() (what Python's own process pool would actually get).
+    Memory read from /proc/meminfo (Linux/container only — Render's Python
+    runtime; silently omitted, not fabricated, on any host where that file
+    doesn't exist, e.g. local macOS dev)."""
+    import shutil as _shutil
+    caps = {
+        "ffmpeg_installed": _shutil.which("ffmpeg") is not None,
+        "cpu_count": os.cpu_count(),
+    }
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    caps["mem_total_mb"] = round(int(line.split()[1]) / 1024)
+                elif line.startswith("MemAvailable:"):
+                    caps["mem_available_mb"] = round(int(line.split()[1]) / 1024)
+    except Exception:
+        pass
+    return caps
+
+
 @app.get("/version")
 def version():
     """Which commit is actually running right now — Render auto-populates
@@ -1395,6 +1420,16 @@ def version():
         # given environment previously required Render dashboard access.
         # Boolean only, never the key itself.
         "tavily_configured": bool(TAVILY_API_KEY),
+        # Post-audit fix: same reasoning as tavily_configured above — no
+        # render.yaml/Dockerfile/Procfile exists in this repo (the Render
+        # start command and instance plan are configured directly in the
+        # dashboard, not in source), and there is no dashboard/SSH access
+        # available outside of Render itself. Before building any feature
+        # that needs ffmpeg/CPU/RAM (e.g. video processing), this is the
+        # only way to get real ground truth about the running host rather
+        # than assuming. No secrets, same safety bar as this endpoint
+        # already being public.
+        **_system_capabilities(),
     }
 
 
