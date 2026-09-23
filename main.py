@@ -4,6 +4,8 @@ from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 from PIL import Image
 import io
+import subprocess
+import tempfile
 import bcrypt
 import phonenumbers
 from openai import OpenAI
@@ -378,6 +380,11 @@ GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 SUPABASE_URL = (os.getenv("SUPABASE_URL", "") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_STORAGE_BUCKET = "website-images"
+# AI Reel Auto-Editor: raw uploaded videos and generated reels are private
+# per-tenant business content, never public marketing assets — a separate,
+# non-public bucket from SUPABASE_STORAGE_BUCKET above (which returns a
+# public URL by design). Storage paths are always {user_id}/{job_id}/...
+_REEL_STORAGE_BUCKET = "creative-reels"
 
 _raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./ai_ad_manager.db")
 # SQLAlchemy requires "postgresql://" but Supabase/Render supply "postgres://"
@@ -552,37 +559,72 @@ def _supabase_storage_headers(content_type: str = "application/json") -> dict:
         "Content-Type": content_type,
     }
 
-def _ensure_supabase_bucket_sync():
-    """Create the storage bucket if it doesn't exist yet. Idempotent, blocking."""
+def _ensure_supabase_bucket_sync(bucket: str = SUPABASE_STORAGE_BUCKET, public: bool = True):
+    """Create the storage bucket if it doesn't exist yet. Idempotent, blocking.
+    `bucket`/`public` are parameterized (default preserves the original
+    website-images behavior exactly) so the AI Reel Auto-Editor's private
+    bucket can reuse this instead of a second copy-pasted function."""
     with httpx.Client(timeout=15) as _c:
         resp = _c.post(
             f"{SUPABASE_URL}/storage/v1/bucket",
             headers=_supabase_storage_headers(),
-            json={"id": SUPABASE_STORAGE_BUCKET, "name": SUPABASE_STORAGE_BUCKET, "public": True},
+            json={"id": bucket, "name": bucket, "public": public},
         )
     if resp.status_code in (200, 201):
-        logger.info(f"[STORAGE] Created bucket '{SUPABASE_STORAGE_BUCKET}'")
+        logger.info(f"[STORAGE] Created bucket '{bucket}' (public={public})")
     elif resp.status_code in (400, 409) and "exists" in resp.text.lower():
         pass  # already exists — fine
     else:
-        raise RuntimeError(f"Could not create bucket '{SUPABASE_STORAGE_BUCKET}' ({resp.status_code}): {resp.text[:300]}")
+        raise RuntimeError(f"Could not create bucket '{bucket}' ({resp.status_code}): {resp.text[:300]}")
 
-def _supabase_storage_upload_sync(storage_path: str, content: bytes, content_type: str) -> str:
-    """Upload bytes to Supabase Storage and return the public URL. Blocking — call via asyncio.to_thread."""
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
+def _supabase_storage_upload_sync(storage_path: str, content: bytes, content_type: str,
+                                   bucket: str = SUPABASE_STORAGE_BUCKET, public: bool = True) -> str:
+    """Upload bytes to Supabase Storage. Blocking — call via asyncio.to_thread.
+    Returns the public URL when `public` is True (original behavior,
+    unchanged for the existing website-images caller); for a private
+    bucket, returns the bare storage_path instead — callers must use
+    _supabase_storage_signed_url_sync to hand the frontend real access."""
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{storage_path}"
     headers = _supabase_storage_headers(content_type)
     headers["x-upsert"] = "true"
-    with httpx.Client(timeout=30) as _c:
+    with httpx.Client(timeout=120) as _c:
         resp = _c.post(upload_url, headers=headers, content=content)
     if resp.status_code not in (200, 201) and "bucket not found" in resp.text.lower():
         # Supabase reports a missing bucket as HTTP 400 with statusCode "404"
         # in the JSON body, not an actual HTTP 404 — check the body, not the status.
-        _ensure_supabase_bucket_sync()
-        with httpx.Client(timeout=30) as _c:
+        _ensure_supabase_bucket_sync(bucket, public)
+        with httpx.Client(timeout=120) as _c:
             resp = _c.post(upload_url, headers=headers, content=content)
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Supabase Storage upload failed ({resp.status_code}): {resp.text[:300]}")
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{storage_path}"
+    if public:
+        return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{storage_path}"
+    return storage_path
+
+def _supabase_storage_download_sync(storage_path: str, bucket: str) -> bytes:
+    """Download bytes from Storage (public or private — service-role auth
+    works either way) into memory. Blocking — call via asyncio.to_thread.
+    Only used for the reel pipeline's own source-video fetch, where files
+    are bounded by _REEL_MAX_UPLOAD_BYTES, so buffering in memory is fine."""
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{storage_path}"
+    headers = {"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_SERVICE_ROLE_KEY}
+    with httpx.Client(timeout=120) as _c:
+        resp = _c.get(url, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Supabase Storage download failed ({resp.status_code}): {resp.text[:300]}")
+    return resp.content
+
+def _supabase_storage_signed_url_sync(storage_path: str, bucket: str, expires_in: int = 3600) -> str:
+    """Create a time-limited signed URL for a private-bucket object — how
+    the frontend gets real (but bounded, revocable-by-expiry) access to a
+    file in a non-public bucket. Blocking — call via asyncio.to_thread."""
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{bucket}/{storage_path}"
+    with httpx.Client(timeout=15) as _c:
+        resp = _c.post(url, headers=_supabase_storage_headers(), json={"expiresIn": expires_in})
+    if resp.status_code != 200:
+        raise RuntimeError(f"Supabase Storage sign failed ({resp.status_code}): {resp.text[:300]}")
+    signed_path = resp.json().get("signedURL", "")
+    return f"{SUPABASE_URL}/storage/v1{signed_path}"
 
 def _validate_and_normalize_image_sync(data: bytes) -> tuple[str, str]:
     """
@@ -1383,12 +1425,28 @@ def _system_capabilities() -> dict:
     via os.cpu_count() (what Python's own process pool would actually get).
     Memory read from /proc/meminfo (Linux/container only — Render's Python
     runtime; silently omitted, not fabricated, on any host where that file
-    doesn't exist, e.g. local macOS dev)."""
+    doesn't exist, e.g. local macOS dev).
+
+    ffmpeg_subtitles_supported is NOT redundant with ffmpeg_installed — a
+    real, live-verified gap found while building the AI Reel Auto-Editor:
+    the default Homebrew ffmpeg build (and plausibly a minimal system
+    package on other hosts) has NO libass compiled in at all, so the
+    `subtitles` filter this feature depends on to burn in captions doesn't
+    exist even though the ffmpeg binary itself runs fine — `ffmpeg
+    -filters` simply omits it, and using it fails immediately with a
+    filtergraph parse error. Checked directly via `ffmpeg -filters` rather
+    than assumed from ffmpeg_installed alone."""
     import shutil as _shutil
     caps = {
         "ffmpeg_installed": _shutil.which("ffmpeg") is not None,
         "cpu_count": os.cpu_count(),
     }
+    if caps["ffmpeg_installed"]:
+        try:
+            _filters_result = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True, timeout=10)
+            caps["ffmpeg_subtitles_supported"] = " subtitles " in _filters_result.stdout
+        except Exception:
+            caps["ffmpeg_subtitles_supported"] = False
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -9309,6 +9367,397 @@ async def ad_to_creative(request: AdToCreativeRequest):
         campaign_objective=request.campaign_objective, offer=request.offer, ad_copy=request.ad_copy,
         headlines=request.headlines, keywords=request.keywords, landing_url=request.landing_url,
     ))
+
+
+# ── Creative Studio: AI Reel Auto-Editor ─────────────────────────────────────
+# Upload a raw video, get back a 30-60s vertical (9:16) Reel with burned-in
+# captions, auto-selected for the most engaging segment. Background job —
+# asyncio.create_task + a DB-backed status row, the exact pattern
+# _run_voice_batch_job/voice_batches already established (no queue system
+# exists anywhere in this codebase; creative_reel_jobs rows ARE the queue).
+# Status values: queued -> processing -> done|failed. Every stage the job
+# passes through updates current_step so a stuck job is diagnosable from the
+# row alone, not just "still processing" with no detail.
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+_REEL_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+_REEL_MAX_UPLOAD_BYTES = 300 * 1024 * 1024  # 300MB — generous for a short raw clip, still bounded
+_REEL_ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+_REEL_MIN_SEGMENT_SECONDS = 30
+_REEL_MAX_SEGMENT_SECONDS = 60
+# Hard per-stage timeouts — together they bound the job's total worst-case
+# wall-clock time to a known, finite number (~16 min + bounded network
+# transfer), satisfying "no infinite hangs" without needing one single
+# wrapping timeout around the whole async job function.
+_REEL_FFMPEG_TIMEOUT_SECONDS = 300
+_REEL_WHISPER_TIMEOUT_SECONDS = 600
+_REEL_CLAUDE_TIMEOUT_SECONDS = 60
+
+_reel_whisper_model = None
+
+def _reel_get_whisper_model():
+    """Lazy singleton — the model (weights included) loads/downloads once
+    per running process, not once per job; a job re-creating it every call
+    would re-pay that cost (and Render's disk is ephemeral, so the
+    Hugging Face download itself repeats on every fresh deploy/restart
+    regardless — this at least avoids repeating it per-job on top of that).
+    Blocking — always call via asyncio.to_thread. No lock guarding the
+    double-checked init: the worst case of two jobs racing here is the
+    model loading twice in parallel once, which self-heals (both ending up
+    with a working model reference) rather than corrupting anything —
+    not worth a threading import for a one-time, harmless race."""
+    global _reel_whisper_model
+    if _reel_whisper_model is None:
+        from faster_whisper import WhisperModel
+        _reel_whisper_model = WhisperModel("small", compute_type="int8")
+    return _reel_whisper_model
+
+
+def _reel_transcribe_sync(video_path: str) -> list:
+    """Real transcription via faster-whisper, word-level timestamps kept
+    (word_timestamps=True) though only segment-level start/end/text is used
+    downstream today — kept for a future finer-grained SRT if ever needed.
+    No language forced: auto-detect, since Hindi/Hinglish (code-switched)
+    content must not be forced into a single wrong language. Blocking —
+    call via asyncio.to_thread."""
+    model = _reel_get_whisper_model()
+    segments, _info = model.transcribe(video_path, word_timestamps=True)
+    return [{"start": s.start, "end": s.end, "text": (s.text or "").strip()} for s in segments]
+
+
+def _reel_ffprobe_duration_sync(video_path: str) -> float:
+    """Real video duration via ffprobe — used to bound Claude's segment
+    choice to what the video actually contains (the transcript's last
+    spoken word can end well before the video's real end, e.g. trailing
+    silence/music). Blocking — call via asyncio.to_thread."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"ffprobe could not read video duration: {result.stderr[-300:]}")
+    return float(result.stdout.strip())
+
+
+def _reel_validate_claude_segment(parsed, video_duration: float) -> dict:
+    """Validates the {start, end, hook} JSON Claude returns for the best
+    reel segment. Raises ValueError with a specific, readable reason on
+    anything invalid — never silently accepts a nonsensical range, and
+    never lets a hallucinated out-of-bounds timestamp reach ffmpeg. Pure
+    function — real unit tests, no mocking."""
+    if not isinstance(parsed, dict):
+        raise ValueError("Claude did not return a JSON object")
+    try:
+        start = float(parsed["start"])
+        end = float(parsed["end"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Claude's response is missing a valid numeric start/end")
+    hook = (parsed.get("hook") or "").strip()
+    if not hook:
+        raise ValueError("Claude's response is missing a hook")
+    if start < 0 or end <= start:
+        raise ValueError(f"Claude returned a non-positive-length segment ({start}-{end})")
+    if start > video_duration:
+        raise ValueError(f"Claude's segment start ({start}s) is past the video's actual duration ({video_duration:.0f}s)")
+    duration = end - start
+    if duration < _REEL_MIN_SEGMENT_SECONDS - 1 or duration > _REEL_MAX_SEGMENT_SECONDS + 5:
+        raise ValueError(
+            f"Claude's segment is {duration:.0f}s — outside the requested "
+            f"{_REEL_MIN_SEGMENT_SECONDS}-{_REEL_MAX_SEGMENT_SECONDS}s range"
+        )
+    return {"start": max(0.0, start), "end": min(end, video_duration), "hook": hook}
+
+
+async def _reel_pick_best_segment(transcript_segments: list, video_duration: float) -> dict:
+    """Sends the timestamped transcript to Claude, asks for JSON only, and
+    validates the response before returning it — never trusts the model's
+    own claim to have honored the schema/bounds (same discipline as every
+    GPT-JSON call elsewhere in this codebase, applied to Claude here since
+    the same failure class — a plausible-looking but out-of-bounds or
+    malformed response — applies regardless of which model produced it)."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY is not configured on the server")
+    if not transcript_segments:
+        raise RuntimeError("No speech was detected in this video — nothing to build a Reel from")
+
+    transcript_lines = "\n".join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in transcript_segments)
+    prompt = (
+        f"Below is a timestamped transcript of a raw video ({video_duration:.0f}s total), possibly in "
+        "Hindi, Hinglish, or English. Find the single most engaging "
+        f"{_REEL_MIN_SEGMENT_SECONDS}-{_REEL_MAX_SEGMENT_SECONDS} second CONTINUOUS segment for a short-form "
+        "vertical social media Reel — the part most likely to hook a viewer in the first couple seconds and hold "
+        "attention through to the end of the clip.\n\n"
+        f"Transcript:\n{transcript_lines}\n\n"
+        "Return ONLY valid JSON, no other text, no markdown code fences:\n"
+        '{"start": <seconds, number>, "end": <seconds, number>, "hook": "<one sentence: why this segment is engaging>"}\n\n'
+        f"The segment MUST be between {_REEL_MIN_SEGMENT_SECONDS} and {_REEL_MAX_SEGMENT_SECONDS} seconds long, "
+        f"and start/end must both fall within 0 and {video_duration:.0f}."
+    )
+    async with httpx.AsyncClient(timeout=_REEL_CLAUDE_TIMEOUT_SECONDS) as client_:
+        resp = await client_.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _REEL_CLAUDE_MODEL, "max_tokens": 500,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Claude API error ({resp.status_code}): {resp.text[:300]}")
+    data = resp.json()
+    raw_text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text").strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        if raw_text.lower().startswith("json"):
+            raw_text = raw_text[4:]
+        raw_text = raw_text.strip()
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Claude did not return valid JSON: {e}")
+    return _reel_validate_claude_segment(parsed, video_duration)
+
+
+def _reel_format_srt_timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    total_ms = round(seconds * 1000)
+    hours, rem_ms = divmod(total_ms, 3_600_000)
+    minutes, rem_ms = divmod(rem_ms, 60_000)
+    secs, ms = divmod(rem_ms, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def _reel_build_srt(segments: list, clip_start: float, clip_end: float) -> str:
+    """Builds an SRT file for the [clip_start, clip_end] window only, with
+    every timestamp shifted to be relative to clip_start — ffmpeg's `-ss
+    clip_start` re-zeros the OUTPUT clip's own timeline to 0, so subtitle
+    timestamps must be re-zeroed the same way or they'd point past the end
+    of the much-shorter clip (or not appear at all). A segment straddling a
+    window boundary is clipped to it, never shown early or held past the
+    clip's own end. Pure function — real unit tests, no mocking."""
+    lines = []
+    idx = 1
+    for seg in segments:
+        seg_start, seg_end = seg["start"], seg["end"]
+        if seg_end <= clip_start or seg_start >= clip_end:
+            continue  # entirely outside the window
+        shown_start = max(seg_start, clip_start) - clip_start
+        shown_end = min(seg_end, clip_end) - clip_start
+        if shown_end <= shown_start:
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(str(idx))
+        lines.append(f"{_reel_format_srt_timestamp(shown_start)} --> {_reel_format_srt_timestamp(shown_end)}")
+        lines.append(text)
+        lines.append("")
+        idx += 1
+    return "\n".join(lines)
+
+
+def _reel_run_ffmpeg_sync(src_path: str, start: float, end: float, srt_path: str, out_path: str):
+    """Cut [start,end], crop to 9:16, scale 1080x1920, burn subtitles, AAC
+    audio. Blocking — call via asyncio.to_thread. Hard timeout via
+    subprocess.run's own `timeout=` — unlike a hung asyncio.to_thread call,
+    this genuinely kills the child process on expiry rather than leaving it
+    running, and raises TimeoutExpired so the job can fail cleanly instead
+    of hanging forever.
+
+    crop=ih*9/16:ih assumes a landscape/wider-than-9:16 source (typical raw
+    footage) — an already-vertical (narrower than 9:16) upload would fail
+    this crop with a real ffmpeg error, which still surfaces as a readable
+    job failure (never a hang), just not a smart re-crop for that case."""
+    escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    vf = f"crop=ih*9/16:ih,scale=1080:1920,subtitles='{escaped_srt}'"
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", src_path,
+        "-vf", vf, "-c:v", "libx264", "-c:a", "aac", out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_REEL_FFMPEG_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed (code {result.returncode}): {result.stderr[-800:]}")
+
+
+def _reel_job_update(job_id: str, **fields):
+    sets = ", ".join(f"{k}=:{k}" for k in fields)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE creative_reel_jobs SET {sets} WHERE id=:job_id"), {**fields, "job_id": job_id})
+
+
+async def _run_reel_job(job_id: str, user_id: str, source_storage_path: str):
+    """The actual background job — kicked off via asyncio.create_task,
+    never run inside the request (same pattern as _run_voice_batch_job).
+    Every stage wrapped in one top-level try/except: any failure, anywhere,
+    ends in status='failed' with a real, specific, readable error_message —
+    never a silently-stuck 'processing' row."""
+    now = datetime.utcnow().isoformat()
+    _reel_job_update(job_id, status="processing", current_step="Downloading upload", started_at=now)
+    tmp_dir = tempfile.mkdtemp(prefix=f"reel-{job_id}-")
+    try:
+        src_ext = os.path.splitext(source_storage_path)[1] or ".mp4"
+        src_path = os.path.join(tmp_dir, f"source{src_ext}")
+        video_bytes = await asyncio.to_thread(_supabase_storage_download_sync, source_storage_path, _REEL_STORAGE_BUCKET)
+        with open(src_path, "wb") as f:
+            f.write(video_bytes)
+        del video_bytes  # done with the in-memory copy once it's on disk
+
+        _reel_job_update(job_id, current_step="Reading video duration")
+        video_duration = await asyncio.to_thread(_reel_ffprobe_duration_sync, src_path)
+
+        _reel_job_update(job_id, current_step="Transcribing (faster-whisper)")
+        try:
+            transcript = await asyncio.wait_for(
+                asyncio.to_thread(_reel_transcribe_sync, src_path), timeout=_REEL_WHISPER_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Transcription timed out after {_REEL_WHISPER_TIMEOUT_SECONDS}s")
+
+        _reel_job_update(job_id, current_step="Selecting the best segment (Claude)")
+        segment = await _reel_pick_best_segment(transcript, video_duration)
+
+        _reel_job_update(job_id, current_step="Burning subtitles & rendering vertical clip")
+        srt_text = _reel_build_srt(transcript, segment["start"], segment["end"])
+        srt_path = os.path.join(tmp_dir, "clip.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_text)
+        out_path = os.path.join(tmp_dir, "output.mp4")
+        await asyncio.to_thread(_reel_run_ffmpeg_sync, src_path, segment["start"], segment["end"], srt_path, out_path)
+
+        _reel_job_update(job_id, current_step="Uploading finished Reel")
+        with open(out_path, "rb") as f:
+            output_bytes = f.read()
+        output_storage_path = f"{user_id}/{job_id}/output.mp4"
+        await asyncio.to_thread(
+            _supabase_storage_upload_sync, output_storage_path, output_bytes, "video/mp4",
+            _REEL_STORAGE_BUCKET, False,
+        )
+
+        finished_at = datetime.utcnow().isoformat()
+        _reel_job_update(
+            job_id, status="done", current_step="Done", output_storage_path=output_storage_path,
+            hook=segment["hook"], segment_start=segment["start"], segment_end=segment["end"],
+            finished_at=finished_at,
+        )
+        logger.info(f"[REEL] job {job_id} succeeded: segment {segment['start']:.1f}-{segment['end']:.1f}s")
+    except Exception as e:
+        finished_at = datetime.utcnow().isoformat()
+        error_message = str(e)[:500] or f"{type(e).__name__} (no message)"
+        _reel_job_update(job_id, status="failed", current_step="Failed", error_message=error_message, finished_at=finished_at)
+        logger.error(f"[REEL] job {job_id} failed: {error_message}")
+    finally:
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+@app.post("/creative-studio/reel-editor/jobs")
+async def reel_editor_upload(request: Request, file: UploadFile = File(...)):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not _supabase_storage_configured():
+        return JSONResponse(
+            {"success": False, "error": "Supabase Storage not configured — set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the server"},
+            status_code=503,
+        )
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse({"success": False, "error": "ANTHROPIC_API_KEY is not configured on the server"}, status_code=503)
+
+    original_name = file.filename or "upload.mp4"
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in _REEL_ALLOWED_EXTENSIONS:
+        return JSONResponse(
+            {"success": False, "error": f"Unsupported file type '{ext}' — allowed: {', '.join(sorted(_REEL_ALLOWED_EXTENSIONS))}"},
+            status_code=400,
+        )
+
+    data = await file.read()
+    if not data:
+        return JSONResponse({"success": False, "error": "Empty file"}, status_code=400)
+    if len(data) > _REEL_MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {"success": False, "error": f"File too large — max {_REEL_MAX_UPLOAD_BYTES // (1024 * 1024)}MB"},
+            status_code=400,
+        )
+
+    job_id = uuid.uuid4().hex
+    # user_id-scoped storage path, per the module-wide rule — every query
+    # and storage path in this feature is filtered by user_id.
+    storage_path = f"{uid}/{job_id}/source{ext}"
+    try:
+        await asyncio.to_thread(
+            _supabase_storage_upload_sync, storage_path, data, "video/mp4", _REEL_STORAGE_BUCKET, False,
+        )
+    except Exception as e:
+        logger.error(f"[REEL] upload failed: {e}")
+        return JSONResponse({"success": False, "error": "Upload to storage failed"}, status_code=502)
+    del data
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO creative_reel_jobs (id, user_id, status, current_step, source_filename, "
+            "source_storage_path, created_at) VALUES (:id, :uid, 'queued', 'Queued', :fn, :sp, :ts)"
+        ), {"id": job_id, "uid": uid, "fn": original_name, "sp": storage_path, "ts": now})
+
+    asyncio.create_task(_run_reel_job(job_id, uid, storage_path))
+    return {"success": True, "job_id": job_id}
+
+
+_REEL_JOB_COLS = ["id", "user_id", "status", "current_step", "source_filename", "source_storage_path",
+                   "output_storage_path", "hook", "segment_start", "segment_end", "error_message",
+                   "created_at", "started_at", "finished_at"]
+
+
+@app.get("/creative-studio/reel-editor/jobs")
+async def reel_editor_list_jobs(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT {', '.join(_REEL_JOB_COLS)} FROM creative_reel_jobs WHERE user_id=:uid ORDER BY created_at DESC LIMIT 50"
+        ), {"uid": uid}).fetchall()
+    return {"success": True, "jobs": [dict(zip(_REEL_JOB_COLS, r)) for r in rows]}
+
+
+@app.get("/creative-studio/reel-editor/jobs/{job_id}")
+async def reel_editor_get_job(job_id: str, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_REEL_JOB_COLS)} FROM creative_reel_jobs WHERE id=:id AND user_id=:uid"
+        ), {"id": job_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"success": True, "job": dict(zip(_REEL_JOB_COLS, row))}
+
+
+@app.get("/creative-studio/reel-editor/jobs/{job_id}/download-url")
+async def reel_editor_download_url(job_id: str, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, output_storage_path FROM creative_reel_jobs WHERE id=:id AND user_id=:uid"
+        ), {"id": job_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    status, output_storage_path = row
+    if status != "done" or not output_storage_path:
+        raise HTTPException(status_code=400, detail=f"Job is {status}, not done yet — no output to download")
+    signed_url = await asyncio.to_thread(_supabase_storage_signed_url_sync, output_storage_path, _REEL_STORAGE_BUCKET, 3600)
+    return {"success": True, "url": signed_url, "expires_in": 3600}
 
 
 # ── Module 3: Prospect Discovery ─────────────────────────────────────────────
@@ -25646,6 +26095,40 @@ try:
     logger.info("[REVENUE] revenue_goals/revenue_rate_cards/prospect_suppressions/whatsapp_outreach_sessions tables ready")
 except Exception as _re:
     logger.error(f"[REVENUE] table creation failed: {_re}")
+
+
+# ── Creative Studio: AI Reel Auto-Editor ─────────────────────────────────────
+# One job row per upload — id is a uuid.uuid4().hex TEXT id, matching
+# voice_batches' own convention (not SERIAL), since the id is handed to the
+# frontend immediately on upload (before the row's real primary key would
+# otherwise be known) and used directly in storage paths.
+_REEL_JOB_DDL = """
+CREATE TABLE IF NOT EXISTS creative_reel_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    current_step TEXT,
+    source_filename TEXT,
+    source_storage_path TEXT,
+    output_storage_path TEXT,
+    hook TEXT,
+    segment_start REAL,
+    segment_end REAL,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+"""
+try:
+    with engine.begin() as _rjconn:
+        for _rjstmt in _REEL_JOB_DDL.strip().split(";"):
+            _rjstmt = _rjstmt.strip()
+            if _rjstmt:
+                _rjconn.execute(text(_rjstmt))
+    logger.info("[REEL] creative_reel_jobs table ready")
+except Exception as _rje:
+    logger.error(f"[REEL] table creation failed: {_rje}")
 
 
 def _is_prospect_suppressed(user_id: str, place_id: str, phone_e164: Optional[str] = None, channel: str = "all") -> bool:
