@@ -878,6 +878,13 @@ CREATE TABLE IF NOT EXISTS creative_studio_memory (
     created_at      TEXT,
     updated_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS keyword_research_memory (
+    id              BIGSERIAL PRIMARY KEY,
+    business_key    TEXT UNIQUE NOT NULL,
+    data            TEXT,
+    created_at      TEXT,
+    updated_at      TEXT
+);
 """
 
 def _create_memory_tables():
@@ -888,7 +895,7 @@ def _create_memory_tables():
     """
     _memory_table_names = ["business_memory", "market_memory", "competitor_memory",
                            "audience_memory", "campaign_memory", "opportunity_memory",
-                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory", "creative_director_memory", "ad_creative_memory", "creative_studio_memory"]
+                           "offer_memory", "website_memory", "visibility_memory", "outreach_memory", "kpi_memory", "performance_memory", "optimizer_memory", "result_memory", "growth_memory", "prospect_memory", "autonomous_plan_memory", "social_intel_memory", "creative_director_memory", "ad_creative_memory", "creative_studio_memory", "keyword_research_memory"]
     with engine.connect() as conn:
         # Check if any table has JSONB columns (only on Postgres)
         needs_recreate = False
@@ -1021,6 +1028,7 @@ _MEMORY_TABLES = {
     "creative_director": "creative_director_memory",
     "ad_creative":       "ad_creative_memory",
     "creative_studio":   "creative_studio_memory",
+    "keyword_research":  "keyword_research_memory",
 }
 
 def _json_val(v):
@@ -4223,13 +4231,31 @@ async def campaign_launch_kit(request: CampaignLaunchKitRequest):
     # so /google-ads/create-campaign can pull them back when the user clicks
     # "Push to Google Ads". Must use the SAME key derivation as the lookup.
     campaign_assets = _extract_campaign_kit_assets(google_kit)
-    logger.info(f"[CAMPAIGN KIT] SAVE key: '{business_key}'")
+
+    # Post-audit fix: Campaign Launch Kit used to always push GPT-invented
+    # keywords (no real volume/competition grounding at all) into the
+    # campaign that eventually gets pushed to a live Google Ads account.
+    # _prior_mem (loaded above, same business_key, same lookup already done
+    # for real performance data) includes "keyword_research" automatically
+    # once that table is registered in _MEMORY_TABLES — reuse it here
+    # rather than a second DB round-trip. Real, measured search volume
+    # takes priority; GPT's own keyword list is used ONLY when no research
+    # exists yet for this business, exactly the "fall back to current
+    # behaviour" the integration calls for.
+    _research_mem = (_prior_mem.get("keyword_research") or {}).get("data") if _prior_mem else None
+    _real_volume_keywords = _kw_research_to_campaign_keywords(_research_mem)
+    keyword_source = "keyword_research_real_volume" if _real_volume_keywords else "gpt_generated"
+    final_keywords = _real_volume_keywords or campaign_assets["keywords"]
+    logger.info(
+        f"[CAMPAIGN KIT] SAVE key: '{business_key}' keyword_source={keyword_source} count={len(final_keywords)}"
+    )
     save_to_memory("campaign", business_key, {
         "campaign_data": {
-            "keywords":     campaign_assets["keywords"],
+            "keywords":     final_keywords,
             "headlines":    campaign_assets["headlines"],
             "descriptions": campaign_assets["descriptions"],
             "sitelinks":    campaign_assets["sitelinks"],
+            "keyword_source": keyword_source,
         }
     })
 
@@ -26129,6 +26155,904 @@ try:
     logger.info("[REEL] creative_reel_jobs table ready")
 except Exception as _rje:
     logger.error(f"[REEL] table creation failed: {_rje}")
+
+
+# ── Keyword Intelligence ──────────────────────────────────────────────────────
+# keyword_research_cache: mandatory 30-day cache per (seed_set, geo, language,
+# network) — Keyword Planning services are rate-limited tighter than other
+# Google Ads services, and Google's own guidance is to cache rather than
+# re-request. cache_key is a deterministic hash of the normalized inputs, so
+# a repeat request for the same segment is a pure DB read, never a live call.
+# keyword_research_jobs: same asyncio.create_task + status-row pattern as
+# gads_import_jobs/creative_reel_jobs — no queue system exists in this
+# codebase, job rows ARE the queue.
+_KEYWORD_RESEARCH_DDL = """
+CREATE TABLE IF NOT EXISTS keyword_research_cache (
+    cache_key       TEXT PRIMARY KEY,
+    seed_terms_json TEXT NOT NULL,
+    geo             TEXT NOT NULL,
+    language        TEXT NOT NULL,
+    network         TEXT NOT NULL,
+    ideas_json      TEXT NOT NULL,
+    fetched_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS keyword_research_jobs (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    business_key    TEXT,
+    category        TEXT,
+    city            TEXT,
+    seed_keywords_json TEXT,
+    competitor_url  TEXT,
+    budget_micros   BIGINT,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    current_step    TEXT,
+    error_message   TEXT,
+    created_at      TEXT NOT NULL,
+    started_at      TEXT,
+    finished_at     TEXT
+);
+"""
+try:
+    with engine.begin() as _kwconn:
+        for _kwstmt in _KEYWORD_RESEARCH_DDL.strip().split(";"):
+            _kwstmt = _kwstmt.strip()
+            if _kwstmt:
+                _kwconn.execute(text(_kwstmt))
+    logger.info("[KEYWORD-INTEL] keyword_research_cache/keyword_research_jobs tables ready")
+except Exception as _kwe:
+    logger.error(f"[KEYWORD-INTEL] table creation failed: {_kwe}")
+
+
+# ── Keyword Intelligence: provenance labels ───────────────────────────────────
+# Every row in this module's output carries one of these, set by the caller
+# from actual pipeline state — never self-reported by the model. This is the
+# hard guarantee behind "never present model-generated keyword guesses as
+# search data."
+_KW_LABEL_VERIFIED     = "VERIFIED"      # Search Console — observed real queries
+_KW_LABEL_REAL_VOLUME  = "REAL_VOLUME"   # Google Ads Keyword Planning API
+_KW_LABEL_OBSERVED     = "OBSERVED"      # web research — phrasing/intent only, never a volume
+
+# English=1000, Hindi=1023 — Google Ads' own published, stable language
+# criterion IDs (https://developers.google.com/google-ads/api/data/codes-formats#languages).
+# Not tenant-specific, no API lookup needed, unlike geo targets.
+_KW_LANGUAGE_CONSTANTS = {"en": "languageConstants/1000", "hi": "languageConstants/1023"}
+_KW_CACHE_DAYS = 30
+_KW_MAX_SEED_TERMS = 20   # KeywordSeed/KeywordAndUrlSeed hard cap per the API itself
+_KW_MAX_CONCURRENCY = 2   # small concurrency cap — Keyword Planning is rate-limited tighter than other Ads services
+
+
+def _kw_cache_key(prefix: str, terms: list, geo: str, language_constants: list, network: str,
+                   page_url: str = "") -> str:
+    """Deterministic cache key for a (term set, geo, language, network,
+    page_url) combination — same normalized inputs always hash to the same
+    key, so a repeat request is a pure cache read, never a live call.
+    page_url is included because a KeywordAndUrlSeed call (competitor URL
+    given) returns different ideas than a plain KeywordSeed call for the
+    identical seed terms — omitting it would wrongly conflate the two.
+    `prefix` distinguishes an ideas-call cache entry from a historical-
+    metrics-call entry sharing the same table (different shape, same
+    freshness window)."""
+    normalized = {
+        "terms": sorted(t.strip().lower() for t in terms if t and t.strip()),
+        "geo": geo, "languages": sorted(language_constants), "network": network,
+        "page_url": (page_url or "").strip().lower(),
+    }
+    digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+    return f"{prefix}:{digest}"
+
+
+def _kw_cache_lookup(cache_key: str) -> Optional[dict]:
+    """Real cache read — _KW_CACHE_DAYS freshness window, per Google's own
+    guidance that Keyword Planning results hold over long spans. Returns
+    None on a miss or a stale hit (never partially-stale data silently
+    reused) — the caller then makes a live call and re-caches."""
+    cutoff = (datetime.utcnow() - timedelta(days=_KW_CACHE_DAYS)).isoformat()
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT ideas_json, fetched_at FROM keyword_research_cache WHERE cache_key=:k AND fetched_at >= :cutoff"
+        ), {"k": cache_key, "cutoff": cutoff}).fetchone()
+    if not row:
+        return None
+    return {"payload": json.loads(row[0]), "fetched_at": row[1]}
+
+
+def _kw_cache_store(cache_key: str, seed_terms: list, geo: str, language: str, network: str, payload) -> None:
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO keyword_research_cache (cache_key, seed_terms_json, geo, language, network, ideas_json, fetched_at) "
+            "VALUES (:k, :st, :geo, :lang, :net, :payload, :ts) "
+            "ON CONFLICT(cache_key) DO UPDATE SET ideas_json=:payload, fetched_at=:ts"
+        ), {"k": cache_key, "st": json.dumps(seed_terms), "geo": geo, "lang": language, "net": network,
+            "payload": json.dumps(payload), "ts": now})
+
+
+_kw_semaphore = asyncio.Semaphore(_KW_MAX_CONCURRENCY)
+
+
+async def _kw_gads_call_with_backoff(fn, *args, label: str = "", max_retries: int = 3, base_delay: float = 5.0):
+    """Runs a blocking Google Ads SDK call via asyncio.to_thread, with real
+    retry/backoff specifically on quota/rate-limit errors (QuotaError.
+    RESOURCE_EXHAUSTED / RESOURCE_TEMPORARILY_EXHAUSTED — Keyword Planning
+    services are documented as more tightly rate-limited than other Google
+    Ads services). A non-quota error (auth, invalid argument, permission)
+    is never blindly retried — it raises immediately, since retrying it
+    would just fail the same way three more times, slower."""
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except GoogleAdsException as ex:
+            is_quota = any("quota" in str(e.error_code).lower() for e in ex.failure.errors)
+            last_err = ex
+            if not is_quota or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(f"[KEYWORD-INTEL] {label}: quota/rate-limit error, retry {attempt + 1}/{max_retries} in {delay:.0f}s")
+            await asyncio.sleep(delay)
+    raise last_err
+
+
+def _kw_generate_ideas_sync(client, customer_id: str, seed_terms: list, geo_target: str,
+                             language_constant: str, page_url: str = "") -> list:
+    """Blocking — call only via _kw_gads_call_with_backoff. Returns REAL API
+    results only, one dict per keyword idea: {keyword, avg_monthly_searches,
+    competition, competition_index, low_bid_micros, high_bid_micros}. Never
+    invents a row — an empty API response returns an empty list, and any
+    metric the API didn't return stays None (proto-plus returns None for an
+    unset `optional` scalar field — never fabricated as 0)."""
+    svc = client.get_service("KeywordPlanIdeaService")
+    req = client.get_type("GenerateKeywordIdeasRequest")
+    req.customer_id = customer_id
+    req.geo_target_constants.append(geo_target)
+    req.language = language_constant
+    req.keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+    terms = [t for t in seed_terms if t and t.strip()][:_KW_MAX_SEED_TERMS]
+    if page_url:
+        req.keyword_and_url_seed.url = page_url
+        req.keyword_and_url_seed.keywords.extend(terms)
+    else:
+        req.keyword_seed.keywords.extend(terms)
+    response = svc.generate_keyword_ideas(request=req)
+    results = []
+    for idea in response:
+        m = idea.keyword_idea_metrics
+        competition = m.competition.name if m.competition is not None else "UNSPECIFIED"
+        results.append({
+            "keyword": idea.text,
+            "avg_monthly_searches": m.avg_monthly_searches,
+            "competition": competition if competition not in ("UNSPECIFIED", "UNKNOWN") else None,
+            "competition_index": m.competition_index,
+            "low_bid_micros": m.low_top_of_page_bid_micros,
+            "high_bid_micros": m.high_top_of_page_bid_micros,
+        })
+    return results
+
+
+def _kw_generate_historical_metrics_sync(client, customer_id: str, keywords: list, geo_target: str,
+                                          language_constant: str) -> dict:
+    """Blocking — call only via _kw_gads_call_with_backoff. Returns REAL
+    12-month data only: {keyword_text: [{"year": int, "month": "JANUARY",
+    "searches": int|None}, ...]}. A keyword the API silently deduped away
+    (near-exact variants — see the field's own docstring) just doesn't
+    appear in the result; never backfilled or guessed."""
+    svc = client.get_service("KeywordPlanIdeaService")
+    req = client.get_type("GenerateKeywordHistoricalMetricsRequest")
+    req.customer_id = customer_id
+    req.geo_target_constants.append(geo_target)
+    req.language = language_constant
+    req.keyword_plan_network = client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
+    req.keywords.extend([k for k in keywords if k and k.strip()][:_KW_MAX_SEED_TERMS])
+    response = svc.generate_keyword_historical_metrics(request=req)
+    result = {}
+    for r in response.results:
+        monthly = [
+            {"year": mv.year, "month": mv.month.name, "searches": mv.monthly_searches}
+            for mv in r.keyword_metrics.monthly_search_volumes
+        ]
+        result[r.text] = monthly
+    return result
+
+
+async def _kw_fetch_ideas_multi_language(client, customer_id: str, seed_terms: list, geo_target: str,
+                                          page_url: str = "") -> list:
+    """GenerateKeywordIdeas takes exactly one language per call (a oneof
+    field, not repeated) — calls once per configured language (English +
+    Hindi, per spec) and merges by lowercased keyword text, keeping
+    whichever language's result reports the higher volume for a keyword
+    that surfaced under both. One language's call failing (e.g. a transient
+    quota error that exhausts its own retries) is logged and skipped rather
+    than failing the whole job if the other language still succeeds."""
+    merged = {}
+    for lang_code, lang_constant in _KW_LANGUAGE_CONSTANTS.items():
+        async with _kw_semaphore:
+            try:
+                items = await _kw_gads_call_with_backoff(
+                    _kw_generate_ideas_sync, client, customer_id, seed_terms, geo_target, lang_constant, page_url,
+                    label=f"GenerateKeywordIdeas[{lang_code}]",
+                )
+            except GoogleAdsException as ex:
+                logger.error(f"[KEYWORD-INTEL] GenerateKeywordIdeas[{lang_code}] failed: {ex}")
+                continue
+        for item in items:
+            key = item["keyword"].strip().lower()
+            if key not in merged or (item["avg_monthly_searches"] or 0) > (merged[key]["avg_monthly_searches"] or 0):
+                merged[key] = item
+    return list(merged.values())
+
+
+async def _kw_fetch_historical_multi_language(client, customer_id: str, keywords: list, geo_target: str) -> dict:
+    """Same one-call-per-language shape as _kw_fetch_ideas_multi_language,
+    merged by keeping whichever language returned more monthly data points
+    for a given keyword (a keyword with real Hindi-market search history
+    showing under the Hindi call but not the English one, or vice versa,
+    must not lose its trend data to whichever call happened to run last)."""
+    merged = {}
+    for lang_code, lang_constant in _KW_LANGUAGE_CONSTANTS.items():
+        async with _kw_semaphore:
+            try:
+                result = await _kw_gads_call_with_backoff(
+                    _kw_generate_historical_metrics_sync, client, customer_id, keywords, geo_target, lang_constant,
+                    label=f"GenerateKeywordHistoricalMetrics[{lang_code}]",
+                )
+            except GoogleAdsException as ex:
+                logger.error(f"[KEYWORD-INTEL] GenerateKeywordHistoricalMetrics[{lang_code}] failed: {ex}")
+                continue
+        for kw, monthly in result.items():
+            key = kw.strip().lower()
+            if key not in merged or len(monthly) > len(merged[key]["monthly"]):
+                merged[key] = {"text": kw, "monthly": monthly}
+    return merged
+
+
+_KW_NETWORK_LABEL = "GOOGLE_SEARCH"
+
+
+async def _kw_get_ideas_cached(client, customer_id: str, seed_terms: list, geo_target: str, page_url: str = "") -> tuple:
+    """Cache-first orchestration for GenerateKeywordIdeas — mandatory per
+    spec, not optional: a repeat request for the same (seed set, geo,
+    language, network) is a pure DB read, never a live call, for
+    _KW_CACHE_DAYS. Returns (ideas: list, cache_date: str|None, from_cache: bool)."""
+    cache_key = _kw_cache_key("ideas", seed_terms, geo_target, list(_KW_LANGUAGE_CONSTANTS.values()), _KW_NETWORK_LABEL, page_url)
+    cached = _kw_cache_lookup(cache_key)
+    if cached:
+        return cached["payload"], cached["fetched_at"], True
+    ideas = await _kw_fetch_ideas_multi_language(client, customer_id, seed_terms, geo_target, page_url)
+    now = datetime.utcnow().isoformat()
+    _kw_cache_store(cache_key, seed_terms, geo_target, ",".join(_KW_LANGUAGE_CONSTANTS.values()), _KW_NETWORK_LABEL, ideas)
+    return ideas, now, False
+
+
+async def _kw_get_historical_cached(client, customer_id: str, keywords: list, geo_target: str) -> tuple:
+    """Same cache-first discipline for GenerateKeywordHistoricalMetrics —
+    called separately from the ideas cache (different cache_key prefix,
+    same table) since it runs on a different, later-determined keyword set
+    (the top 10 by volume, decided only after clustering)."""
+    cache_key = _kw_cache_key("hist", keywords, geo_target, list(_KW_LANGUAGE_CONSTANTS.values()), _KW_NETWORK_LABEL)
+    cached = _kw_cache_lookup(cache_key)
+    if cached:
+        return cached["payload"], cached["fetched_at"], True
+    merged = await _kw_fetch_historical_multi_language(client, customer_id, keywords, geo_target)
+    now = datetime.utcnow().isoformat()
+    _kw_cache_store(cache_key, keywords, geo_target, ",".join(_KW_LANGUAGE_CONSTANTS.values()), _KW_NETWORK_LABEL, merged)
+    return merged, now, False
+
+
+def _kw_blend_gsc_queries(ads_rows: dict, gsc_queries: list) -> dict:
+    """Merges Search Console's real observed queries into the ads_rows dict
+    (keyed by lowercased keyword text, same shape _kw_get_ideas_cached
+    produces). A GSC query already present from the Ads API keeps its
+    REAL_VOLUME row but gains the real gsc_clicks/gsc_impressions/
+    gsc_position fields (both real, from different sources — never
+    conflated). A GSC-only query becomes a new VERIFIED row with
+    avg_monthly_searches=None ("not available" per the hard rule — GSC
+    reports clicks/impressions, never Google Ads search volume) unless a
+    later exact-text match against Ads data fills it in."""
+    for q in gsc_queries:
+        key = (q.get("query_text") or "").strip().lower()
+        if not key:
+            continue
+        gsc_fields = {
+            "gsc_clicks": q.get("clicks"), "gsc_impressions": q.get("impressions"),
+            "gsc_ctr": q.get("ctr"), "gsc_position": q.get("avg_position"),
+        }
+        if key in ads_rows:
+            ads_rows[key].update(gsc_fields)
+            ads_rows[key]["data_source"] = "google_ads_api+search_console"
+            ads_rows[key]["label"] = _KW_LABEL_VERIFIED  # observed real query outranks estimated-only
+        else:
+            ads_rows[key] = {
+                "keyword": q.get("query_text", ""), "avg_monthly_searches": None,
+                "competition": None, "competition_index": None,
+                "low_bid_micros": None, "high_bid_micros": None,
+                "data_source": "search_console", "label": _KW_LABEL_VERIFIED,
+                **gsc_fields,
+            }
+    return ads_rows
+
+
+async def _kw_fetch_observed_phrasings(category: str, city: str) -> list:
+    """Web research layer — context and phrasing only, NEVER a volume
+    number, per the module's hard rule. fetch_tavily returns raw prose;
+    a small GPT pass extracts discrete phrase-level items from it (an
+    ALLOWED interpretation task — clustering/extraction of what's already
+    in the real research text, not invention), each one explicitly
+    labeled OBSERVED with search_volume fixed to None regardless of
+    anything the model might otherwise claim."""
+    query = f"{category} {city} frequently asked questions forum discussion"
+    try:
+        raw_text = await fetch_tavily(query)
+    except Exception as e:
+        logger.warning(f"[KEYWORD-INTEL] Tavily research failed (non-fatal): {e}")
+        return []
+    if not raw_text or not raw_text.strip():
+        return []
+
+    def _build(correction):
+        prompt = (
+            f"Below is real web research text about \"{category}\" in {city}. Extract up to 15 distinct search-like "
+            "phrases or questions that real people would plausibly type into Google, based ONLY on what this text "
+            "actually discusses — do not invent topics the text doesn't mention.\n\n"
+            f"RESEARCH TEXT:\n{raw_text[:4000]}\n\n"
+            + (f"\n{correction}\n" if correction else "") +
+            'Return ONLY valid JSON: {"phrases": ["phrase 1", "phrase 2", ...]}'
+        )
+        return [{"role": "user", "content": prompt}]
+
+    try:
+        parsed = await _call_gpt_json_with_retry(_build, model="gpt-4o-mini", max_tokens=800, label="keyword-intel observed phrasings")
+    except Exception as e:
+        logger.warning(f"[KEYWORD-INTEL] Observed-phrasing extraction failed (non-fatal): {e}")
+        return []
+    phrases = parsed.get("phrases", [])
+    if not isinstance(phrases, list):
+        return []
+    return [
+        {"keyword": str(p).strip(), "avg_monthly_searches": None, "competition": None, "competition_index": None,
+         "low_bid_micros": None, "high_bid_micros": None, "data_source": "web_research", "label": _KW_LABEL_OBSERVED}
+        for p in phrases if str(p).strip()
+    ]
+
+
+async def _kw_expand_seed_terms(category: str, city: str, seed_keywords: list, competitor_url: str = "") -> list:
+    """GPT expands a category into seed terms BEFORE the Ads API call — an
+    ALLOWED step per spec. These seeds are NEVER shown to the user or
+    persisted as a result row; they only earn a place in the output if
+    GenerateKeywordIdeas returns real volume for them (or a close variant
+    of them). If the tenant already gave explicit seed_keywords, those are
+    used as-is (still just seeds, same rule) and this expansion just adds
+    a few more candidates around them rather than replacing them."""
+    base = [k.strip() for k in (seed_keywords or []) if k and k.strip()]
+    if len(base) >= 8:
+        return base[:_KW_MAX_SEED_TERMS]
+
+    def _build(correction):
+        prompt = (
+            f"A business in the category \"{category}\" in {city}, India wants Google Ads keyword research. "
+            + (f"They already have these seed keywords: {', '.join(base)}. " if base else "") +
+            (f"A competitor's site is {competitor_url}. " if competitor_url else "") +
+            "Suggest up to 12 additional realistic SHORT seed phrases (2-4 words each) a potential customer would "
+            "search for — mix of service-specific, symptom/need-based, and 'near me'/local-intent phrasing. These "
+            "are only STARTING POINTS for a real search-volume lookup, not a final list — do not include reasoning, "
+            "just the phrases.\n\n"
+            + (f"\n{correction}\n" if correction else "") +
+            'Return ONLY valid JSON: {"seeds": ["phrase 1", "phrase 2", ...]}'
+        )
+        return [{"role": "user", "content": prompt}]
+
+    try:
+        parsed = await _call_gpt_json_with_retry(_build, model="gpt-4o-mini", max_tokens=500, label="keyword-intel seed expansion")
+        extra = [str(s).strip() for s in parsed.get("seeds", []) if str(s).strip()]
+    except Exception as e:
+        logger.warning(f"[KEYWORD-INTEL] Seed expansion failed, using base seeds only: {e}")
+        extra = []
+    combined, seen = [], set()
+    for term in base + extra:
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            combined.append(term)
+    return combined[:_KW_MAX_SEED_TERMS] or [category]
+
+
+_KW_INTENT_TYPES = {"informational", "commercial", "transactional", "branded"}
+
+
+async def _kw_cluster_keywords(keyword_rows: list, category: str, city: str) -> dict:
+    """GPT clusters the REAL keyword rows by intent, detects Hinglish/
+    vernacular phrasing patterns, and writes a grounded "why this matters"
+    line per cluster — interpretation/grouping, explicitly allowed. NEVER
+    allowed to introduce a keyword that isn't in the real input set: every
+    keyword GPT lists inside a cluster is checked against the real input by
+    exact case-insensitive text match; anything that doesn't match is
+    dropped and logged, never silently kept. This deterministic guard is
+    the actual guarantee — the prompt instruction alone is not trusted,
+    matching this codebase's established discipline for every other GPT
+    call whose output must not exceed a bounded, real input set."""
+    if not keyword_rows:
+        return {"clusters": [], "hinglish_patterns": [], "dropped_count": 0}
+
+    real_texts_by_lower = {r["keyword"].strip().lower(): r["keyword"] for r in keyword_rows if r.get("keyword")}
+    kw_lines = "\n".join(
+        f"- {r['keyword']} | volume={r['avg_monthly_searches'] if r['avg_monthly_searches'] is not None else 'n/a'} "
+        f"| competition={r.get('competition') or 'n/a'} | source={r['label']}"
+        for r in keyword_rows
+    )
+
+    def _build(correction):
+        prompt = (
+            f"Below is a REAL list of keywords for \"{category}\" in {city}, India, each with its real search "
+            "volume/competition where available (source label shown — REAL_VOLUME is from Google Ads, VERIFIED is "
+            "from Search Console, OBSERVED is unverified web research phrasing).\n\n"
+            f"{kw_lines}\n\n"
+            "Group these EXACT keywords (copy the text verbatim, never rephrase or invent a new one) into intent "
+            "clusters: informational (\"what is\", \"how to\"), commercial (\"best\", \"vs\", \"cost\", \"review\"), "
+            "transactional (\"near me\", \"book\", \"appointment\", \"price\"), branded (mentions a specific brand "
+            "name). Every keyword above must appear in exactly one cluster.\n\n"
+            "Also identify up to 5 Hinglish/vernacular phrasing patterns you notice in this exact list (mixed "
+            "Hindi-English constructions) — only patterns actually present above, not general knowledge.\n\n"
+            + (f"\n{correction}\n" if correction else "") +
+            "Return ONLY valid JSON:\n"
+            '{"clusters": [{"intent": "transactional", "label": "short cluster name", '
+            '"why_it_matters": "one sentence grounded in the real volume/competition shown above", '
+            '"recommendation": "bid"|"content"|"both", "keywords": ["exact keyword text", ...]}], '
+            '"hinglish_patterns": ["pattern description", ...]}'
+        )
+        return [{"role": "user", "content": prompt}]
+
+    try:
+        parsed = await _call_gpt_json_with_retry(_build, model="gpt-4o", max_tokens=3000, label="keyword-intel clustering")
+    except Exception as e:
+        logger.error(f"[KEYWORD-INTEL] Clustering failed: {e}")
+        return {"clusters": [], "hinglish_patterns": [], "dropped_count": 0}
+
+    validated_clusters, dropped = [], []
+    for c in parsed.get("clusters", []):
+        if not isinstance(c, dict):
+            continue
+        intent = str(c.get("intent", "")).strip().lower()
+        if intent not in _KW_INTENT_TYPES:
+            intent = "commercial"
+        real_kw_texts = []
+        for kw in c.get("keywords", []):
+            key = str(kw).strip().lower()
+            if key in real_texts_by_lower:
+                real_kw_texts.append(real_texts_by_lower[key])
+            else:
+                dropped.append(kw)
+        if not real_kw_texts:
+            continue
+        validated_clusters.append({
+            "intent": intent, "label": str(c.get("label", "")).strip()[:80],
+            "why_it_matters": str(c.get("why_it_matters", "")).strip()[:300],
+            "recommendation": c.get("recommendation") if c.get("recommendation") in ("bid", "content", "both") else "content",
+            "keywords": real_kw_texts,
+        })
+    if dropped:
+        logger.warning(f"[KEYWORD-INTEL] Clustering dropped {len(dropped)} non-real keyword(s) GPT invented: {dropped[:10]}")
+
+    hinglish = [str(p).strip() for p in parsed.get("hinglish_patterns", []) if str(p).strip()][:5]
+    return {"clusters": validated_clusters, "hinglish_patterns": hinglish, "dropped_count": len(dropped)}
+
+
+def _kw_compute_bid_shortlist(keyword_rows: list, budget_micros: int, max_items: int = 10,
+                               exclude_keywords: Optional[set] = None) -> list:
+    """Deterministic selection — never GPT-driven — of which real keywords
+    are worth bidding on given the tenant's stated budget. Real
+    avg_monthly_searches AND real bid data are both required — no volume,
+    no shortlist membership, full stop. `exclude_keywords` (lowercased
+    text) is normally the informational-intent cluster's keywords: those
+    are explicitly the content/GEO/AEO track per spec, not ad targets — a
+    purely informational "what causes X" query is real, high-volume,
+    low-competition data that would otherwise dominate a purely numeric
+    ranking despite nobody sensibly bidding on it. Sorted by a volume-vs-
+    competition score, then trimmed to what plausibly fits the stated
+    monthly budget at the keyword's own low-bid estimate (a real-number
+    affordability sanity filter, never a click/conversion forecast)."""
+    exclude_keywords = exclude_keywords or set()
+    candidates = [
+        dict(r) for r in keyword_rows
+        if r.get("avg_monthly_searches") and r.get("low_bid_micros") is not None
+        and (r.get("keyword") or "").strip().lower() not in exclude_keywords
+    ]
+    if not candidates or not budget_micros:
+        return []
+    for r in candidates:
+        comp_penalty = (r.get("competition_index") if r.get("competition_index") is not None else 50) / 100.0
+        r["_score"] = (r["avg_monthly_searches"] or 0) * (1 - comp_penalty * 0.5)
+    candidates.sort(key=lambda r: r["_score"], reverse=True)
+
+    daily_budget_micros = budget_micros / 30.0
+    shortlist = []
+    for r in candidates:
+        if r["low_bid_micros"] <= daily_budget_micros * 3:
+            r.pop("_score", None)
+            shortlist.append(r)
+        if len(shortlist) >= max_items:
+            break
+    return shortlist
+
+
+async def _kw_write_bid_reasoning(shortlist: list, budget_micros: int) -> dict:
+    """GPT writes the grounded 'why' text for an ALREADY deterministically
+    selected shortlist — it never picks the keywords itself. Returns
+    {keyword_lower: reason_text}; any keyword missing from the model's
+    response just shows no reason line rather than blocking display, and
+    any keyword text in the response that isn't in the real shortlist is
+    dropped (same fidelity discipline as clustering)."""
+    if not shortlist:
+        return {}
+    budget_rupees = round(budget_micros / 1_000_000)
+    lines = "\n".join(
+        f"- {r['keyword']} | volume={r['avg_monthly_searches']} | competition={r.get('competition') or 'n/a'} "
+        f"({r.get('competition_index', 'n/a')}/100) | bid range=Rs.{(r['low_bid_micros'] or 0) / 1_000_000:.0f}-"
+        f"Rs.{(r['high_bid_micros'] or 0) / 1_000_000:.0f}"
+        for r in shortlist
+    )
+
+    def _build(correction):
+        prompt = (
+            f"A tenant has a monthly Google Ads budget of Rs.{budget_rupees}. Below are keywords ALREADY selected "
+            "as worth bidding on (do not add, remove, or rename any) — write one grounded sentence per keyword "
+            "explaining why it's worth the bid, citing its actual volume/competition/bid numbers shown.\n\n"
+            f"{lines}\n\n"
+            + (f"\n{correction}\n" if correction else "") +
+            'Return ONLY valid JSON: {"reasons": {"<exact keyword text>": "one sentence"}}'
+        )
+        return [{"role": "user", "content": prompt}]
+
+    try:
+        parsed = await _call_gpt_json_with_retry(_build, model="gpt-4o-mini", max_tokens=1200, label="keyword-intel bid reasoning")
+    except Exception as e:
+        logger.warning(f"[KEYWORD-INTEL] Bid reasoning generation failed (non-fatal): {e}")
+        return {}
+    real_texts = {r["keyword"].lower() for r in shortlist}
+    return {k: v for k, v in parsed.get("reasons", {}).items() if str(k).lower() in real_texts}
+
+
+def _kw_job_update(job_id: str, **fields):
+    sets = ", ".join(f"{k}=:{k}" for k in fields)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE keyword_research_jobs SET {sets} WHERE id=:job_id"), {**fields, "job_id": job_id})
+
+
+def _kw_research_to_campaign_keywords(research_data: Optional[dict], max_keywords: int = 20) -> list:
+    """Converts a stored keyword-research result into the
+    {"text", "match_type"} shape _add_keywords_sync / the campaign-push
+    flow expects — the Campaign Launch Kit integration: real, measured
+    search volume instead of a GPT guess. Prefers bid_shortlist (already
+    budget-aware and deterministically selected); falls back to the
+    highest-volume REAL_VOLUME rows from top_searches when no budget was
+    given yet. Only ever pulls from REAL_VOLUME rows — a VERIFIED
+    (Search-Console-only) or OBSERVED (web-research) row with no real Ads
+    volume is never pushed as a paid keyword, since the entire point of
+    this integration is that what gets bid on is backed by measured search
+    volume, not an estimate or a guess. Returns [] (never a fabricated
+    keyword) if no real-volume research exists for this business — the
+    caller falls back to the existing GPT-generated behavior only then."""
+    if not research_data:
+        return []
+    source_rows = research_data.get("bid_shortlist") or [
+        r for r in (research_data.get("top_searches") or [])
+        if r.get("label") == _KW_LABEL_REAL_VOLUME and r.get("avg_monthly_searches")
+    ]
+    if not source_rows:
+        return []
+    ranked = sorted(source_rows, key=lambda r: r.get("avg_monthly_searches") or 0, reverse=True)[:max_keywords]
+    keywords = []
+    for i, r in enumerate(ranked):
+        text_val = (r.get("keyword") or "").strip()
+        if not text_val:
+            continue
+        keywords.append({"text": text_val, "match_type": "EXACT" if i < 5 else "PHRASE"})
+    return keywords
+
+
+async def _run_keyword_research_job(job_id: str, user_id: str, ads_client, customer_id: str,
+                                     category: str, city: str, seed_keywords: list, competitor_url: str,
+                                     budget_micros: Optional[int], business_key: str, gsc_site_url: Optional[str]):
+    """The background job — asyncio.create_task, never run inside the
+    request (same pattern as _run_gads_import_job/_run_voice_batch_job/
+    _run_reel_job). ads_client/customer_id are resolved once in the request
+    handler and passed in explicitly, rather than re-resolved from
+    ContextVar state that a long-lived detached task shouldn't depend on.
+    One top-level try/except: any failure, anywhere, ends in
+    status='failed' with a specific, readable error_message."""
+    now = datetime.utcnow().isoformat()
+    _kw_job_update(job_id, status="processing", current_step="Resolving location", started_at=now)
+    try:
+        geo_target, geo_matched_name = await asyncio.to_thread(_resolve_geo_target_sync, city, ads_client)
+
+        _kw_job_update(job_id, current_step="Expanding seed terms")
+        seed_terms = await _kw_expand_seed_terms(category, city, seed_keywords, competitor_url)
+
+        _kw_job_update(job_id, current_step="Fetching real search volume (Google Ads)")
+        ads_ideas, ideas_cache_date, ideas_from_cache = await _kw_get_ideas_cached(
+            ads_client, customer_id, seed_terms, geo_target, competitor_url,
+        )
+        keyword_rows = {
+            item["keyword"].strip().lower(): {**item, "data_source": "google_ads_api", "label": _KW_LABEL_REAL_VOLUME}
+            for item in ads_ideas
+        }
+
+        _kw_job_update(job_id, current_step="Reading Search Console (verified queries)")
+        gsc_matched = 0
+        if gsc_site_url:
+            try:
+                gsc_queries = await asyncio.to_thread(_list_gsc_top_queries, user_id, gsc_site_url, 100)
+                before = len(keyword_rows)
+                keyword_rows = _kw_blend_gsc_queries(keyword_rows, gsc_queries)
+                gsc_matched = len(keyword_rows) - before
+            except Exception as e:
+                logger.warning(f"[KEYWORD-INTEL] job {job_id}: Search Console blend failed (non-fatal): {e}")
+
+        _kw_job_update(job_id, current_step="Researching real discussion (web research)")
+        observed = await _kw_fetch_observed_phrasings(category, city)
+        for item in observed:
+            key = item["keyword"].strip().lower()
+            if key not in keyword_rows:  # never let an unverified OBSERVED row shadow a real one
+                keyword_rows[key] = item
+
+        all_rows = list(keyword_rows.values())
+        if not all_rows:
+            raise RuntimeError(
+                "No keywords found from any source (Google Ads, Search Console, or web research) for this "
+                "category/city — try broader seed keywords or a different city."
+            )
+
+        _kw_job_update(job_id, current_step="Clustering by intent (AI)")
+        cluster_result = await _kw_cluster_keywords(all_rows, category, city)
+
+        _kw_job_update(job_id, current_step="Fetching 12-month seasonality for top 10")
+        top10 = sorted(
+            (r for r in all_rows if r.get("avg_monthly_searches")),
+            key=lambda r: r["avg_monthly_searches"], reverse=True,
+        )[:10]
+        seasonality = {}
+        if top10:
+            hist_merged, hist_cache_date, hist_from_cache = await _kw_get_historical_cached(
+                ads_client, customer_id, [r["keyword"] for r in top10], geo_target,
+            )
+            for r in top10:
+                entry = hist_merged.get(r["keyword"].strip().lower())
+                if entry:
+                    seasonality[r["keyword"]] = entry["monthly"]
+        else:
+            hist_cache_date, hist_from_cache = None, False
+
+        informational_kws = {
+            kw.strip().lower() for c in cluster_result["clusters"] if c["intent"] == "informational" for kw in c["keywords"]
+        }
+        bid_shortlist, needs_budget = [], not bool(budget_micros)
+        if budget_micros:
+            _kw_job_update(job_id, current_step="Building bid shortlist")
+            bid_shortlist = _kw_compute_bid_shortlist(all_rows, budget_micros, exclude_keywords=informational_kws)
+            reasons = await _kw_write_bid_reasoning(bid_shortlist, budget_micros)
+            for r in bid_shortlist:
+                r["reason"] = reasons.get(r["keyword"].lower(), "")
+
+        top_searches = sorted(
+            all_rows, key=lambda r: (r.get("avg_monthly_searches") is not None, r.get("avg_monthly_searches") or 0),
+            reverse=True,
+        )
+        # Cluster "keywords" lists carry only the validated keyword TEXT (see
+        # _kw_cluster_keywords) — map back to the full row (volume/
+        # competition/bid/source) so the Question Searches panel has the
+        # same real data every other panel does, not just bare strings.
+        rows_by_lower = {r["keyword"].strip().lower(): r for r in all_rows}
+        question_searches = [
+            rows_by_lower[kw.strip().lower()]
+            for c in cluster_result["clusters"] if c["intent"] == "informational"
+            for kw in c["keywords"] if kw.strip().lower() in rows_by_lower
+        ]
+
+        result = {
+            "category": category, "city": city, "geo_matched_name": geo_matched_name,
+            "top_searches": top_searches,
+            "seasonality": {kw: months for kw, months in seasonality.items()},
+            "clusters": cluster_result["clusters"],
+            "hinglish_patterns": cluster_result["hinglish_patterns"],
+            "question_searches": question_searches,
+            "bid_shortlist": bid_shortlist,
+            "needs_budget": needs_budget,
+            "budget_micros": budget_micros,
+            "cache": {
+                "ideas_cache_date": ideas_cache_date, "ideas_from_cache": ideas_from_cache,
+                "historical_cache_date": hist_cache_date if top10 else None, "historical_from_cache": hist_from_cache if top10 else False,
+            },
+            "counts": {
+                "total_keywords": len(all_rows),
+                "real_volume_count": sum(1 for r in all_rows if r["label"] == _KW_LABEL_REAL_VOLUME),
+                "verified_count": sum(1 for r in all_rows if r["label"] == _KW_LABEL_VERIFIED),
+                "observed_count": sum(1 for r in all_rows if r["label"] == _KW_LABEL_OBSERVED),
+                "gsc_matched": gsc_matched, "dropped_by_fidelity_guard": cluster_result["dropped_count"],
+            },
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+        if business_key:
+            save_to_memory("keyword_research", business_key, {"data": result})
+
+        finished_at = datetime.utcnow().isoformat()
+        _kw_job_update(job_id, status="done", current_step="Done", finished_at=finished_at)
+        logger.info(f"[KEYWORD-INTEL] job {job_id} succeeded: {len(all_rows)} keywords "
+                    f"({result['counts']['real_volume_count']} real volume, {result['counts']['verified_count']} verified, "
+                    f"{result['counts']['observed_count']} observed)")
+    except Exception as e:
+        finished_at = datetime.utcnow().isoformat()
+        error_message = str(e)[:500] or f"{type(e).__name__} (no message)"
+        _kw_job_update(job_id, status="failed", current_step="Failed", error_message=error_message, finished_at=finished_at)
+        logger.error(f"[KEYWORD-INTEL] job {job_id} failed: {error_message}")
+
+
+def _kw_get_gsc_site_url(user_id: str) -> Optional[str]:
+    """The tenant's connected-and-selected Search Console property, if any
+    — reads the same table every other GSC endpoint in this codebase reads
+    directly (no single shared getter exists yet). None (not an exception)
+    when not connected — Search Console is an enrichment layer here, not a
+    hard requirement for the module to run."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT selected_site_url FROM search_console_tokens WHERE user_id=:uid AND revoked=FALSE"
+            ), {"uid": user_id}).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+class KeywordResearchRequest(BaseModel):
+    category: str
+    city: str = ""
+    seed_keywords: list[str] = []
+    competitor_url: str = ""
+    budget: Optional[int] = None   # monthly budget in rupees — None means "ask for one", never assumed
+    industry: str = ""             # optional override for Business Key derivation; defaults to category
+    url: str = ""                  # optional — ties this research to an existing Business Key (Marketing Brain, Campaign Launch Kit)
+
+
+@app.post("/keyword-intelligence/jobs")
+async def keyword_intelligence_start_job(payload: KeywordResearchRequest, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    category = (payload.category or "").strip()
+    if not category:
+        raise HTTPException(status_code=400, detail="category is required")
+    city = (payload.city or "").strip()
+
+    # Resolved once here, in the request handler, where auth_middleware has
+    # reliably set the tenant context — then passed explicitly into the
+    # background task rather than re-resolved from ContextVar state a
+    # long-lived detached task shouldn't depend on.
+    try:
+        ads_client = await asyncio.to_thread(get_google_ads_client)
+        customer_id = _gads_customer_id()
+    except GadsNotConnectedError:
+        return JSONResponse(
+            {"success": False, "error": "Google Ads is not connected for this account — connect it in Settings first."},
+            status_code=400,
+        )
+    except Exception as e:
+        logger.error(f"[KEYWORD-INTEL] Could not build Google Ads client: {e}")
+        return JSONResponse({"success": False, "error": "Could not connect to Google Ads."}, status_code=502)
+    if not customer_id:
+        return JSONResponse(
+            {"success": False, "error": "No Google Ads account is connected/selected for this tenant — connect one in Settings first."},
+            status_code=400,
+        )
+
+    industry = (payload.industry or payload.category).strip()
+    business_key = derive_business_key(payload.url, industry, city)
+    budget_micros = int(payload.budget) * 1_000_000 if payload.budget else None
+    gsc_site_url = _kw_get_gsc_site_url(uid)
+
+    job_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO keyword_research_jobs (id, user_id, business_key, category, city, seed_keywords_json, "
+            "competitor_url, budget_micros, status, current_step, created_at) "
+            "VALUES (:id, :uid, :bk, :cat, :city, :sk, :curl, :budget, 'queued', 'Queued', :ts)"
+        ), {"id": job_id, "uid": uid, "bk": business_key, "cat": category, "city": city,
+            "sk": json.dumps(payload.seed_keywords or []), "curl": payload.competitor_url or None,
+            "budget": budget_micros, "ts": now})
+
+    asyncio.create_task(_run_keyword_research_job(
+        job_id, uid, ads_client, customer_id, category, city, payload.seed_keywords or [],
+        payload.competitor_url, budget_micros, business_key, gsc_site_url,
+    ))
+    return {"success": True, "job_id": job_id, "business_key": business_key}
+
+
+_KW_JOB_COLS = ["id", "user_id", "business_key", "category", "city", "seed_keywords_json", "competitor_url",
+                "budget_micros", "status", "current_step", "error_message", "created_at", "started_at", "finished_at"]
+
+
+def _kw_job_row_to_dict(row) -> dict:
+    d = dict(zip(_KW_JOB_COLS, row))
+    d["seed_keywords"] = json.loads(d.pop("seed_keywords_json") or "[]")
+    return d
+
+
+@app.get("/keyword-intelligence/jobs")
+async def keyword_intelligence_list_jobs(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT {', '.join(_KW_JOB_COLS)} FROM keyword_research_jobs WHERE user_id=:uid ORDER BY created_at DESC LIMIT 50"
+        ), {"uid": uid}).fetchall()
+    return {"success": True, "jobs": [_kw_job_row_to_dict(r) for r in rows]}
+
+
+@app.get("/keyword-intelligence/jobs/{job_id}")
+async def keyword_intelligence_get_job(job_id: str, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_KW_JOB_COLS)} FROM keyword_research_jobs WHERE id=:id AND user_id=:uid"
+        ), {"id": job_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _kw_job_row_to_dict(row)
+    result = None
+    if job["status"] == "done" and job["business_key"]:
+        mem = get_memory(job["business_key"])
+        result = (mem.get("keyword_research") or {}).get("data")
+    return {"success": True, "job": job, "result": result}
+
+
+class KeywordShortlistRequest(BaseModel):
+    budget: int   # monthly budget in rupees — required here, this endpoint only exists to supply it
+
+
+@app.post("/keyword-intelligence/jobs/{job_id}/shortlist")
+async def keyword_intelligence_compute_shortlist(job_id: str, payload: KeywordShortlistRequest, request: Request):
+    """Cheap follow-up for "ask for a budget rather than assume one" — a
+    job that finished with needs_budget=True already has every real
+    keyword row stored; this recomputes just the deterministic bid
+    shortlist + its grounded reasoning from that stored data, with ZERO new
+    Google Ads API calls (the expensive, rate-limited part stays cached)."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if payload.budget <= 0:
+        raise HTTPException(status_code=400, detail="budget must be a positive number of rupees")
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT business_key, status FROM keyword_research_jobs WHERE id=:id AND user_id=:uid"
+        ), {"id": job_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    business_key, status = row
+    if status != "done":
+        raise HTTPException(status_code=400, detail=f"Job is {status}, not done yet")
+    mem = get_memory(business_key)
+    result = (mem.get("keyword_research") or {}).get("data")
+    if not result:
+        raise HTTPException(status_code=404, detail="No stored research result for this job")
+
+    budget_micros = payload.budget * 1_000_000
+    informational_kws = {
+        kw.strip().lower() for c in (result.get("clusters") or []) if c.get("intent") == "informational"
+        for kw in c.get("keywords", [])
+    }
+    bid_shortlist = _kw_compute_bid_shortlist(result["top_searches"], budget_micros, exclude_keywords=informational_kws)
+    reasons = await _kw_write_bid_reasoning(bid_shortlist, budget_micros)
+    for r in bid_shortlist:
+        r["reason"] = reasons.get(r["keyword"].lower(), "")
+
+    result["bid_shortlist"] = bid_shortlist
+    result["needs_budget"] = False
+    result["budget_micros"] = budget_micros
+    save_to_memory("keyword_research", business_key, {"data": result})
+    _kw_job_update(job_id, budget_micros=budget_micros)
+    return {"success": True, "bid_shortlist": bid_shortlist}
 
 
 def _is_prospect_suppressed(user_id: str, place_id: str, phone_e164: Optional[str] = None, channel: str = "all") -> bool:
