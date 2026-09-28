@@ -5244,7 +5244,24 @@ def get_stats(request: Request, db: Session = Depends(get_db)):
     if not _uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
     leads = db.query(LeadModel).filter(LeadModel.user_id == _uid).all()
-    return {"total": len(leads), "whatsapp": len([l for l in leads if l.source == "whatsapp"]), "website": len([l for l in leads if l.source == "website"]), "form": len([l for l in leads if l.source == "form"]), "new": len([l for l in leads if l.status == "New"]), "converted": len([l for l in leads if l.status == "Converted"])}
+    # Post-audit fix: real reported case — Total Leads: 4, Lead Sources
+    # (WhatsApp/Website/Form) summed to 0. Root cause: leads created
+    # automatically by Voice Outreach (source='voice_outreach') and Revenue
+    # Engine (source='revenue_engine') were never NULL/empty — they just
+    # carried a source string this endpoint's bucket set didn't recognize,
+    # so every one of them counted toward `total` but none of the three
+    # named buckets. `unknown` now catches anything that isn't one of the
+    # three recognized values, so total == whatsapp+website+form+unknown
+    # always reconciles, regardless of what future call sites set source to.
+    _known_sources = ("whatsapp", "website", "form")
+    whatsapp  = len([l for l in leads if l.source == "whatsapp"])
+    website   = len([l for l in leads if l.source == "website"])
+    form      = len([l for l in leads if l.source == "form"])
+    unknown   = len([l for l in leads if l.source not in _known_sources])
+    return {
+        "total": len(leads), "whatsapp": whatsapp, "website": website, "form": form, "unknown": unknown,
+        "new": len([l for l in leads if l.status == "New"]), "converted": len([l for l in leads if l.status == "Converted"]),
+    }
 
 @app.put("/leads/{lead_id}")
 def update_lead(
@@ -5708,6 +5725,319 @@ async def google_ads_ad_policy_status(campaign_id: str = ""):
         logger.error(f"[GOOGLE ADS] ad-policy-status unexpected: {ex}")
         return {"success": False, "error": str(ex)}
 
+
+# Post-audit fix: real reported case — a live Search campaign running 3 days
+# with 78 impressions / 5 clicks / ₹4.39 spend / 0 conversions. The dashboard
+# showed the numbers but gave no diagnosis of WHY delivery was low. Google
+# Ads' own campaign.primary_status_reasons already says exactly what's
+# wrong (BUDGET_CONSTRAINED, NO_KEYWORDS, HAS_ADS_DISAPPROVED, etc.) — this
+# maps those real reasons to plain-English text + severity + a recommended
+# fix, rather than re-deriving the diagnosis from raw metrics with
+# hand-rolled heuristics. Metrics (impression-share-lost) and keyword/ad/
+# search-term-level detail are supplementary evidence layered on top.
+_CAMPAIGN_STATUS_REASON_INFO = {
+    "CAMPAIGN_PAUSED": ("high", "Campaign is paused.", "Enable the campaign in Google Ads if you're ready for it to serve."),
+    "CAMPAIGN_PENDING": ("medium", "Campaign hasn't started yet — its start date is in the future.", "Check the campaign's start date in Google Ads."),
+    "CAMPAIGN_ENDED": ("high", "The campaign's end date has passed.", "Extend or remove the end date if you want it to keep serving."),
+    "CAMPAIGN_DRAFT": ("high", "This campaign is still a draft and was never applied.", "Apply the draft in Google Ads."),
+    "BIDDING_STRATEGY_MISCONFIGURED": ("high", "The bidding strategy is misconfigured.", "Review the bidding strategy settings in Google Ads."),
+    "BIDDING_STRATEGY_LIMITED": ("high", "The bid strategy doesn't have enough conversion data or budget to bid effectively.", "Raise the budget or max CPC, or switch to Manual CPC until more data accumulates."),
+    "BIDDING_STRATEGY_LEARNING": ("low", "The automated bid strategy is still in its learning period (normal for the first 1-2 weeks).", "No action needed yet — give it time to exit the learning phase."),
+    "BIDDING_STRATEGY_CONSTRAINED": ("medium", "The bid strategy is constrained and can't spend the full budget at its current target.", "Consider raising the target CPA/ROAS or the budget."),
+    "BUDGET_CONSTRAINED": ("high", "The campaign is limited by its budget — it could spend (and deliver) more if the budget were higher.", "Increase the daily budget."),
+    "BUDGET_MISCONFIGURED": ("high", "The campaign budget is misconfigured.", "Review the campaign budget in Google Ads."),
+    "SEARCH_VOLUME_LIMITED": ("high", "There isn't enough real search volume for the current keywords/targeting to spend the budget.", "Add more keywords, broaden match types (add Phrase/Broad, not just Exact), or widen geo targeting."),
+    "AD_GROUPS_PAUSED": ("high", "Every ad group in this campaign is paused.", "Enable at least one ad group."),
+    "NO_AD_GROUPS": ("high", "This campaign has no ad groups at all.", "Add an ad group with keywords and ads."),
+    "KEYWORDS_PAUSED": ("high", "Every keyword is paused.", "Enable at least one keyword."),
+    "NO_KEYWORDS": ("high", "This campaign has no keywords.", "Add keywords to at least one ad group."),
+    "AD_GROUP_ADS_PAUSED": ("high", "Every ad is paused.", "Enable at least one ad."),
+    "NO_AD_GROUP_ADS": ("high", "This campaign has no ads.", "Add at least one ad to an ad group."),
+    "HAS_ADS_LIMITED_BY_POLICY": ("medium", "One or more ads are limited by a policy finding — they can still serve, but with restrictions.", "Check the ad's policy findings below for the specific topic and evidence."),
+    "HAS_ADS_DISAPPROVED": ("high", "One or more ads are disapproved and cannot serve at all.", "Check the ad's policy findings below, fix the flagged issue, and resubmit."),
+    "MOST_ADS_UNDER_REVIEW": ("medium", "Most ads are still under Google's review — can take up to 24-48h for a new ad.", "No action needed yet unless it's been more than 2 days."),
+    "MISSING_LOCATION_TARGETING": ("high", "No location targeting is set on this campaign.", "Add a location target."),
+}
+
+
+def _humanize_reason(reason: str) -> str:
+    return reason.replace("_", " ").capitalize()
+
+
+@app.get("/google-ads/campaign-diagnostics/{campaign_id}")
+async def google_ads_campaign_diagnostics(campaign_id: str, request: Request, days: int = 7):
+    """Real-data diagnosis of why a specific campaign isn't delivering —
+    every issue below is either a Google-Ads-reported primary_status_reason
+    (the ground truth for "why"), an impression-share-lost metric, or a
+    concrete keyword/ad/search-term finding. Never a guess — an empty
+    `issues` list with everything ELIGIBLE/SERVING means the campaign's
+    settings genuinely look fine and any remaining delivery question is
+    about market/bid competitiveness, not a configuration problem this
+    endpoint can see."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    campaign_id = (campaign_id or "").strip()
+    if not campaign_id.isdigit():
+        raise HTTPException(status_code=400, detail="campaign_id must be numeric")
+    customer_id = _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "connect_required": True, "error": "No Google Ads account selected."}
+
+    end = date.today()
+    start = end - timedelta(days=days)
+    issues = []
+
+    def _add_issue(severity, title, detail, fix):
+        issues.append({"severity": severity, "title": title, "detail": detail, "fix": fix})
+
+    try:
+        client = get_google_ads_client()
+        service = client.get_service("GoogleAdsService")
+
+        # ── 1. Campaign status/serving/primary + budget + bidding strategy + impression share ──
+        camp_query = f"""
+            SELECT
+                campaign.id, campaign.name, campaign.status, campaign.serving_status,
+                campaign.primary_status, campaign.primary_status_reasons,
+                campaign.bidding_strategy_type,
+                campaign.manual_cpc.enhanced_cpc_enabled,
+                campaign.maximize_conversions.cpc_bid_ceiling_micros,
+                campaign.target_cpa.target_cpa_micros,
+                campaign.target_roas.target_roas,
+                campaign_budget.amount_micros, campaign_budget.status,
+                metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions,
+                metrics.search_impression_share, metrics.search_budget_lost_impression_share,
+                metrics.search_rank_lost_impression_share
+            FROM campaign
+            WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
+        """
+        camp_rows = list(service.search(customer_id=customer_id, query=camp_query))
+        if not camp_rows:
+            raise HTTPException(status_code=404, detail="Campaign not found or no data for this date range")
+
+        camp = camp_rows[0].campaign
+        campaign_name = camp.name
+        status_name = camp.status.name if hasattr(camp.status, "name") else str(camp.status)
+        serving_status_name = camp.serving_status.name if hasattr(camp.serving_status, "name") else str(camp.serving_status)
+        primary_status_name = camp.primary_status.name if hasattr(camp.primary_status, "name") else str(camp.primary_status)
+        reason_names = [r.name if hasattr(r, "name") else str(r) for r in camp.primary_status_reasons]
+
+        for reason in reason_names:
+            severity, detail, fix = _CAMPAIGN_STATUS_REASON_INFO.get(
+                reason, ("medium", f"Google Ads reports this campaign's status is affected by: {_humanize_reason(reason)}.", "Review this in the Google Ads UI for more detail.")
+            )
+            _add_issue(severity, _humanize_reason(reason), detail, fix)
+
+        # Sum metrics + capture the impression-share fields from whichever
+        # row carries them (Google Ads returns one row per date segment
+        # here; impression-share metrics are the same value repeated, not
+        # additive, unlike impressions/clicks/cost).
+        total_impressions = sum(r.metrics.impressions for r in camp_rows)
+        total_clicks = sum(r.metrics.clicks for r in camp_rows)
+        total_cost_micros = sum(r.metrics.cost_micros for r in camp_rows)
+        total_conversions = sum(r.metrics.conversions for r in camp_rows)
+        impression_share = camp_rows[-1].metrics.search_impression_share
+        budget_lost_share = camp_rows[-1].metrics.search_budget_lost_impression_share
+        rank_lost_share = camp_rows[-1].metrics.search_rank_lost_impression_share
+
+        if rank_lost_share is not None and rank_lost_share > 0.5:
+            _add_issue(
+                "high", "Losing most impression share to Ad Rank",
+                f"{round(rank_lost_share * 100, 1)}% of available impression share was lost because of Ad Rank "
+                "(bid too low and/or Quality Score too low) — the campaign isn't entering most auctions it's eligible for.",
+                "Raise the max CPC bid on your keywords, or switch to an automated bidding strategy once you have conversion tracking.",
+            )
+        if budget_lost_share is not None and budget_lost_share > 0.5:
+            _add_issue(
+                "high", "Losing impression share to budget",
+                f"{round(budget_lost_share * 100, 1)}% of available impression share was lost because the daily budget ran out.",
+                "Increase the daily budget.",
+            )
+
+        bidding_strategy_type = camp.bidding_strategy_type.name if hasattr(camp.bidding_strategy_type, "name") else str(camp.bidding_strategy_type)
+        bidding_strategy = {"type": bidding_strategy_type}
+        if bidding_strategy_type == "MANUAL_CPC":
+            bidding_strategy["enhanced_cpc_enabled"] = camp.manual_cpc.enhanced_cpc_enabled
+        elif bidding_strategy_type == "MAXIMIZE_CONVERSIONS":
+            bidding_strategy["cpc_bid_ceiling_micros"] = camp.maximize_conversions.cpc_bid_ceiling_micros or None
+        elif bidding_strategy_type == "TARGET_CPA":
+            bidding_strategy["target_cpa_micros"] = camp.target_cpa.target_cpa_micros or None
+        elif bidding_strategy_type == "TARGET_ROAS":
+            bidding_strategy["target_roas"] = camp.target_roas.target_roas or None
+
+        budget_amount_micros = camp_rows[0].campaign_budget.amount_micros
+
+        # ── 2. Keywords — system_serving_status / approval_status ──
+        kw_query = f"""
+            SELECT
+                ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,
+                ad_group_criterion.system_serving_status, ad_group_criterion.approval_status,
+                ad_group_criterion.cpc_bid_micros, ad_group_criterion.status,
+                ad_group.id
+            FROM ad_group_criterion
+            WHERE campaign.id = {campaign_id} AND ad_group_criterion.type = KEYWORD
+        """
+        kw_rows = list(service.search(customer_id=customer_id, query=kw_query))
+        keywords = []
+        low_search_volume_count = 0
+        cpc_bids = []
+        for r in kw_rows:
+            crit = r.ad_group_criterion
+            serving = crit.system_serving_status.name if hasattr(crit.system_serving_status, "name") else str(crit.system_serving_status)
+            approval = crit.approval_status.name if hasattr(crit.approval_status, "name") else str(crit.approval_status)
+            if serving == "LOW_SEARCH_VOLUME":
+                low_search_volume_count += 1
+            if crit.cpc_bid_micros:
+                cpc_bids.append(crit.cpc_bid_micros)
+            keywords.append({
+                "text": crit.keyword.text, "match_type": crit.keyword.match_type.name if hasattr(crit.keyword.match_type, "name") else str(crit.keyword.match_type),
+                "serving_status": serving, "approval_status": approval,
+                "cpc_bid_inr": round(crit.cpc_bid_micros / 1_000_000, 2) if crit.cpc_bid_micros else None,
+                "status": r.ad_group_criterion.status.name if hasattr(r.ad_group_criterion.status, "name") else str(r.ad_group_criterion.status),
+            })
+        if low_search_volume_count > 0:
+            _add_issue(
+                "medium", f"{low_search_volume_count} keyword(s) flagged \"Low search volume\"",
+                "Google Ads won't serve ads for a keyword it judges has too little search traffic to be worth evaluating.",
+                "Broaden these keywords' match type, or replace them with higher-volume alternatives (use Keyword Intelligence to check real volume first).",
+            )
+        if cpc_bids and max(cpc_bids) <= 2_000_000:
+            _add_issue(
+                "high", "Max CPC bid is very low",
+                f"The highest keyword-level bid found is ₹{round(max(cpc_bids) / 1_000_000, 2)}. Most Search verticals in India need a "
+                "meaningfully higher bid to win auctions consistently.",
+                "Raise the CPC bid on your keywords (or the ad group's default bid) — check Keyword Intelligence for this category's real bid range first.",
+            )
+        match_types = {k["match_type"] for k in keywords}
+        if keywords and match_types == {"EXACT"}:
+            _add_issue(
+                "medium", "Every keyword is Exact match only",
+                "Exact match only targets the narrowest possible set of real search queries.",
+                "Add Phrase match (and consider Broad with automated bidding) to widen the pool of matchable searches.",
+            )
+
+        # ── 3. Ads — policy_summary.approval_status ──
+        ad_query = f"""
+            SELECT ad_group_ad.ad.id, ad_group_ad.status, ad_group_ad.policy_summary.approval_status
+            FROM ad_group_ad
+            WHERE campaign.id = {campaign_id}
+        """
+        ad_rows = list(service.search(customer_id=customer_id, query=ad_query))
+        ads_summary = []
+        disapproved_count = 0
+        for r in ad_rows:
+            approval = r.ad_group_ad.policy_summary.approval_status.name if hasattr(r.ad_group_ad.policy_summary.approval_status, "name") else str(r.ad_group_ad.policy_summary.approval_status)
+            if approval == "DISAPPROVED":
+                disapproved_count += 1
+            ads_summary.append({
+                "ad_id": str(r.ad_group_ad.ad.id),
+                "status": r.ad_group_ad.status.name if hasattr(r.ad_group_ad.status, "name") else str(r.ad_group_ad.status),
+                "approval_status": approval,
+            })
+        if not ads_summary:
+            _add_issue("high", "No ads found for this campaign", "This campaign has no ads at all.", "Add at least one ad to an ad group.")
+        elif disapproved_count > 0:
+            _add_issue(
+                "high", f"{disapproved_count} ad(s) disapproved",
+                "A disapproved ad cannot serve at all — call GET /google-ads/ad-policy-status for the specific policy topic and evidence.",
+                "Fix the flagged policy issue and resubmit the ad.",
+            )
+
+        # ── 4. Search terms actually matched, for the date range ──
+        st_query = f"""
+            SELECT search_term_view.search_term, metrics.impressions, metrics.clicks
+            FROM search_term_view
+            WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
+            ORDER BY metrics.impressions DESC
+            LIMIT 50
+        """
+        st_rows = list(service.search(customer_id=customer_id, query=st_query))
+        search_terms = [
+            {"search_term": r.search_term_view.search_term, "impressions": r.metrics.impressions, "clicks": r.metrics.clicks}
+            for r in st_rows
+        ]
+        if not search_terms and total_impressions > 0:
+            pass  # impressions with no logged search terms is normal at low volume (Google doesn't log every term) — not itself an issue
+        elif not search_terms and total_impressions == 0:
+            _add_issue(
+                "high", "No search terms matched at all",
+                "Zero real searches triggered this campaign's ads in the selected date range.",
+                "This usually means keywords/bids/targeting are too narrow to enter auctions — see the other issues above for the likely specific cause.",
+            )
+
+        # ── 5. Conversion tracking ──
+        conv_query = "SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.type FROM conversion_action"
+        conv_rows = list(service.search(customer_id=customer_id, query=conv_query))
+        conversion_actions = [
+            {"name": r.conversion_action.name, "status": r.conversion_action.status.name if hasattr(r.conversion_action.status, "name") else str(r.conversion_action.status)}
+            for r in conv_rows
+        ]
+        active_conversions = [c for c in conversion_actions if c["status"] == "ENABLED"]
+        if not active_conversions:
+            _add_issue(
+                "high", "No active conversion tracking configured",
+                "This account has no enabled conversion action — Google Ads has no way to learn what a successful outcome looks like, "
+                "and any automated bidding strategy that optimizes for conversions cannot work without it.",
+                "Set up conversion tracking in Google Ads (or via the existing GSC/CRM integration) before switching to Maximize Conversions/Target CPA.",
+            )
+
+        return {
+            "success": True,
+            "campaign": {
+                "id": campaign_id, "name": campaign_name, "status": status_name,
+                "serving_status": serving_status_name, "primary_status": primary_status_name,
+                "primary_status_reasons": reason_names,
+            },
+            "budget": {"amount_inr": round(budget_amount_micros / 1_000_000, 2) if budget_amount_micros else None},
+            "bidding_strategy": bidding_strategy,
+            "metrics": {
+                "period_days": days, "impressions": total_impressions, "clicks": total_clicks,
+                "cost_inr": round(total_cost_micros / 1_000_000, 2), "conversions": round(total_conversions, 2),
+                "search_impression_share_pct": round(impression_share * 100, 1) if impression_share is not None else None,
+                "search_budget_lost_impression_share_pct": round(budget_lost_share * 100, 1) if budget_lost_share is not None else None,
+                "search_rank_lost_impression_share_pct": round(rank_lost_share * 100, 1) if rank_lost_share is not None else None,
+            },
+            "keywords": keywords,
+            "ads": ads_summary,
+            "search_terms": search_terms,
+            "conversion_actions": conversion_actions,
+            "issues": sorted(issues, key=lambda i: {"high": 0, "medium": 1, "low": 2}.get(i["severity"], 3)),
+        }
+    except HTTPException:
+        raise
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
+    except GoogleAdsException as ex:
+        errors = [e.message for e in ex.failure.errors]
+        logger.error(f"[GOOGLE ADS] campaign-diagnostics error: {errors}")
+        return {"success": False, "error": errors}
+    except Exception as ex:
+        logger.error(f"[GOOGLE ADS] campaign-diagnostics unexpected: {ex}")
+        return {"success": False, "error": str(ex)}
+
+
+def _gads_zero_fill_daily(rows_by_date: dict, start: date, end: date) -> list:
+    """Post-audit fix: Google Ads' `FROM customer` segmented-by-date query
+    is NOT guaranteed to emit a row for every calendar day — a day with
+    zero rows returned used to just be skipped, so the chart's x-axis
+    silently jumped over it (real reported case: 09-02 to 09-16). Fills
+    every date in [start, end] so the frontend always gets a contiguous
+    series for the requested range, regardless of what the API actually
+    returned. `rows_by_date` maps an ISO date string to a dict with
+    impressions/clicks/cost_inr already extracted (pure function, no SDK
+    row objects — real unit tests, no mocking). Days missing from
+    rows_by_date get explicit zeros, never omitted."""
+    daily = []
+    d = start
+    while d <= end:
+        iso = d.isoformat()
+        found = rows_by_date.get(iso)
+        daily.append(found if found else {"date": iso, "impressions": 0, "clicks": 0, "cost_inr": 0})
+        d += timedelta(days=1)
+    return daily
+
+
 @app.get("/google-ads/daily")
 async def google_ads_daily(days: int = 90):
     """Daily time-series: date, impressions, clicks, cost_inr."""
@@ -5730,15 +6060,15 @@ async def google_ads_daily(days: int = 90):
             ORDER BY segments.date ASC
         """
         rows = list(service.search(customer_id=customer_id, query=query))
-        daily = []
-        for row in rows:
-            daily.append({
-                "date":        row.segments.date,
-                "impressions": row.metrics.impressions,
-                "clicks":      row.metrics.clicks,
-                "cost_inr":    round(row.metrics.cost_micros / 1_000_000, 2),
-            })
-        logger.info(f"[GOOGLE ADS] daily: {len(daily)} data points for last {days} days")
+        rows_by_date = {
+            row.segments.date: {
+                "date": row.segments.date, "impressions": row.metrics.impressions,
+                "clicks": row.metrics.clicks, "cost_inr": round(row.metrics.cost_micros / 1_000_000, 2),
+            }
+            for row in rows
+        }
+        daily = _gads_zero_fill_daily(rows_by_date, start, end)
+        logger.info(f"[GOOGLE ADS] daily: {len(daily)} data points (zero-filled) for last {days} days, {len(rows)} real rows returned")
         return {"success": True, "period_days": days, "start_date": str(start), "end_date": str(end), "daily": daily}
     except GadsNotConnectedError as ex:
         return {"success": False, "connect_required": True, "error": str(ex)}
