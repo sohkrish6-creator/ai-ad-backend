@@ -1,0 +1,17 @@
+name: Google Ads Optimizer Daily Run
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-optimizer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger /google-ads/optimizer/run-all
+        run: |
+          curl -X POST https://ai-ad-backend-zhpj.onrender.com/google-ads/optimizer/run-all \
+            --header "X-API-Key: ${{ secrets.BACKEND_API_KEY }}" \
+            --max-time 300 \
+            --fail-with-body

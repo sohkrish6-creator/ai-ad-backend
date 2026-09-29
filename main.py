@@ -151,6 +151,7 @@ _WEBHOOK_PATHS = {
 _API_KEY_ONLY_PATHS = {
     "/admin/weekly-market-insight/create",
     "/search-console/sync-all",  # daily GitHub Actions cron — no Supabase session, X-API-Key only
+    "/google-ads/optimizer/run-all",  # daily GitHub Actions cron — same shape as /search-console/sync-all above
 }
 # Same idea, but for a whole path family (dynamic /{id} segments) — the
 # website-admin.html panel authenticates with X-API-Key only, entered once
@@ -5764,6 +5765,273 @@ def _humanize_reason(reason: str) -> str:
     return reason.replace("_", " ").capitalize()
 
 
+def _gads_fetch_campaign_diagnostics_data(client, service, customer_id: str, campaign_id: str, days: int) -> dict:
+    """The real-data-gathering core of campaign diagnostics — extracted so
+    both GET /google-ads/campaign-diagnostics/{id} (a human viewing one
+    campaign) and the daily optimizer job (_run_gads_optimizer_for_campaign,
+    iterating every active campaign for every connected tenant) share the
+    exact same GAQL/parsing logic rather than maintaining two copies that
+    could silently drift apart. Raises HTTPException(404) if the campaign
+    has no data for the range; GoogleAdsException/other exceptions
+    propagate to the caller (each caller decides how to handle a single
+    campaign's fetch failure — the endpoint returns an error response, the
+    batch job logs and continues to the next campaign).
+
+    keywords/ads carry their real resource_name (ad_group_criterion / ad_
+    group) — not needed by the read-only diagnostics endpoint, but required
+    by the optimizer job to build a mutable target_resource for a
+    recommendation, which is the whole reason this function returns raw
+    identifiers rather than display-only text."""
+    end = date.today()
+    start = end - timedelta(days=days)
+    issues = []
+
+    def _add_issue(severity, title, detail, fix):
+        issues.append({"severity": severity, "title": title, "detail": detail, "fix": fix})
+
+    # ── 1. Campaign status/serving/primary + budget + bidding strategy + impression share ──
+    # Post-audit fix: segments.date must be in SELECT (not just the WHERE
+    # range filter) to actually get one row per calendar day — without it
+    # GAQL returns a single row aggregated over the whole window, silently
+    # making a "per-day" comment further down inaccurate. Explicit ORDER BY
+    # guarantees camp_rows[-1] is genuinely the most recent day, and this is
+    # what makes a real daily cost series (for the under-delivery rule)
+    # possible at all.
+    camp_query = f"""
+        SELECT
+            campaign.id, campaign.name, campaign.status, campaign.serving_status,
+            campaign.primary_status, campaign.primary_status_reasons,
+            campaign.bidding_strategy_type,
+            campaign.manual_cpc.enhanced_cpc_enabled,
+            campaign.maximize_conversions.cpc_bid_ceiling_micros,
+            campaign.target_cpa.target_cpa_micros,
+            campaign.target_roas.target_roas,
+            campaign_budget.resource_name, campaign_budget.amount_micros, campaign_budget.status,
+            segments.date,
+            metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions,
+            metrics.search_impression_share, metrics.search_budget_lost_impression_share,
+            metrics.search_rank_lost_impression_share
+        FROM campaign
+        WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
+        ORDER BY segments.date ASC
+    """
+    camp_rows = list(service.search(customer_id=customer_id, query=camp_query))
+    if not camp_rows:
+        raise HTTPException(status_code=404, detail="Campaign not found or no data for this date range")
+
+    camp = camp_rows[0].campaign
+    campaign_name = camp.name
+    status_name = camp.status.name if hasattr(camp.status, "name") else str(camp.status)
+    serving_status_name = camp.serving_status.name if hasattr(camp.serving_status, "name") else str(camp.serving_status)
+    primary_status_name = camp.primary_status.name if hasattr(camp.primary_status, "name") else str(camp.primary_status)
+    reason_names = [r.name if hasattr(r, "name") else str(r) for r in camp.primary_status_reasons]
+
+    for reason in reason_names:
+        severity, detail, fix = _CAMPAIGN_STATUS_REASON_INFO.get(
+            reason, ("medium", f"Google Ads reports this campaign's status is affected by: {_humanize_reason(reason)}.", "Review this in the Google Ads UI for more detail.")
+        )
+        _add_issue(severity, _humanize_reason(reason), detail, fix)
+
+    # Sum metrics + capture the impression-share fields from whichever
+    # row carries them (Google Ads returns one row per date segment
+    # here; impression-share metrics are the same value repeated, not
+    # additive, unlike impressions/clicks/cost).
+    total_impressions = sum(r.metrics.impressions for r in camp_rows)
+    total_clicks = sum(r.metrics.clicks for r in camp_rows)
+    total_cost_micros = sum(r.metrics.cost_micros for r in camp_rows)
+    total_conversions = sum(r.metrics.conversions for r in camp_rows)
+    impression_share = camp_rows[-1].metrics.search_impression_share
+    budget_lost_share = camp_rows[-1].metrics.search_budget_lost_impression_share
+    rank_lost_share = camp_rows[-1].metrics.search_rank_lost_impression_share
+
+    daily_cost_by_date = {r.segments.date: r.metrics.cost_micros for r in camp_rows}
+    daily_cost_micros = [
+        daily_cost_by_date.get(d.isoformat(), 0)
+        for d in (start + timedelta(days=n) for n in range((end - start).days + 1))
+    ]
+
+    if rank_lost_share is not None and rank_lost_share > 0.5:
+        _add_issue(
+            "high", "Losing most impression share to Ad Rank",
+            f"{round(rank_lost_share * 100, 1)}% of available impression share was lost because of Ad Rank "
+            "(bid too low and/or Quality Score too low) — the campaign isn't entering most auctions it's eligible for.",
+            "Raise the max CPC bid on your keywords, or switch to an automated bidding strategy once you have conversion tracking.",
+        )
+    if budget_lost_share is not None and budget_lost_share > 0.5:
+        _add_issue(
+            "high", "Losing impression share to budget",
+            f"{round(budget_lost_share * 100, 1)}% of available impression share was lost because the daily budget ran out.",
+            "Increase the daily budget.",
+        )
+
+    bidding_strategy_type = camp.bidding_strategy_type.name if hasattr(camp.bidding_strategy_type, "name") else str(camp.bidding_strategy_type)
+    bidding_strategy = {"type": bidding_strategy_type}
+    if bidding_strategy_type == "MANUAL_CPC":
+        bidding_strategy["enhanced_cpc_enabled"] = camp.manual_cpc.enhanced_cpc_enabled
+    elif bidding_strategy_type == "MAXIMIZE_CONVERSIONS":
+        bidding_strategy["cpc_bid_ceiling_micros"] = camp.maximize_conversions.cpc_bid_ceiling_micros or None
+    elif bidding_strategy_type == "TARGET_CPA":
+        bidding_strategy["target_cpa_micros"] = camp.target_cpa.target_cpa_micros or None
+    elif bidding_strategy_type == "TARGET_ROAS":
+        bidding_strategy["target_roas"] = camp.target_roas.target_roas or None
+
+    budget_resource_name = camp_rows[0].campaign_budget.resource_name
+    budget_amount_micros = camp_rows[0].campaign_budget.amount_micros
+
+    # ── 2. Keywords — system_serving_status / approval_status ──
+    kw_query = f"""
+        SELECT
+            ad_group_criterion.resource_name,
+            ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,
+            ad_group_criterion.system_serving_status, ad_group_criterion.approval_status,
+            ad_group_criterion.cpc_bid_micros, ad_group_criterion.status,
+            ad_group_criterion.position_estimates.top_of_page_cpc_micros,
+            ad_group.id, ad_group.resource_name
+        FROM ad_group_criterion
+        WHERE campaign.id = {campaign_id} AND ad_group_criterion.type = KEYWORD
+    """
+    kw_rows = list(service.search(customer_id=customer_id, query=kw_query))
+    keywords = []
+    low_search_volume_count = 0
+    cpc_bids = []
+    for r in kw_rows:
+        crit = r.ad_group_criterion
+        serving = crit.system_serving_status.name if hasattr(crit.system_serving_status, "name") else str(crit.system_serving_status)
+        approval = crit.approval_status.name if hasattr(crit.approval_status, "name") else str(crit.approval_status)
+        if serving == "LOW_SEARCH_VOLUME":
+            low_search_volume_count += 1
+        if crit.cpc_bid_micros:
+            cpc_bids.append(crit.cpc_bid_micros)
+        keywords.append({
+            "text": crit.keyword.text, "match_type": crit.keyword.match_type.name if hasattr(crit.keyword.match_type, "name") else str(crit.keyword.match_type),
+            "serving_status": serving, "approval_status": approval,
+            "cpc_bid_micros": crit.cpc_bid_micros or None,
+            "cpc_bid_inr": round(crit.cpc_bid_micros / 1_000_000, 2) if crit.cpc_bid_micros else None,
+            "top_of_page_bid_high_micros": crit.position_estimates.top_of_page_cpc_micros or None,
+            "status": r.ad_group_criterion.status.name if hasattr(r.ad_group_criterion.status, "name") else str(r.ad_group_criterion.status),
+            "resource_name": crit.resource_name, "ad_group_resource_name": r.ad_group.resource_name,
+        })
+    if low_search_volume_count > 0:
+        _add_issue(
+            "medium", f"{low_search_volume_count} keyword(s) flagged \"Low search volume\"",
+            "Google Ads won't serve ads for a keyword it judges has too little search traffic to be worth evaluating.",
+            "Broaden these keywords' match type, or replace them with higher-volume alternatives (use Keyword Intelligence to check real volume first).",
+        )
+    if cpc_bids and max(cpc_bids) <= 2_000_000:
+        _add_issue(
+            "high", "Max CPC bid is very low",
+            f"The highest keyword-level bid found is ₹{round(max(cpc_bids) / 1_000_000, 2)}. Most Search verticals in India need a "
+            "meaningfully higher bid to win auctions consistently.",
+            "Raise the CPC bid on your keywords (or the ad group's default bid) — check Keyword Intelligence for this category's real bid range first.",
+        )
+    match_types = {k["match_type"] for k in keywords}
+    if keywords and match_types == {"EXACT"}:
+        _add_issue(
+            "medium", "Every keyword is Exact match only",
+            "Exact match only targets the narrowest possible set of real search queries.",
+            "Add Phrase match (and consider Broad with automated bidding) to widen the pool of matchable searches.",
+        )
+
+    # ── 3. Ads — policy_summary.approval_status ──
+    ad_query = f"""
+        SELECT ad_group_ad.ad.id, ad_group_ad.status, ad_group_ad.policy_summary.approval_status
+        FROM ad_group_ad
+        WHERE campaign.id = {campaign_id}
+    """
+    ad_rows = list(service.search(customer_id=customer_id, query=ad_query))
+    ads_summary = []
+    disapproved_count = 0
+    for r in ad_rows:
+        approval = r.ad_group_ad.policy_summary.approval_status.name if hasattr(r.ad_group_ad.policy_summary.approval_status, "name") else str(r.ad_group_ad.policy_summary.approval_status)
+        if approval == "DISAPPROVED":
+            disapproved_count += 1
+        ads_summary.append({
+            "ad_id": str(r.ad_group_ad.ad.id),
+            "status": r.ad_group_ad.status.name if hasattr(r.ad_group_ad.status, "name") else str(r.ad_group_ad.status),
+            "approval_status": approval,
+        })
+    if not ads_summary:
+        _add_issue("high", "No ads found for this campaign", "This campaign has no ads at all.", "Add at least one ad to an ad group.")
+    elif disapproved_count > 0:
+        _add_issue(
+            "high", f"{disapproved_count} ad(s) disapproved",
+            "A disapproved ad cannot serve at all — call GET /google-ads/ad-policy-status for the specific policy topic and evidence.",
+            "Fix the flagged policy issue and resubmit the ad.",
+        )
+
+    # ── 4. Search terms actually matched, for the date range ──
+    st_query = f"""
+        SELECT search_term_view.search_term, ad_group.resource_name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM search_term_view
+        WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
+        ORDER BY metrics.impressions DESC
+        LIMIT 50
+    """
+    st_rows = list(service.search(customer_id=customer_id, query=st_query))
+    search_terms = [
+        {"search_term": r.search_term_view.search_term, "ad_group_resource_name": r.ad_group.resource_name,
+         "impressions": r.metrics.impressions, "clicks": r.metrics.clicks,
+         "cost_micros": r.metrics.cost_micros, "conversions": r.metrics.conversions}
+        for r in st_rows
+    ]
+    if not search_terms and total_impressions > 0:
+        pass  # impressions with no logged search terms is normal at low volume (Google doesn't log every term) — not itself an issue
+    elif not search_terms and total_impressions == 0:
+        _add_issue(
+            "high", "No search terms matched at all",
+            "Zero real searches triggered this campaign's ads in the selected date range.",
+            "This usually means keywords/bids/targeting are too narrow to enter auctions — see the other issues above for the likely specific cause.",
+        )
+
+    # ── 5. Conversion tracking ──
+    conv_query = "SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.type FROM conversion_action"
+    conv_rows = list(service.search(customer_id=customer_id, query=conv_query))
+    conversion_actions = [
+        {"name": r.conversion_action.name, "status": r.conversion_action.status.name if hasattr(r.conversion_action.status, "name") else str(r.conversion_action.status)}
+        for r in conv_rows
+    ]
+    active_conversions = [c for c in conversion_actions if c["status"] == "ENABLED"]
+    if not active_conversions:
+        _add_issue(
+            "high", "No active conversion tracking configured",
+            "This account has no enabled conversion action — Google Ads has no way to learn what a successful outcome looks like, "
+            "and any automated bidding strategy that optimizes for conversions cannot work without it.",
+            "Set up conversion tracking in Google Ads (or via the existing GSC/CRM integration) before switching to Maximize Conversions/Target CPA.",
+        )
+
+    return {
+        "success": True,
+        "campaign": {
+            "id": campaign_id, "name": campaign_name, "status": status_name,
+            "serving_status": serving_status_name, "primary_status": primary_status_name,
+            "primary_status_reasons": reason_names,
+        },
+        "budget": {
+            "resource_name": budget_resource_name,
+            "amount_micros": budget_amount_micros or None,
+            "amount_inr": round(budget_amount_micros / 1_000_000, 2) if budget_amount_micros else None,
+        },
+        "bidding_strategy": bidding_strategy,
+        "metrics": {
+            "period_days": days, "impressions": total_impressions, "clicks": total_clicks,
+            "cost_inr": round(total_cost_micros / 1_000_000, 2), "conversions": round(total_conversions, 2),
+            "search_impression_share_pct": round(impression_share * 100, 1) if impression_share is not None else None,
+            "search_budget_lost_impression_share_pct": round(budget_lost_share * 100, 1) if budget_lost_share is not None else None,
+            "search_rank_lost_impression_share_pct": round(rank_lost_share * 100, 1) if rank_lost_share is not None else None,
+            "search_budget_lost_impression_share": budget_lost_share,
+            "search_rank_lost_impression_share": rank_lost_share,
+            "daily_cost_micros": daily_cost_micros,
+        },
+        "keywords": keywords,
+        "ads": ads_summary,
+        "disapproved_ad_count": disapproved_count,
+        "search_terms": search_terms,
+        "conversion_actions": conversion_actions,
+        "active_conversion_count": len(active_conversions),
+        "issues": sorted(issues, key=lambda i: {"high": 0, "medium": 1, "low": 2}.get(i["severity"], 3)),
+    }
+
+
 @app.get("/google-ads/campaign-diagnostics/{campaign_id}")
 async def google_ads_campaign_diagnostics(campaign_id: str, request: Request, days: int = 7):
     """Real-data diagnosis of why a specific campaign isn't delivering —
@@ -5783,227 +6051,10 @@ async def google_ads_campaign_diagnostics(campaign_id: str, request: Request, da
     customer_id = _gads_customer_id()
     if not customer_id:
         return {"success": False, "connect_required": True, "error": "No Google Ads account selected."}
-
-    end = date.today()
-    start = end - timedelta(days=days)
-    issues = []
-
-    def _add_issue(severity, title, detail, fix):
-        issues.append({"severity": severity, "title": title, "detail": detail, "fix": fix})
-
     try:
         client = get_google_ads_client()
         service = client.get_service("GoogleAdsService")
-
-        # ── 1. Campaign status/serving/primary + budget + bidding strategy + impression share ──
-        camp_query = f"""
-            SELECT
-                campaign.id, campaign.name, campaign.status, campaign.serving_status,
-                campaign.primary_status, campaign.primary_status_reasons,
-                campaign.bidding_strategy_type,
-                campaign.manual_cpc.enhanced_cpc_enabled,
-                campaign.maximize_conversions.cpc_bid_ceiling_micros,
-                campaign.target_cpa.target_cpa_micros,
-                campaign.target_roas.target_roas,
-                campaign_budget.amount_micros, campaign_budget.status,
-                metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions,
-                metrics.search_impression_share, metrics.search_budget_lost_impression_share,
-                metrics.search_rank_lost_impression_share
-            FROM campaign
-            WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
-        """
-        camp_rows = list(service.search(customer_id=customer_id, query=camp_query))
-        if not camp_rows:
-            raise HTTPException(status_code=404, detail="Campaign not found or no data for this date range")
-
-        camp = camp_rows[0].campaign
-        campaign_name = camp.name
-        status_name = camp.status.name if hasattr(camp.status, "name") else str(camp.status)
-        serving_status_name = camp.serving_status.name if hasattr(camp.serving_status, "name") else str(camp.serving_status)
-        primary_status_name = camp.primary_status.name if hasattr(camp.primary_status, "name") else str(camp.primary_status)
-        reason_names = [r.name if hasattr(r, "name") else str(r) for r in camp.primary_status_reasons]
-
-        for reason in reason_names:
-            severity, detail, fix = _CAMPAIGN_STATUS_REASON_INFO.get(
-                reason, ("medium", f"Google Ads reports this campaign's status is affected by: {_humanize_reason(reason)}.", "Review this in the Google Ads UI for more detail.")
-            )
-            _add_issue(severity, _humanize_reason(reason), detail, fix)
-
-        # Sum metrics + capture the impression-share fields from whichever
-        # row carries them (Google Ads returns one row per date segment
-        # here; impression-share metrics are the same value repeated, not
-        # additive, unlike impressions/clicks/cost).
-        total_impressions = sum(r.metrics.impressions for r in camp_rows)
-        total_clicks = sum(r.metrics.clicks for r in camp_rows)
-        total_cost_micros = sum(r.metrics.cost_micros for r in camp_rows)
-        total_conversions = sum(r.metrics.conversions for r in camp_rows)
-        impression_share = camp_rows[-1].metrics.search_impression_share
-        budget_lost_share = camp_rows[-1].metrics.search_budget_lost_impression_share
-        rank_lost_share = camp_rows[-1].metrics.search_rank_lost_impression_share
-
-        if rank_lost_share is not None and rank_lost_share > 0.5:
-            _add_issue(
-                "high", "Losing most impression share to Ad Rank",
-                f"{round(rank_lost_share * 100, 1)}% of available impression share was lost because of Ad Rank "
-                "(bid too low and/or Quality Score too low) — the campaign isn't entering most auctions it's eligible for.",
-                "Raise the max CPC bid on your keywords, or switch to an automated bidding strategy once you have conversion tracking.",
-            )
-        if budget_lost_share is not None and budget_lost_share > 0.5:
-            _add_issue(
-                "high", "Losing impression share to budget",
-                f"{round(budget_lost_share * 100, 1)}% of available impression share was lost because the daily budget ran out.",
-                "Increase the daily budget.",
-            )
-
-        bidding_strategy_type = camp.bidding_strategy_type.name if hasattr(camp.bidding_strategy_type, "name") else str(camp.bidding_strategy_type)
-        bidding_strategy = {"type": bidding_strategy_type}
-        if bidding_strategy_type == "MANUAL_CPC":
-            bidding_strategy["enhanced_cpc_enabled"] = camp.manual_cpc.enhanced_cpc_enabled
-        elif bidding_strategy_type == "MAXIMIZE_CONVERSIONS":
-            bidding_strategy["cpc_bid_ceiling_micros"] = camp.maximize_conversions.cpc_bid_ceiling_micros or None
-        elif bidding_strategy_type == "TARGET_CPA":
-            bidding_strategy["target_cpa_micros"] = camp.target_cpa.target_cpa_micros or None
-        elif bidding_strategy_type == "TARGET_ROAS":
-            bidding_strategy["target_roas"] = camp.target_roas.target_roas or None
-
-        budget_amount_micros = camp_rows[0].campaign_budget.amount_micros
-
-        # ── 2. Keywords — system_serving_status / approval_status ──
-        kw_query = f"""
-            SELECT
-                ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,
-                ad_group_criterion.system_serving_status, ad_group_criterion.approval_status,
-                ad_group_criterion.cpc_bid_micros, ad_group_criterion.status,
-                ad_group.id
-            FROM ad_group_criterion
-            WHERE campaign.id = {campaign_id} AND ad_group_criterion.type = KEYWORD
-        """
-        kw_rows = list(service.search(customer_id=customer_id, query=kw_query))
-        keywords = []
-        low_search_volume_count = 0
-        cpc_bids = []
-        for r in kw_rows:
-            crit = r.ad_group_criterion
-            serving = crit.system_serving_status.name if hasattr(crit.system_serving_status, "name") else str(crit.system_serving_status)
-            approval = crit.approval_status.name if hasattr(crit.approval_status, "name") else str(crit.approval_status)
-            if serving == "LOW_SEARCH_VOLUME":
-                low_search_volume_count += 1
-            if crit.cpc_bid_micros:
-                cpc_bids.append(crit.cpc_bid_micros)
-            keywords.append({
-                "text": crit.keyword.text, "match_type": crit.keyword.match_type.name if hasattr(crit.keyword.match_type, "name") else str(crit.keyword.match_type),
-                "serving_status": serving, "approval_status": approval,
-                "cpc_bid_inr": round(crit.cpc_bid_micros / 1_000_000, 2) if crit.cpc_bid_micros else None,
-                "status": r.ad_group_criterion.status.name if hasattr(r.ad_group_criterion.status, "name") else str(r.ad_group_criterion.status),
-            })
-        if low_search_volume_count > 0:
-            _add_issue(
-                "medium", f"{low_search_volume_count} keyword(s) flagged \"Low search volume\"",
-                "Google Ads won't serve ads for a keyword it judges has too little search traffic to be worth evaluating.",
-                "Broaden these keywords' match type, or replace them with higher-volume alternatives (use Keyword Intelligence to check real volume first).",
-            )
-        if cpc_bids and max(cpc_bids) <= 2_000_000:
-            _add_issue(
-                "high", "Max CPC bid is very low",
-                f"The highest keyword-level bid found is ₹{round(max(cpc_bids) / 1_000_000, 2)}. Most Search verticals in India need a "
-                "meaningfully higher bid to win auctions consistently.",
-                "Raise the CPC bid on your keywords (or the ad group's default bid) — check Keyword Intelligence for this category's real bid range first.",
-            )
-        match_types = {k["match_type"] for k in keywords}
-        if keywords and match_types == {"EXACT"}:
-            _add_issue(
-                "medium", "Every keyword is Exact match only",
-                "Exact match only targets the narrowest possible set of real search queries.",
-                "Add Phrase match (and consider Broad with automated bidding) to widen the pool of matchable searches.",
-            )
-
-        # ── 3. Ads — policy_summary.approval_status ──
-        ad_query = f"""
-            SELECT ad_group_ad.ad.id, ad_group_ad.status, ad_group_ad.policy_summary.approval_status
-            FROM ad_group_ad
-            WHERE campaign.id = {campaign_id}
-        """
-        ad_rows = list(service.search(customer_id=customer_id, query=ad_query))
-        ads_summary = []
-        disapproved_count = 0
-        for r in ad_rows:
-            approval = r.ad_group_ad.policy_summary.approval_status.name if hasattr(r.ad_group_ad.policy_summary.approval_status, "name") else str(r.ad_group_ad.policy_summary.approval_status)
-            if approval == "DISAPPROVED":
-                disapproved_count += 1
-            ads_summary.append({
-                "ad_id": str(r.ad_group_ad.ad.id),
-                "status": r.ad_group_ad.status.name if hasattr(r.ad_group_ad.status, "name") else str(r.ad_group_ad.status),
-                "approval_status": approval,
-            })
-        if not ads_summary:
-            _add_issue("high", "No ads found for this campaign", "This campaign has no ads at all.", "Add at least one ad to an ad group.")
-        elif disapproved_count > 0:
-            _add_issue(
-                "high", f"{disapproved_count} ad(s) disapproved",
-                "A disapproved ad cannot serve at all — call GET /google-ads/ad-policy-status for the specific policy topic and evidence.",
-                "Fix the flagged policy issue and resubmit the ad.",
-            )
-
-        # ── 4. Search terms actually matched, for the date range ──
-        st_query = f"""
-            SELECT search_term_view.search_term, metrics.impressions, metrics.clicks
-            FROM search_term_view
-            WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
-            ORDER BY metrics.impressions DESC
-            LIMIT 50
-        """
-        st_rows = list(service.search(customer_id=customer_id, query=st_query))
-        search_terms = [
-            {"search_term": r.search_term_view.search_term, "impressions": r.metrics.impressions, "clicks": r.metrics.clicks}
-            for r in st_rows
-        ]
-        if not search_terms and total_impressions > 0:
-            pass  # impressions with no logged search terms is normal at low volume (Google doesn't log every term) — not itself an issue
-        elif not search_terms and total_impressions == 0:
-            _add_issue(
-                "high", "No search terms matched at all",
-                "Zero real searches triggered this campaign's ads in the selected date range.",
-                "This usually means keywords/bids/targeting are too narrow to enter auctions — see the other issues above for the likely specific cause.",
-            )
-
-        # ── 5. Conversion tracking ──
-        conv_query = "SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.type FROM conversion_action"
-        conv_rows = list(service.search(customer_id=customer_id, query=conv_query))
-        conversion_actions = [
-            {"name": r.conversion_action.name, "status": r.conversion_action.status.name if hasattr(r.conversion_action.status, "name") else str(r.conversion_action.status)}
-            for r in conv_rows
-        ]
-        active_conversions = [c for c in conversion_actions if c["status"] == "ENABLED"]
-        if not active_conversions:
-            _add_issue(
-                "high", "No active conversion tracking configured",
-                "This account has no enabled conversion action — Google Ads has no way to learn what a successful outcome looks like, "
-                "and any automated bidding strategy that optimizes for conversions cannot work without it.",
-                "Set up conversion tracking in Google Ads (or via the existing GSC/CRM integration) before switching to Maximize Conversions/Target CPA.",
-            )
-
-        return {
-            "success": True,
-            "campaign": {
-                "id": campaign_id, "name": campaign_name, "status": status_name,
-                "serving_status": serving_status_name, "primary_status": primary_status_name,
-                "primary_status_reasons": reason_names,
-            },
-            "budget": {"amount_inr": round(budget_amount_micros / 1_000_000, 2) if budget_amount_micros else None},
-            "bidding_strategy": bidding_strategy,
-            "metrics": {
-                "period_days": days, "impressions": total_impressions, "clicks": total_clicks,
-                "cost_inr": round(total_cost_micros / 1_000_000, 2), "conversions": round(total_conversions, 2),
-                "search_impression_share_pct": round(impression_share * 100, 1) if impression_share is not None else None,
-                "search_budget_lost_impression_share_pct": round(budget_lost_share * 100, 1) if budget_lost_share is not None else None,
-                "search_rank_lost_impression_share_pct": round(rank_lost_share * 100, 1) if rank_lost_share is not None else None,
-            },
-            "keywords": keywords,
-            "ads": ads_summary,
-            "search_terms": search_terms,
-            "conversion_actions": conversion_actions,
-            "issues": sorted(issues, key=lambda i: {"high": 0, "medium": 1, "low": 2}.get(i["severity"], 3)),
-        }
+        return _gads_fetch_campaign_diagnostics_data(client, service, customer_id, campaign_id, days)
     except HTTPException:
         raise
     except GadsNotConnectedError as ex:
@@ -26532,6 +26583,950 @@ try:
     logger.info("[KEYWORD-INTEL] keyword_research_cache/keyword_research_jobs tables ready")
 except Exception as _kwe:
     logger.error(f"[KEYWORD-INTEL] table creation failed: {_kwe}")
+
+
+# ── Google Ads Automated Optimization Loop (Phase 1: approval-only) ─────────
+# gads_automation_settings: one row per tenant, the guardrails every
+# recommendation and apply-time check is bound by — max_bid_change_pct is
+# read at RECOMMEND time (a proposed bid capped to +30% by default) AND
+# re-checked at APPLY time (defense-in-depth: settings could change between
+# when a recommendation was generated and when it's approved days later).
+# gads_recommendations: one row per detected issue per campaign. UNIQUE on
+# (user_id, campaign_id, type, target_resource) — the daily job UPSERTs, so
+# an unresolved issue never spawns duplicate pending rows across days; a
+# rejected/applied one is left alone (rejecting an issue that recurs still
+# shows the SAME row, not a new one demanding re-review).
+_GADS_AUTOMATION_DDL = """
+CREATE TABLE IF NOT EXISTS gads_automation_settings (
+    id                            BIGSERIAL PRIMARY KEY,
+    user_id                       TEXT UNIQUE NOT NULL,
+    max_cpc_cap_micros            BIGINT DEFAULT 50000000,
+    max_daily_budget_cap_micros   BIGINT DEFAULT 500000000,
+    max_bid_change_pct            INTEGER DEFAULT 30,
+    automation_paused             BOOLEAN DEFAULT FALSE,
+    auto_apply_enabled            BOOLEAN DEFAULT FALSE,
+    updated_at                    TEXT
+);
+CREATE TABLE IF NOT EXISTS gads_recommendations (
+    id                       BIGSERIAL PRIMARY KEY,
+    user_id                  TEXT NOT NULL,
+    campaign_id              TEXT NOT NULL,
+    campaign_name            TEXT,
+    type                     TEXT NOT NULL,
+    severity                 TEXT NOT NULL,
+    target_resource          TEXT,
+    current_value            TEXT,
+    proposed_value           TEXT,
+    reason                   TEXT NOT NULL,
+    supporting_metrics_json  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'pending',
+    applied_resource_name    TEXT,
+    previous_value_micros    BIGINT,
+    created_at                TEXT NOT NULL,
+    reviewed_at               TEXT,
+    applied_at                TEXT,
+    reverted_at               TEXT,
+    outcome_json              TEXT,
+    outcome_computed_at       TEXT,
+    UNIQUE(user_id, campaign_id, type, target_resource)
+);
+"""
+try:
+    _gaddl = _GADS_AUTOMATION_DDL
+    if _is_sqlite:
+        _gaddl = _gaddl.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    with engine.begin() as _gaconn:
+        for _gastmt in _gaddl.strip().split(";"):
+            _gastmt = _gastmt.strip()
+            if _gastmt:
+                _gaconn.execute(text(_gastmt))
+    logger.info("[GADS-OPTIMIZER] gads_automation_settings/gads_recommendations tables ready")
+except Exception as _gae:
+    logger.error(f"[GADS-OPTIMIZER] table creation failed: {_gae}")
+
+
+_GADS_AUTOMATION_SETTINGS_COLS = [
+    "max_cpc_cap_micros", "max_daily_budget_cap_micros", "max_bid_change_pct",
+    "automation_paused", "auto_apply_enabled",
+]
+
+
+def _get_or_create_gads_automation_settings(user_id: str) -> dict:
+    """Same get-or-create shape as _get_or_create_voice_settings: SELECT
+    first, INSERT-with-defaults-only-if-missing via ON CONFLICT DO NOTHING,
+    then recurse once the row exists — every guardrail default lives in the
+    DDL's own column defaults, not duplicated here."""
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_GADS_AUTOMATION_SETTINGS_COLS)} FROM gads_automation_settings WHERE user_id=:uid"
+        ), {"uid": user_id}).fetchone()
+    if row:
+        settings = dict(zip(_GADS_AUTOMATION_SETTINGS_COLS, row))
+        settings["automation_paused"] = bool(settings["automation_paused"])
+        settings["auto_apply_enabled"] = bool(settings["auto_apply_enabled"])
+        return settings
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO gads_automation_settings (user_id, updated_at) VALUES (:uid, :ts) "
+            "ON CONFLICT(user_id) DO NOTHING"
+        ), {"uid": user_id, "ts": now})
+    return _get_or_create_gads_automation_settings(user_id)
+
+
+class GadsAutomationSettingsPatch(BaseModel):
+    max_cpc_cap_inr: Optional[float] = None
+    max_daily_budget_cap_inr: Optional[float] = None
+    max_bid_change_pct: Optional[int] = None
+    automation_paused: Optional[bool] = None
+    auto_apply_enabled: Optional[bool] = None
+
+
+@app.get("/google-ads/automation-settings")
+async def gads_get_automation_settings(request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"success": True, "settings": _get_or_create_gads_automation_settings(uid)}
+
+
+@app.patch("/google-ads/automation-settings")
+async def gads_patch_automation_settings(payload: GadsAutomationSettingsPatch, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    _get_or_create_gads_automation_settings(uid)  # guarantee a row exists
+
+    if payload.max_bid_change_pct is not None and not (1 <= payload.max_bid_change_pct <= 200):
+        raise HTTPException(status_code=400, detail="max_bid_change_pct must be between 1 and 200")
+    if payload.max_cpc_cap_inr is not None and payload.max_cpc_cap_inr <= 0:
+        raise HTTPException(status_code=400, detail="max_cpc_cap_inr must be positive")
+    if payload.max_daily_budget_cap_inr is not None and payload.max_daily_budget_cap_inr <= 0:
+        raise HTTPException(status_code=400, detail="max_daily_budget_cap_inr must be positive")
+
+    updates = {}
+    if payload.max_cpc_cap_inr is not None:
+        updates["max_cpc_cap_micros"] = int(payload.max_cpc_cap_inr * 1_000_000)
+    if payload.max_daily_budget_cap_inr is not None:
+        updates["max_daily_budget_cap_micros"] = int(payload.max_daily_budget_cap_inr * 1_000_000)
+    if payload.max_bid_change_pct is not None:
+        updates["max_bid_change_pct"] = payload.max_bid_change_pct
+    if payload.automation_paused is not None:
+        updates["automation_paused"] = payload.automation_paused
+    if payload.auto_apply_enabled is not None:
+        # Post-audit fix: Phase 1 is approval-mode only — accepting this
+        # flag from the API but never reading it anywhere in the apply
+        # path (see _gads_apply_recommendation) is the actual Phase-1
+        # guarantee. Stored now so Phase 2 has a real per-user setting to
+        # read later, without needing a schema change at that point.
+        updates["auto_apply_enabled"] = payload.auto_apply_enabled
+
+    if not updates:
+        return {"success": True, "settings": _get_or_create_gads_automation_settings(uid)}
+
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    sets = ", ".join(f"{k}=:{k}" for k in updates)
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE gads_automation_settings SET {sets} WHERE user_id=:uid"), {**updates, "uid": uid})
+    return {"success": True, "settings": _get_or_create_gads_automation_settings(uid)}
+
+
+# ── Google Ads Optimizer: rule evaluation (pure functions) ──────────────────
+# Every rule below takes real numbers already fetched from the Ads API and
+# returns either a recommendation dict or None — no rule ever calls the Ads
+# API itself, and no rule's proposed_value is ever applied without also
+# being re-checked against current guardrails at apply time (see
+# _gads_apply_recommendation). Pure functions — real unit tests, no mocking.
+
+def _gads_rule_raise_cpc(keyword_text: str, ad_group_criterion_rn: str, current_bid_micros: int,
+                          top_of_page_bid_high_micros: Optional[int], rank_lost_share: Optional[float],
+                          max_cpc_cap_micros: int, max_bid_change_pct: int) -> Optional[dict]:
+    """search_rank_lost_impression_share > 50% → recommend raising max CPC
+    toward the keyword's own top-of-page bid estimate. Capped at +max_bid_
+    change_pct per step AND never above the user's max_cpc_cap_micros —
+    both caps apply simultaneously, whichever is lower wins. No recommendation
+    if the capped proposal isn't actually higher than the current bid (the
+    cap already binds, so a change here would be either impossible or a
+    no-op)."""
+    if rank_lost_share is None or rank_lost_share <= 0.5:
+        return None
+    if not current_bid_micros or current_bid_micros <= 0:
+        return None
+    step_capped = int(current_bid_micros * (1 + max_bid_change_pct / 100.0))
+    proposed = min(step_capped, max_cpc_cap_micros)
+    if top_of_page_bid_high_micros:
+        proposed = min(proposed, top_of_page_bid_high_micros)
+    if proposed <= current_bid_micros:
+        return None
+    return {
+        "type": "raise_cpc", "severity": "high", "target_resource": ad_group_criterion_rn,
+        "current_value": str(current_bid_micros), "proposed_value": str(proposed),
+        "reason": (
+            f"\"{keyword_text}\" lost {round(rank_lost_share * 100, 1)}% of its available impression share to "
+            f"Ad Rank — the current bid (₹{current_bid_micros / 1_000_000:.2f}) is too low to compete."
+        ),
+        "supporting_metrics": {
+            "keyword": keyword_text, "search_rank_lost_impression_share_pct": round(rank_lost_share * 100, 1),
+            "current_bid_inr": round(current_bid_micros / 1_000_000, 2), "proposed_bid_inr": round(proposed / 1_000_000, 2),
+            "top_of_page_bid_high_inr": round(top_of_page_bid_high_micros / 1_000_000, 2) if top_of_page_bid_high_micros else None,
+        },
+    }
+
+
+def _gads_rule_raise_budget(campaign_budget_rn: str, current_budget_micros: int, budget_lost_share: Optional[float],
+                             max_daily_budget_cap_micros: int, max_bid_change_pct: int) -> Optional[dict]:
+    """search_budget_lost_impression_share > 30% → recommend a budget
+    increase. No separate "max budget change per step" guardrail was
+    specified, so this reuses max_bid_change_pct as the one generic
+    per-step change limiter that applies to both bid and budget increases."""
+    if budget_lost_share is None or budget_lost_share <= 0.3:
+        return None
+    if not current_budget_micros or current_budget_micros <= 0:
+        return None
+    proposed = min(int(current_budget_micros * (1 + max_bid_change_pct / 100.0)), max_daily_budget_cap_micros)
+    if proposed <= current_budget_micros:
+        return None
+    return {
+        "type": "raise_budget", "severity": "high", "target_resource": campaign_budget_rn,
+        "current_value": str(current_budget_micros), "proposed_value": str(proposed),
+        "reason": (
+            f"{round(budget_lost_share * 100, 1)}% of available impression share was lost because the daily budget "
+            f"(₹{current_budget_micros / 1_000_000:.2f}) ran out."
+        ),
+        "supporting_metrics": {
+            "search_budget_lost_impression_share_pct": round(budget_lost_share * 100, 1),
+            "current_budget_inr": round(current_budget_micros / 1_000_000, 2), "proposed_budget_inr": round(proposed / 1_000_000, 2),
+        },
+    }
+
+
+def _gads_rule_low_search_volume(keyword_text: str, ad_group_rn: str, match_type: str, serving_status: str) -> Optional[dict]:
+    """Keywords flagged "Low search volume" → recommend a phrase-match
+    variant, which Google evaluates against a broader real query pool than
+    an exact-match term stuck below the volume threshold. Only fires for a
+    keyword that isn't ALREADY phrase/broad (nothing to widen otherwise)."""
+    if serving_status != "LOW_SEARCH_VOLUME" or match_type != "EXACT":
+        return None
+    return {
+        "type": "add_phrase_match", "severity": "medium", "target_resource": ad_group_rn,
+        "current_value": keyword_text, "proposed_value": keyword_text,
+        "reason": f"\"{keyword_text}\" is flagged Low Search Volume as an exact-match term — Google won't serve it as-is.",
+        "supporting_metrics": {"keyword": keyword_text, "current_match_type": match_type, "serving_status": serving_status},
+    }
+
+
+def _gads_rule_disapproved_ads(disapproved_count: int, campaign_id: str) -> Optional[dict]:
+    if disapproved_count <= 0:
+        return None
+    return {
+        "type": "fix_disapproved_ad", "severity": "high", "target_resource": f"campaign/{campaign_id}/disapproved_ads",
+        "current_value": str(disapproved_count), "proposed_value": None,
+        "reason": f"{disapproved_count} ad(s) are disapproved and cannot serve at all.",
+        "supporting_metrics": {"disapproved_count": disapproved_count},
+    }
+
+
+def _gads_rule_conversion_tracking(active_conversion_count: int, campaign_id: str) -> Optional[dict]:
+    if active_conversion_count > 0:
+        return None
+    return {
+        "type": "fix_conversion_tracking", "severity": "high", "target_resource": f"campaign/{campaign_id}/conversion_tracking",
+        "current_value": "0 active conversion actions", "proposed_value": None,
+        "reason": "No active conversion tracking is configured for this account.",
+        "supporting_metrics": {"active_conversion_count": active_conversion_count},
+    }
+
+
+def _gads_rule_underdelivery(recent_daily_cost_micros: list, daily_budget_micros: int, campaign_id: str) -> Optional[dict]:
+    """Campaign spent under 20% of daily budget for 2+ consecutive days —
+    `recent_daily_cost_micros` must already be ordered oldest→newest and
+    zero-filled (no missing days) by the caller; this function only looks
+    at the LAST 2 entries (the most recent consecutive pair)."""
+    if not daily_budget_micros or len(recent_daily_cost_micros) < 2:
+        return None
+    threshold = daily_budget_micros * 0.2
+    last_two = recent_daily_cost_micros[-2:]
+    if not all(cost < threshold for cost in last_two):
+        return None
+    return {
+        "type": "under_delivery_alert", "severity": "medium", "target_resource": f"campaign/{campaign_id}/under_delivery",
+        "current_value": str(last_two[-1]), "proposed_value": None,
+        "reason": (
+            f"Spent under 20% of the ₹{daily_budget_micros / 1_000_000:.2f} daily budget for the last 2 days "
+            f"(₹{last_two[0] / 1_000_000:.2f}, ₹{last_two[-1] / 1_000_000:.2f})."
+        ),
+        "supporting_metrics": {"daily_budget_inr": round(daily_budget_micros / 1_000_000, 2),
+                                "recent_spend_inr": [round(c / 1_000_000, 2) for c in last_two]},
+    }
+
+
+_GADS_OPTIMIZER_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+
+def _gads_negative_keyword_candidates(search_terms: list) -> list:
+    """Deterministic pre-filter — search terms with real spend and zero
+    conversions. This runs BEFORE any Claude call so classification never
+    wastes a call (or a chance to hallucinate) on a term that isn't even a
+    real candidate. `search_terms` items: {search_term, impressions, clicks,
+    cost_micros, conversions}."""
+    return [
+        t for t in search_terms
+        if (t.get("cost_micros") or 0) > 0 and (t.get("conversions") or 0) == 0
+    ]
+
+
+async def _gads_classify_search_term_relevance(search_term: str, business_description: str) -> dict:
+    """Claude classifies whether a real, already-spend-and-zero-conversion
+    search term is relevant to the business — same raw-httpx call pattern
+    already used by the Reel Auto-Editor (_reel_pick_best_segment). Returns
+    {"relevant": bool, "reasoning": str}; never invents a search term of
+    its own, it only judges the ONE real term it's given. On any failure
+    (no API key, bad JSON, network error) returns relevant=True (the safe
+    default — never recommend excluding real traffic on an unverified
+    guess)."""
+    safe_default = {"relevant": True, "reasoning": "Could not classify (defaulting to relevant, not excluded)."}
+    if not ANTHROPIC_API_KEY or not search_term.strip():
+        return safe_default
+
+    prompt = (
+        f"A Google Ads Search campaign for this business:\n{business_description}\n\n"
+        f"A real search term that triggered an ad, cost money, and produced ZERO conversions: \"{search_term}\"\n\n"
+        "Is this search term actually relevant to what this business offers? Judge based on real intent match, not "
+        "just keyword overlap — e.g. \"free\" or \"jobs\" appended to an otherwise-relevant term is usually NOT "
+        "relevant (different intent).\n\n"
+        'Return ONLY valid JSON: {"relevant": true|false, "reasoning": "one sentence"}'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client_:
+            resp = await client_.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": _GADS_OPTIMIZER_CLAUDE_MODEL, "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"[GADS-OPTIMIZER] Claude classify failed ({resp.status_code}) for {search_term!r}")
+            return safe_default
+        data = resp.json()
+        raw_text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        if raw_text.startswith("```"):
+            raw_text = raw_text.strip("`")
+            if raw_text.lower().startswith("json"):
+                raw_text = raw_text[4:]
+            raw_text = raw_text.strip()
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, dict) or "relevant" not in parsed:
+            return safe_default
+        return {"relevant": bool(parsed["relevant"]), "reasoning": str(parsed.get("reasoning", ""))[:300]}
+    except Exception as e:
+        logger.warning(f"[GADS-OPTIMIZER] Claude classify error for {search_term!r}: {e}")
+        return safe_default
+
+
+def _gads_rule_negative_keyword(search_term: str, cost_micros: int, ad_group_rn: str,
+                                 classification: dict) -> Optional[dict]:
+    """Turns a real zero-conversion search term + its Claude relevance
+    verdict into a recommendation — only when Claude judged it NOT
+    relevant. A term Claude couldn't confidently classify (safe_default,
+    relevant=True) never becomes a recommendation, matching "never exclude
+    real traffic on an unverified guess.\""""
+    if classification.get("relevant", True):
+        return None
+    return {
+        "type": "add_negative_keyword", "severity": "low", "target_resource": ad_group_rn,
+        "current_value": None, "proposed_value": search_term,
+        "reason": f"\"{search_term}\" cost ₹{cost_micros / 1_000_000:.2f} with 0 conversions and was judged irrelevant: {classification.get('reasoning', '')}",
+        "supporting_metrics": {"search_term": search_term, "cost_inr": round(cost_micros / 1_000_000, 2), "claude_reasoning": classification.get("reasoning", "")},
+    }
+
+
+# ── Google Ads Optimizer: mutation functions (all `.update`/`.create`, never
+# applied except through _gads_apply_recommendation's guardrail re-check) ───
+
+def _gads_update_bid_sync(client, customer_id: str, ad_group_criterion_rn: str, new_bid_micros: int) -> str:
+    """Updates an EXISTING ad_group_criterion's cpc_bid_micros. No prior
+    `.update` mutation exists anywhere in this codebase (only `.create`,
+    per this feature's own audit) — verified live against the real SDK
+    message classes (no auth needed for message construction) that
+    protobuf_helpers.field_mask(None, op.update._pb) produces the correct
+    ['resource_name', 'cpc_bid_micros'] mask, matching Google's own
+    published client-library sample pattern."""
+    from google.api_core.protobuf_helpers import field_mask
+    svc = client.get_service("AdGroupCriterionService")
+    op = client.get_type("AdGroupCriterionOperation")
+    op.update.resource_name = ad_group_criterion_rn
+    op.update.cpc_bid_micros = new_bid_micros
+    op.update_mask.CopyFrom(field_mask(None, op.update._pb))
+    resp = svc.mutate_ad_group_criteria(customer_id=customer_id, operations=[op])
+    return resp.results[0].resource_name
+
+
+def _gads_update_budget_sync(client, customer_id: str, campaign_budget_rn: str, new_amount_micros: int) -> str:
+    from google.api_core.protobuf_helpers import field_mask
+    svc = client.get_service("CampaignBudgetService")
+    op = client.get_type("CampaignBudgetOperation")
+    op.update.resource_name = campaign_budget_rn
+    op.update.amount_micros = new_amount_micros
+    op.update_mask.CopyFrom(field_mask(None, op.update._pb))
+    resp = svc.mutate_campaign_budgets(customer_id=customer_id, operations=[op])
+    return resp.results[0].resource_name
+
+
+def _gads_add_negative_keyword_sync(client, customer_id: str, ad_group_rn: str, keyword_text: str) -> str:
+    """Adds a negative keyword at the ad-group level — AdGroupCriterion
+    with negative=True on a .create operation (same resource type as a
+    positive keyword; Google Ads has no separate resource for negatives).
+    No prior precedent for this in the codebase (verified via a whole-file
+    audit) — this is new, but uses the exact same
+    get_service/get_type/.create/mutate shape _add_keywords_sync already
+    establishes for positive keywords."""
+    svc = client.get_service("AdGroupCriterionService")
+    op = client.get_type("AdGroupCriterionOperation")
+    crit = op.create
+    crit.ad_group = ad_group_rn
+    crit.negative = True
+    crit.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    crit.keyword.text = keyword_text[:80]
+    crit.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
+    resp = svc.mutate_ad_group_criteria(customer_id=customer_id, operations=[op])
+    return resp.results[0].resource_name
+
+
+def _gads_add_phrase_match_variant_sync(client, customer_id: str, ad_group_rn: str, keyword_text: str) -> str:
+    """Adds a phrase-match variant of an existing low-search-volume exact
+    keyword — the existing keyword is left untouched (never removed), this
+    only adds a second, broader criterion alongside it."""
+    svc = client.get_service("AdGroupCriterionService")
+    op = client.get_type("AdGroupCriterionOperation")
+    crit = op.create
+    crit.ad_group = ad_group_rn
+    crit.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+    crit.keyword.text = keyword_text[:80]
+    crit.keyword.match_type = client.enums.KeywordMatchTypeEnum.PHRASE
+    resp = svc.mutate_ad_group_criteria(customer_id=customer_id, operations=[op])
+    return resp.results[0].resource_name
+
+
+def _gads_remove_criterion_sync(client, customer_id: str, ad_group_criterion_rn: str) -> None:
+    """Removes an ad_group_criterion by resource_name — the revert path for
+    a previously-applied add_negative_keyword/add_phrase_match
+    recommendation (undoes a .create by removing the created resource,
+    rather than an .update needing a prior-value restore)."""
+    svc = client.get_service("AdGroupCriterionService")
+    op = client.get_type("AdGroupCriterionOperation")
+    op.remove = ad_group_criterion_rn
+    svc.mutate_ad_group_criteria(customer_id=customer_id, operations=[op])
+
+
+# ── Google Ads Optimizer: apply / revert dispatchers ─────────────────────────
+# Phase 1 is approval-mode only: these functions are ONLY ever invoked from
+# the approve/revert endpoints below, which require an authenticated human
+# request — nothing in the daily recommendation job (_run_gads_optimizer_
+# for_campaign) ever calls either of these. auto_apply_enabled is stored on
+# gads_automation_settings for Phase 2 but is never read here or anywhere
+# else in this file — that is the actual Phase-1 guarantee, not just a
+# comment.
+_GADS_ALERT_ONLY_TYPES = {"fix_disapproved_ad", "fix_conversion_tracking", "under_delivery_alert"}
+
+
+async def _gads_apply_recommendation(rec: dict, ads_client, customer_id: str, settings: dict) -> dict:
+    """Applies ONE approved recommendation through the real Ads API.
+    Guardrails are re-checked HERE against CURRENT settings, never just
+    trusted from whenever the recommendation was generated — a human may
+    approve it days later, after the cap or step-size setting changed.
+    Returns {"success", "applied_resource_name", "previous_value_micros",
+    "error"}."""
+    rec_type = rec["type"]
+    if rec_type in _GADS_ALERT_ONLY_TYPES:
+        # Nothing to mutate — these are alerts only. "Approve" just
+        # acknowledges them.
+        return {"success": True, "applied_resource_name": None, "previous_value_micros": None, "error": None}
+
+    if rec_type == "raise_cpc":
+        current = int(rec["current_value"])
+        proposed = int(rec["proposed_value"])
+        step_capped = int(current * (1 + settings["max_bid_change_pct"] / 100.0))
+        final_bid = min(proposed, step_capped, settings["max_cpc_cap_micros"])
+        if final_bid <= current:
+            return {"success": False, "error": "Current guardrails no longer allow any increase for this bid.", "applied_resource_name": None, "previous_value_micros": None}
+        try:
+            rn = await asyncio.to_thread(_gads_update_bid_sync, ads_client, customer_id, rec["target_resource"], final_bid)
+            return {"success": True, "applied_resource_name": rn, "previous_value_micros": current, "error": None}
+        except Exception as e:
+            return {"success": False, "error": str(e), "applied_resource_name": None, "previous_value_micros": None}
+
+    if rec_type == "raise_budget":
+        current = int(rec["current_value"])
+        proposed = int(rec["proposed_value"])
+        step_capped = int(current * (1 + settings["max_bid_change_pct"] / 100.0))
+        final_budget = min(proposed, step_capped, settings["max_daily_budget_cap_micros"])
+        if final_budget <= current:
+            return {"success": False, "error": "Current guardrails no longer allow any increase for this budget.", "applied_resource_name": None, "previous_value_micros": None}
+        try:
+            rn = await asyncio.to_thread(_gads_update_budget_sync, ads_client, customer_id, rec["target_resource"], final_budget)
+            return {"success": True, "applied_resource_name": rn, "previous_value_micros": current, "error": None}
+        except Exception as e:
+            return {"success": False, "error": str(e), "applied_resource_name": None, "previous_value_micros": None}
+
+    if rec_type == "add_phrase_match":
+        try:
+            rn = await asyncio.to_thread(_gads_add_phrase_match_variant_sync, ads_client, customer_id, rec["target_resource"], rec["proposed_value"])
+            return {"success": True, "applied_resource_name": rn, "previous_value_micros": None, "error": None}
+        except Exception as e:
+            return {"success": False, "error": str(e), "applied_resource_name": None, "previous_value_micros": None}
+
+    if rec_type == "add_negative_keyword":
+        try:
+            rn = await asyncio.to_thread(_gads_add_negative_keyword_sync, ads_client, customer_id, rec["target_resource"], rec["proposed_value"])
+            return {"success": True, "applied_resource_name": rn, "previous_value_micros": None, "error": None}
+        except Exception as e:
+            return {"success": False, "error": str(e), "applied_resource_name": None, "previous_value_micros": None}
+
+    return {"success": False, "error": f"Unknown recommendation type: {rec_type}", "applied_resource_name": None, "previous_value_micros": None}
+
+
+async def _gads_revert_recommendation(rec: dict, ads_client, customer_id: str) -> dict:
+    """Undoes an applied change: restores previous_value_micros for a bid/
+    budget raise, or removes the created criterion for a negative-keyword/
+    phrase-match addition. Alert-only types were never mutated, so there is
+    nothing to revert."""
+    rec_type = rec["type"]
+    if rec_type in _GADS_ALERT_ONLY_TYPES:
+        return {"success": False, "error": "This recommendation type has no applied change to revert."}
+
+    if rec_type in ("raise_cpc", "raise_budget"):
+        if rec.get("previous_value_micros") is None:
+            return {"success": False, "error": "No prior value was recorded for this change."}
+        target = rec.get("applied_resource_name") or rec["target_resource"]
+        try:
+            if rec_type == "raise_cpc":
+                await asyncio.to_thread(_gads_update_bid_sync, ads_client, customer_id, target, rec["previous_value_micros"])
+            else:
+                await asyncio.to_thread(_gads_update_budget_sync, ads_client, customer_id, target, rec["previous_value_micros"])
+            return {"success": True, "error": None}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    if rec_type in ("add_negative_keyword", "add_phrase_match"):
+        if not rec.get("applied_resource_name"):
+            return {"success": False, "error": "No applied resource was recorded for this change."}
+        try:
+            await asyncio.to_thread(_gads_remove_criterion_sync, ads_client, customer_id, rec["applied_resource_name"])
+            return {"success": True, "error": None}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    return {"success": False, "error": "Nothing to revert for this recommendation."}
+
+
+def _gads_resolve_business_description(campaign_id: str, campaign_name: str) -> str:
+    """Best-effort real business context for Claude's negative-keyword
+    relevance classification — reuses the existing activity_log→business_key
+    lookup (_resolve_business_key_from_campaign, already established for
+    ad-to-creative) and business_memory, when available. Falls back to the
+    campaign's own name (always real, always available) rather than
+    inventing a description — Claude's classification prompt explicitly
+    says "judge based on real intent match," so an honest-but-thin fallback
+    context is safer than a fabricated one."""
+    try:
+        resolved = _resolve_business_key_from_campaign(campaign_id)
+        business_key = resolved.get("business_key")
+        if business_key:
+            mem = get_memory(business_key)
+            biz = mem.get("business") or {}
+            parts = [p for p in [biz.get("business_name"), biz.get("industry"), biz.get("positioning"), biz.get("uvp")] if p]
+            if parts:
+                return " — ".join(str(p) for p in parts)
+    except Exception as e:
+        logger.warning(f"[GADS-OPTIMIZER] business description resolution failed: {e}")
+    return f"A business running the Google Ads campaign \"{campaign_name}\"."
+
+
+def _gads_upsert_recommendation(user_id: str, campaign_id: str, campaign_name: str, rec: dict) -> None:
+    """UPSERT on (user_id, campaign_id, type, target_resource) — a daily
+    rerun of the same unresolved issue refreshes the existing PENDING row's
+    reason/metrics/proposed_value rather than creating a duplicate. A row
+    that's already approved/applied/rejected/reverted is deliberately left
+    untouched — the job must never silently overwrite a human decision or
+    an applied change's audit trail. Implemented as an explicit SELECT-then-
+    INSERT-or-UPDATE (not a native upsert) so behavior is identical on
+    SQLite and Postgres without depending on a specific conditional-upsert
+    dialect feature."""
+    target_resource = rec.get("target_resource") or f"campaign/{campaign_id}/{rec['type']}"
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        existing = conn.execute(text(
+            "SELECT id, status FROM gads_recommendations WHERE user_id=:uid AND campaign_id=:cid AND type=:type AND target_resource=:tr"
+        ), {"uid": user_id, "cid": campaign_id, "type": rec["type"], "tr": target_resource}).fetchone()
+        if existing:
+            existing_id, existing_status = existing
+            if existing_status != "pending":
+                return
+            conn.execute(text(
+                "UPDATE gads_recommendations SET severity=:severity, current_value=:cv, proposed_value=:pv, "
+                "reason=:reason, supporting_metrics_json=:sm WHERE id=:id"
+            ), {"severity": rec["severity"], "cv": rec.get("current_value"), "pv": rec.get("proposed_value"),
+                "reason": rec["reason"], "sm": json.dumps(rec.get("supporting_metrics", {})), "id": existing_id})
+        else:
+            conn.execute(text(
+                "INSERT INTO gads_recommendations (user_id, campaign_id, campaign_name, type, severity, "
+                "target_resource, current_value, proposed_value, reason, supporting_metrics_json, status, created_at) "
+                "VALUES (:uid, :cid, :cname, :type, :severity, :tr, :cv, :pv, :reason, :sm, 'pending', :ts)"
+            ), {"uid": user_id, "cid": campaign_id, "cname": campaign_name, "type": rec["type"], "severity": rec["severity"],
+                "tr": target_resource, "cv": rec.get("current_value"), "pv": rec.get("proposed_value"),
+                "reason": rec["reason"], "sm": json.dumps(rec.get("supporting_metrics", {})), "ts": now})
+
+
+async def _run_gads_optimizer_for_campaign(user_id: str, ads_client, customer_id: str, campaign_id: str, settings: dict) -> int:
+    """Evaluates every rule against one campaign's real diagnostics data and
+    upserts any triggered recommendation. Returns the count of recommendations
+    touched. Detection + storage ONLY — nothing in this function (or
+    anything it calls) ever mutates a live Google Ads campaign; that only
+    ever happens through _gads_apply_recommendation, gated behind an
+    explicit human approve action on a specific stored row."""
+    service = ads_client.get_service("GoogleAdsService")
+    data = await asyncio.to_thread(_gads_fetch_campaign_diagnostics_data, ads_client, service, customer_id, campaign_id, 7)
+    campaign_name = data["campaign"]["name"]
+    metrics = data["metrics"]
+    budget = data["budget"]
+    touched = 0
+
+    def _store(rec):
+        nonlocal touched
+        if rec:
+            _gads_upsert_recommendation(user_id, campaign_id, campaign_name, rec)
+            touched += 1
+
+    # raise_cpc — one candidate per keyword with a real bid and a real resource_name
+    for kw in data["keywords"]:
+        if not kw.get("resource_name") or not kw.get("cpc_bid_micros"):
+            continue
+        _store(_gads_rule_raise_cpc(
+            kw["text"], kw["resource_name"], kw["cpc_bid_micros"], kw.get("top_of_page_bid_high_micros"),
+            metrics.get("search_rank_lost_impression_share"), settings["max_cpc_cap_micros"], settings["max_bid_change_pct"],
+        ))
+
+    # raise_budget — campaign-level, once
+    if budget.get("resource_name") and budget.get("amount_micros"):
+        _store(_gads_rule_raise_budget(
+            budget["resource_name"], budget["amount_micros"], metrics.get("search_budget_lost_impression_share"),
+            settings["max_daily_budget_cap_micros"], settings["max_bid_change_pct"],
+        ))
+
+    # add_phrase_match — one candidate per low-search-volume exact keyword
+    for kw in data["keywords"]:
+        if not kw.get("ad_group_resource_name"):
+            continue
+        _store(_gads_rule_low_search_volume(kw["text"], kw["ad_group_resource_name"], kw["match_type"], kw["serving_status"]))
+
+    # fix_disapproved_ad / fix_conversion_tracking — campaign-level alerts
+    _store(_gads_rule_disapproved_ads(data.get("disapproved_ad_count", 0), campaign_id))
+    _store(_gads_rule_conversion_tracking(data.get("active_conversion_count", 0), campaign_id))
+
+    # under_delivery_alert — needs the zero-filled daily cost series already
+    # built by _gads_fetch_campaign_diagnostics_data
+    if budget.get("amount_micros"):
+        _store(_gads_rule_underdelivery(metrics.get("daily_cost_micros", []), budget["amount_micros"], campaign_id))
+
+    # add_negative_keyword — the only Claude-dependent rule. Pre-filtered
+    # deterministically (real spend, zero conversions) before any model call.
+    candidates = _gads_negative_keyword_candidates(data.get("search_terms", []))
+    if candidates:
+        business_description = _gads_resolve_business_description(campaign_id, campaign_name)
+        # Cap how many terms get classified per campaign per run — bounds
+        # both Claude API cost and run time; the highest-cost offenders
+        # matter most and are addressed first, the rest catch up next run.
+        for term in sorted(candidates, key=lambda t: t.get("cost_micros", 0), reverse=True)[:15]:
+            if not term.get("ad_group_resource_name"):
+                continue
+            classification = await _gads_classify_search_term_relevance(term["search_term"], business_description)
+            _store(_gads_rule_negative_keyword(term["search_term"], term["cost_micros"], term["ad_group_resource_name"], classification))
+
+    return touched
+
+
+@app.post("/google-ads/optimizer/run-all")
+async def gads_optimizer_run_all():
+    """Daily cron entrypoint — same X-API-Key-only gate as the existing,
+    verified-correct /search-console/sync-all (registered in
+    _API_KEY_ONLY_PATHS, no Supabase JWT needed). Iterates every tenant
+    with a connected, non-revoked Google Ads account and every ENABLED
+    campaign under it, running the detection-only rule pass per campaign.
+    One tenant's or campaign's failure is logged and skipped — never abandons
+    the whole batch."""
+    with engine.connect() as conn:
+        tenant_rows = conn.execute(text(
+            "SELECT user_id, customer_id FROM gads_oauth_tokens WHERE revoked=FALSE AND customer_id IS NOT NULL AND customer_id != ''"
+        )).fetchall()
+
+    results = {"tenants_processed": 0, "campaigns_processed": 0, "recommendations_touched": 0, "errors": []}
+    for user_id, customer_id in tenant_rows:
+        try:
+            settings = _get_or_create_gads_automation_settings(user_id)
+            if settings["automation_paused"]:
+                continue  # global per-user pause switch — skip detection entirely, not just apply
+            ads_client = get_google_ads_client_for_user(user_id)
+            service = ads_client.get_service("GoogleAdsService")
+            camp_rows = list(await asyncio.to_thread(
+                lambda: list(service.search(customer_id=customer_id, query=(
+                    "SELECT campaign.id FROM campaign WHERE campaign.status = 'ENABLED'"
+                )))
+            ))
+            results["tenants_processed"] += 1
+            for row in camp_rows:
+                campaign_id = str(row.campaign.id)
+                try:
+                    touched = await _run_gads_optimizer_for_campaign(user_id, ads_client, customer_id, campaign_id, settings)
+                    results["campaigns_processed"] += 1
+                    results["recommendations_touched"] += touched
+                except Exception as ce:
+                    logger.error(f"[GADS-OPTIMIZER] campaign {campaign_id} (user {user_id}) failed: {ce}")
+                    results["errors"].append(f"user={user_id} campaign={campaign_id}: {ce}")
+        except Exception as te:
+            logger.error(f"[GADS-OPTIMIZER] tenant {user_id} failed: {te}")
+            results["errors"].append(f"user={user_id}: {te}")
+
+    logger.info(f"[GADS-OPTIMIZER] run-all complete: {results['tenants_processed']} tenants, "
+                f"{results['campaigns_processed']} campaigns, {results['recommendations_touched']} recommendations touched")
+    return {"success": True, **results}
+
+
+# ── Outcome tracking ──────────────────────────────────────────────────────────
+_GADS_OUTCOME_WAIT_DAYS = 3
+
+
+def _gads_compute_outcome_comparison(before_metrics: dict, after_metrics: dict) -> dict:
+    """Pure function — compares two real {impressions, clicks, cost_micros,
+    conversions} windows and produces the delta summary shown next to a
+    recommendation. `worsened` requires a REAL regression on more than one
+    signal (clicks down by a real margin AND (CPC up OR conversions down))
+    — never flags normal day-to-day noise on a single metric as a failed
+    change."""
+    def pct_change(before, after):
+        if not before:
+            return None
+        return round((after - before) / before * 100, 1)
+
+    before_ctr = (before_metrics["clicks"] / before_metrics["impressions"] * 100) if before_metrics["impressions"] else 0.0
+    after_ctr = (after_metrics["clicks"] / after_metrics["impressions"] * 100) if after_metrics["impressions"] else 0.0
+    before_cpc = (before_metrics["cost_micros"] / before_metrics["clicks"]) if before_metrics["clicks"] else 0.0
+    after_cpc = (after_metrics["cost_micros"] / after_metrics["clicks"]) if after_metrics["clicks"] else 0.0
+    clicks_change_pct = pct_change(before_metrics["clicks"], after_metrics["clicks"])
+    conversions_change = after_metrics["conversions"] - before_metrics["conversions"]
+
+    worsened = (
+        clicks_change_pct is not None and clicks_change_pct < -10
+        and (after_cpc > before_cpc or conversions_change < 0)
+    )
+    return {
+        "before": before_metrics, "after": after_metrics,
+        "impressions_change_pct": pct_change(before_metrics["impressions"], after_metrics["impressions"]),
+        "clicks_change_pct": clicks_change_pct,
+        "ctr_before_pct": round(before_ctr, 2), "ctr_after_pct": round(after_ctr, 2),
+        "cpc_before_inr": round(before_cpc / 1_000_000, 2), "cpc_after_inr": round(after_cpc / 1_000_000, 2),
+        "conversions_change": round(conversions_change, 2),
+        "worsened": worsened,
+    }
+
+
+def _gads_fetch_campaign_metrics_window_sync(client, customer_id: str, campaign_id: str, start, end) -> dict:
+    """Blocking — call via asyncio.to_thread. Real summed metrics for one
+    campaign over one date window, used to build the before/after outcome
+    comparison."""
+    service = client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions
+        FROM campaign
+        WHERE campaign.id = {campaign_id} AND segments.date BETWEEN '{start}' AND '{end}'
+    """
+    rows = list(service.search(customer_id=customer_id, query=query))
+    return {
+        "impressions": sum(r.metrics.impressions for r in rows),
+        "clicks": sum(r.metrics.clicks for r in rows),
+        "cost_micros": sum(r.metrics.cost_micros for r in rows),
+        "conversions": round(sum(r.metrics.conversions for r in rows), 2),
+    }
+
+
+async def _gads_maybe_compute_outcome(rec: dict) -> None:
+    """Lazy, computed-on-read rather than needing a second scheduled
+    trigger: if this recommendation was applied _GADS_OUTCOME_WAIT_DAYS+
+    ago and has no outcome yet, compute it now (comparing the
+    _GADS_OUTCOME_WAIT_DAYS before applied_at against the same span after)
+    and persist it. A no-op for anything not yet due, already computed, or
+    never applied. Mutates `rec` in place when it computes one."""
+    if rec["status"] not in ("applied", "reverted") or not rec.get("applied_at") or rec.get("outcome"):
+        return
+    try:
+        applied_dt = datetime.fromisoformat(rec["applied_at"])
+    except Exception:
+        return
+    if datetime.utcnow() - applied_dt < timedelta(days=_GADS_OUTCOME_WAIT_DAYS):
+        return
+    customer_id = _gads_customer_id()
+    if not customer_id:
+        return
+    try:
+        client = get_google_ads_client()
+        applied_date = applied_dt.date()
+        before_start = applied_date - timedelta(days=_GADS_OUTCOME_WAIT_DAYS)
+        before_end = applied_date - timedelta(days=1)
+        after_start = applied_date
+        after_end = applied_date + timedelta(days=_GADS_OUTCOME_WAIT_DAYS - 1)
+        before = await asyncio.to_thread(_gads_fetch_campaign_metrics_window_sync, client, customer_id, rec["campaign_id"], before_start, before_end)
+        after = await asyncio.to_thread(_gads_fetch_campaign_metrics_window_sync, client, customer_id, rec["campaign_id"], after_start, after_end)
+        comparison = _gads_compute_outcome_comparison(before, after)
+        now = datetime.utcnow().isoformat()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE gads_recommendations SET outcome_json=:oj, outcome_computed_at=:ts WHERE id=:id"
+            ), {"oj": json.dumps(comparison), "ts": now, "id": rec["id"]})
+        rec["outcome"] = comparison
+        rec["outcome_computed_at"] = now
+    except Exception as e:
+        logger.warning(f"[GADS-OPTIMIZER] outcome computation failed for recommendation {rec.get('id')}: {e}")
+
+
+_GADS_RECOMMENDATION_COLS = [
+    "id", "user_id", "campaign_id", "campaign_name", "type", "severity", "target_resource",
+    "current_value", "proposed_value", "reason", "supporting_metrics_json", "status",
+    "applied_resource_name", "previous_value_micros", "created_at", "reviewed_at", "applied_at",
+    "reverted_at", "outcome_json", "outcome_computed_at",
+]
+
+
+def _gads_rec_row_to_dict(row) -> dict:
+    d = dict(zip(_GADS_RECOMMENDATION_COLS, row))
+    try:
+        d["supporting_metrics"] = json.loads(d.pop("supporting_metrics_json") or "{}")
+    except Exception:
+        d["supporting_metrics"] = {}
+    try:
+        d["outcome"] = json.loads(d.pop("outcome_json")) if d.get("outcome_json") else None
+    except Exception:
+        d["outcome"] = None
+    return d
+
+
+@app.get("/google-ads/recommendations")
+async def gads_list_recommendations(request: Request, status: str = "", campaign_id: str = ""):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    where = ["user_id=:uid"]
+    params = {"uid": uid}
+    if status:
+        where.append("status=:status")
+        params["status"] = status
+    if campaign_id:
+        where.append("campaign_id=:cid")
+        params["cid"] = campaign_id
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            f"SELECT {', '.join(_GADS_RECOMMENDATION_COLS)} FROM gads_recommendations "
+            f"WHERE {' AND '.join(where)} ORDER BY created_at DESC LIMIT 200"
+        ), params).fetchall()
+    recs = [_gads_rec_row_to_dict(r) for r in rows]
+    for rec in recs:
+        await _gads_maybe_compute_outcome(rec)
+    return {"success": True, "recommendations": recs}
+
+
+def _gads_get_recommendation_or_404(rec_id: int, uid: str) -> dict:
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            f"SELECT {', '.join(_GADS_RECOMMENDATION_COLS)} FROM gads_recommendations WHERE id=:id AND user_id=:uid"
+        ), {"id": rec_id, "uid": uid}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return _gads_rec_row_to_dict(row)
+
+
+@app.post("/google-ads/recommendations/{rec_id}/reject")
+async def gads_reject_recommendation(rec_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    rec = _gads_get_recommendation_or_404(rec_id, uid)
+    if rec["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Recommendation is already {rec['status']}")
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE gads_recommendations SET status='rejected', reviewed_at=:ts WHERE id=:id AND user_id=:uid"
+        ), {"ts": now, "id": rec_id, "uid": uid})
+    return {"success": True}
+
+
+@app.post("/google-ads/recommendations/{rec_id}/approve")
+async def gads_approve_recommendation(rec_id: int, request: Request):
+    """The ONLY code path in this entire feature that mutates a live Google
+    Ads campaign — requires an authenticated human request approving one
+    specific, already-stored recommendation. Guardrails are re-checked
+    against CURRENT settings inside _gads_apply_recommendation, not just
+    trusted from whenever the recommendation was generated."""
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    rec = _gads_get_recommendation_or_404(rec_id, uid)
+    if rec["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Recommendation is already {rec['status']}")
+
+    settings = _get_or_create_gads_automation_settings(uid)
+    if settings["automation_paused"]:
+        raise HTTPException(status_code=400, detail="Automation is paused for this account — resume it in settings before approving.")
+
+    customer_id = _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "connect_required": True, "error": "No Google Ads account selected."}
+    try:
+        ads_client = get_google_ads_client()
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
+
+    now = datetime.utcnow().isoformat()
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE gads_recommendations SET status='approved', reviewed_at=:ts WHERE id=:id"), {"ts": now, "id": rec_id})
+
+    result = await _gads_apply_recommendation(rec, ads_client, customer_id, settings)
+    now2 = datetime.utcnow().isoformat()
+    if result["success"]:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE gads_recommendations SET status='applied', applied_at=:ts, "
+                "applied_resource_name=:arn, previous_value_micros=:pvm WHERE id=:id"
+            ), {"ts": now2, "arn": result.get("applied_resource_name"), "pvm": result.get("previous_value_micros"), "id": rec_id})
+        return {"success": True, "recommendation": _gads_get_recommendation_or_404(rec_id, uid)}
+    else:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE gads_recommendations SET status='failed' WHERE id=:id"), {"id": rec_id})
+        return {"success": False, "error": result.get("error"), "recommendation": _gads_get_recommendation_or_404(rec_id, uid)}
+
+
+@app.post("/google-ads/recommendations/{rec_id}/revert")
+async def gads_revert_recommendation(rec_id: int, request: Request):
+    uid = getattr(request.state, "user_id", "")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    rec = _gads_get_recommendation_or_404(rec_id, uid)
+    if rec["status"] != "applied":
+        raise HTTPException(status_code=400, detail=f"Only an applied recommendation can be reverted (this one is {rec['status']})")
+
+    customer_id = _gads_customer_id()
+    if not customer_id:
+        return {"success": False, "connect_required": True, "error": "No Google Ads account selected."}
+    try:
+        ads_client = get_google_ads_client()
+    except GadsNotConnectedError as ex:
+        return {"success": False, "connect_required": True, "error": str(ex)}
+
+    result = await _gads_revert_recommendation(rec, ads_client, customer_id)
+    if result["success"]:
+        now = datetime.utcnow().isoformat()
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE gads_recommendations SET status='reverted', reverted_at=:ts WHERE id=:id"), {"ts": now, "id": rec_id})
+        return {"success": True, "recommendation": _gads_get_recommendation_or_404(rec_id, uid)}
+    return {"success": False, "error": result.get("error")}
 
 
 # ── Keyword Intelligence: provenance labels ───────────────────────────────────
