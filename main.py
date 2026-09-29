@@ -15,6 +15,7 @@ from typing import Optional, Literal
 from contextvars import ContextVar
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
+from google.auth.exceptions import RefreshError as GoogleAuthRefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow as _GoogleOAuthFlow
 from cryptography.fernet import Fernet
@@ -26739,37 +26740,59 @@ async def gads_patch_automation_settings(payload: GadsAutomationSettingsPatch, r
 # being re-checked against current guardrails at apply time (see
 # _gads_apply_recommendation). Pure functions — real unit tests, no mocking.
 
+_GADS_DIRECT_JUMP_THRESHOLD_PCT = 0.25
+
+
 def _gads_rule_raise_cpc(keyword_text: str, ad_group_criterion_rn: str, current_bid_micros: int,
                           top_of_page_bid_high_micros: Optional[int], rank_lost_share: Optional[float],
                           max_cpc_cap_micros: int, max_bid_change_pct: int) -> Optional[dict]:
     """search_rank_lost_impression_share > 50% → recommend raising max CPC
-    toward the keyword's own top-of-page bid estimate. Capped at +max_bid_
-    change_pct per step AND never above the user's max_cpc_cap_micros —
-    both caps apply simultaneously, whichever is lower wins. No recommendation
-    if the capped proposal isn't actually higher than the current bid (the
-    cap already binds, so a change here would be either impossible or a
-    no-op)."""
+    toward the keyword's own top-of-page bid estimate. Normally capped at
+    +max_bid_change_pct per step AND never above the user's max_cpc_cap_micros
+    — both caps apply simultaneously, whichever is lower wins.
+
+    Exception: when the current bid is below 25% of the top-of-page estimate,
+    a single 30%-step increase would leave the bid still far below what's
+    competitive — and would just repeat, one slow step at a time, on every
+    future run. In that case this proposes jumping straight to the top-of-
+    page estimate instead of a step, still never above the user's CPC cap.
+
+    No recommendation if the capped proposal isn't actually higher than the
+    current bid (a cap already binds, so a change here would be either
+    impossible or a no-op)."""
     if rank_lost_share is None or rank_lost_share <= 0.5:
         return None
     if not current_bid_micros or current_bid_micros <= 0:
         return None
-    step_capped = int(current_bid_micros * (1 + max_bid_change_pct / 100.0))
-    proposed = min(step_capped, max_cpc_cap_micros)
-    if top_of_page_bid_high_micros:
-        proposed = min(proposed, top_of_page_bid_high_micros)
+    direct_jump = bool(top_of_page_bid_high_micros) and current_bid_micros < top_of_page_bid_high_micros * _GADS_DIRECT_JUMP_THRESHOLD_PCT
+    if direct_jump:
+        proposed = min(top_of_page_bid_high_micros, max_cpc_cap_micros)
+    else:
+        step_capped = int(current_bid_micros * (1 + max_bid_change_pct / 100.0))
+        proposed = min(step_capped, max_cpc_cap_micros)
+        if top_of_page_bid_high_micros:
+            proposed = min(proposed, top_of_page_bid_high_micros)
     if proposed <= current_bid_micros:
         return None
+    reason = (
+        f"\"{keyword_text}\" lost {round(rank_lost_share * 100, 1)}% of its available impression share to "
+        f"Ad Rank — the current bid (₹{current_bid_micros / 1_000_000:.2f}) is too low to compete."
+    )
+    if direct_jump:
+        reason += (
+            f" [Direct jump] Current bid is under 25% of the ₹{top_of_page_bid_high_micros / 1_000_000:.2f} "
+            f"top-of-page estimate, so this proposes jumping straight to the estimate rather than a 30% step."
+        )
     return {
         "type": "raise_cpc", "severity": "high", "target_resource": ad_group_criterion_rn,
         "current_value": str(current_bid_micros), "proposed_value": str(proposed),
-        "reason": (
-            f"\"{keyword_text}\" lost {round(rank_lost_share * 100, 1)}% of its available impression share to "
-            f"Ad Rank — the current bid (₹{current_bid_micros / 1_000_000:.2f}) is too low to compete."
-        ),
+        "reason": reason,
         "supporting_metrics": {
             "keyword": keyword_text, "search_rank_lost_impression_share_pct": round(rank_lost_share * 100, 1),
             "current_bid_inr": round(current_bid_micros / 1_000_000, 2), "proposed_bid_inr": round(proposed / 1_000_000, 2),
             "top_of_page_bid_high_inr": round(top_of_page_bid_high_micros / 1_000_000, 2) if top_of_page_bid_high_micros else None,
+            "top_of_page_bid_high_micros": top_of_page_bid_high_micros,
+            "direct_jump_to_estimate": direct_jump,
         },
     }
 
@@ -26835,6 +26858,31 @@ def _gads_rule_conversion_tracking(active_conversion_count: int, campaign_id: st
         "current_value": "0 active conversion actions", "proposed_value": None,
         "reason": "No active conversion tracking is configured for this account.",
         "supporting_metrics": {"active_conversion_count": active_conversion_count},
+    }
+
+
+def _gads_is_oauth_error(exc: Exception) -> bool:
+    """True only for the specific failure modes that mean "this user's Google
+    Ads OAuth connection needs to be redone" — no token on file / revoked
+    (GadsNotConnectedError), or a refresh token Google has invalidated
+    (google.auth's RefreshError, e.g. invalid_grant). Any other exception
+    (a network blip, a malformed GAQL query, a transient Ads API error) is
+    deliberately NOT treated as a reconnect situation — surfacing a
+    "reconnect your account" alert for an unrelated failure would send the
+    user down the wrong troubleshooting path."""
+    return isinstance(exc, (GadsNotConnectedError, GoogleAuthRefreshError))
+
+
+def _gads_rule_reconnect_needed(error_detail: str) -> dict:
+    """Account-level, alert-only recommendation fired when a tenant's stored
+    Google Ads OAuth connection can no longer authenticate. Surfaced in the
+    Recommendations list (not just a server log) so the user actually sees
+    it and can act — reconnecting in Connected Accounts is the only fix."""
+    return {
+        "type": "reconnect_google_ads", "severity": "high", "target_resource": "account/reconnect_google_ads",
+        "current_value": None, "proposed_value": None,
+        "reason": "Google Ads connection is no longer valid — reconnect the account in Connected Accounts to resume daily optimization checks.",
+        "supporting_metrics": {"error": (error_detail or "")[:500]},
     }
 
 
@@ -27026,7 +27074,7 @@ def _gads_remove_criterion_sync(client, customer_id: str, ad_group_criterion_rn:
 # gads_automation_settings for Phase 2 but is never read here or anywhere
 # else in this file — that is the actual Phase-1 guarantee, not just a
 # comment.
-_GADS_ALERT_ONLY_TYPES = {"fix_disapproved_ad", "fix_conversion_tracking", "under_delivery_alert"}
+_GADS_ALERT_ONLY_TYPES = {"fix_disapproved_ad", "fix_conversion_tracking", "under_delivery_alert", "reconnect_google_ads"}
 
 
 async def _gads_apply_recommendation(rec: dict, ads_client, customer_id: str, settings: dict) -> dict:
@@ -27045,8 +27093,18 @@ async def _gads_apply_recommendation(rec: dict, ads_client, customer_id: str, se
     if rec_type == "raise_cpc":
         current = int(rec["current_value"])
         proposed = int(rec["proposed_value"])
-        step_capped = int(current * (1 + settings["max_bid_change_pct"] / 100.0))
-        final_bid = min(proposed, step_capped, settings["max_cpc_cap_micros"])
+        # Re-derive the direct-jump exception from CURRENT values, same as
+        # every other guardrail here — never just trust a stored flag from
+        # whenever the recommendation was generated. Without this, a
+        # direct-jump proposal would silently get clamped back down to a
+        # 30% step at approval time, defeating the whole point of it.
+        top_of_page = (rec.get("supporting_metrics") or {}).get("top_of_page_bid_high_micros")
+        direct_jump = bool(top_of_page) and current < top_of_page * _GADS_DIRECT_JUMP_THRESHOLD_PCT
+        if direct_jump:
+            final_bid = min(proposed, top_of_page, settings["max_cpc_cap_micros"])
+        else:
+            step_capped = int(current * (1 + settings["max_bid_change_pct"] / 100.0))
+            final_bid = min(proposed, step_capped, settings["max_cpc_cap_micros"])
         if final_bid <= current:
             return {"success": False, "error": "Current guardrails no longer allow any increase for this bid.", "applied_resource_name": None, "previous_value_micros": None}
         try:
@@ -27285,6 +27343,15 @@ async def gads_optimizer_run_all():
         except Exception as te:
             logger.error(f"[GADS-OPTIMIZER] tenant {user_id} failed: {te}")
             results["errors"].append(f"user={user_id}: {te}")
+            if _gads_is_oauth_error(te):
+                try:
+                    _gads_upsert_recommendation(user_id, "account", "Account", _gads_rule_reconnect_needed(str(te)))
+                    results["recommendations_touched"] += 1
+                except Exception as ae:
+                    logger.error(f"[GADS-OPTIMIZER] failed to store reconnect alert for user {user_id}: {ae}")
+            # Deliberately no `raise`/`continue` needed here — this is already
+            # the last statement in the loop body, so control naturally
+            # advances to the next tenant in tenant_rows regardless.
 
     logger.info(f"[GADS-OPTIMIZER] run-all complete: {results['tenants_processed']} tenants, "
                 f"{results['campaigns_processed']} campaigns, {results['recommendations_touched']} recommendations touched")

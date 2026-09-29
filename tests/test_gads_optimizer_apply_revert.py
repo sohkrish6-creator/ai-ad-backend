@@ -149,6 +149,41 @@ async def test_apply_raise_cpc_is_reclamped_when_stored_proposal_exceeds_current
 
 
 @pytest.mark.asyncio
+async def test_apply_raise_cpc_direct_jump_is_not_reclamped_to_the_30pct_step():
+    # The recommendation was flagged direct_jump_to_estimate=True at
+    # generation time (current bid was under 25% of the 10M top-of-page
+    # estimate). At apply time, a plain 30% step would only allow 2.6M —
+    # but the direct jump must still apply the full 10M, not get silently
+    # clamped back down to the step.
+    rec = {
+        "type": "raise_cpc", "current_value": "2000000", "proposed_value": "10000000", "target_resource": "rn",
+        "supporting_metrics": {"top_of_page_bid_high_micros": 10_000_000, "direct_jump_to_estimate": True},
+    }
+    client = _FakeClient()
+    result = await _gads_apply_recommendation(rec, client, "1", DEFAULT_SETTINGS)
+    assert result["success"] is True
+    applied_op = client._service.calls[0]["operations"][0]
+    assert applied_op.update.cpc_bid_micros == 10_000_000
+
+
+@pytest.mark.asyncio
+async def test_apply_raise_cpc_direct_jump_is_still_capped_by_the_current_user_cpc_cap():
+    # Guardrails tightened since the recommendation was generated: the user
+    # cap is now 5M, below the 10M top-of-page estimate — the cap must win
+    # even though this is a direct-jump recommendation.
+    rec = {
+        "type": "raise_cpc", "current_value": "2000000", "proposed_value": "10000000", "target_resource": "rn",
+        "supporting_metrics": {"top_of_page_bid_high_micros": 10_000_000, "direct_jump_to_estimate": True},
+    }
+    tighter_settings = {**DEFAULT_SETTINGS, "max_cpc_cap_micros": 5_000_000}
+    client = _FakeClient()
+    result = await _gads_apply_recommendation(rec, client, "1", tighter_settings)
+    assert result["success"] is True
+    applied_op = client._service.calls[0]["operations"][0]
+    assert applied_op.update.cpc_bid_micros == 5_000_000
+
+
+@pytest.mark.asyncio
 async def test_apply_raise_cpc_fails_cleanly_when_guardrails_no_longer_allow_any_increase():
     rec = {"type": "raise_cpc", "current_value": "50000000", "proposed_value": "60000000", "target_resource": "rn"}
     client = _FakeClient()

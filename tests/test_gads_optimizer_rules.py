@@ -49,9 +49,11 @@ def test_raise_cpc_does_not_fire_when_rank_lost_share_is_none():
 
 
 def test_raise_cpc_proposed_value_is_capped_at_max_bid_change_pct():
-    # current=10, step cap=13 (30%), top-of-page=100 (no bind), CPC cap=50 (no bind)
-    rec = _gads_rule_raise_cpc("x", "rn", 10_000_000, 100_000_000, 0.9, MAX_CPC_CAP, STEP_PCT)
+    # current=10, step cap=13 (30%), top-of-page=30 (no bind — and current
+    # is 33% of it, above the 25% direct-jump threshold), CPC cap=50 (no bind)
+    rec = _gads_rule_raise_cpc("x", "rn", 10_000_000, 30_000_000, 0.9, MAX_CPC_CAP, STEP_PCT)
     assert int(rec["proposed_value"]) == 13_000_000
+    assert rec["supporting_metrics"]["direct_jump_to_estimate"] is False
 
 
 def test_raise_cpc_proposed_value_is_capped_at_top_of_page_bid_when_lower_than_step():
@@ -73,6 +75,42 @@ def test_raise_cpc_never_fires_if_already_at_or_above_the_cap():
 def test_raise_cpc_missing_top_of_page_estimate_still_works_with_just_the_step_and_user_cap():
     rec = _gads_rule_raise_cpc("x", "rn", 10_000_000, None, 0.9, MAX_CPC_CAP, STEP_PCT)
     assert int(rec["proposed_value"]) == 13_000_000
+
+
+# ── raise_cpc: direct jump when far below the top-of-page estimate ─────────
+
+def test_raise_cpc_jumps_directly_to_estimate_when_current_bid_is_under_25pct_of_it():
+    # current=2M is 20% of top-of-page=10M — under the 25% threshold, so this
+    # should jump straight to 10M instead of a 30% step (which would only be 2.6M).
+    rec = _gads_rule_raise_cpc("x", "rn", 2_000_000, 10_000_000, 0.9, MAX_CPC_CAP, STEP_PCT)
+    assert int(rec["proposed_value"]) == 10_000_000
+    assert rec["supporting_metrics"]["direct_jump_to_estimate"] is True
+    assert "[Direct jump]" in rec["reason"]
+
+
+def test_raise_cpc_direct_jump_is_still_capped_by_the_user_cpc_cap():
+    # Same as above, but the user's CPC cap (6M) is lower than the top-of-page
+    # estimate (10M) — the cap must still win.
+    rec = _gads_rule_raise_cpc("x", "rn", 2_000_000, 10_000_000, 0.9, 6_000_000, STEP_PCT)
+    assert int(rec["proposed_value"]) == 6_000_000
+    assert rec["supporting_metrics"]["direct_jump_to_estimate"] is True
+
+
+def test_raise_cpc_does_not_direct_jump_at_exactly_25pct_of_the_estimate():
+    # current=2.5M is EXACTLY 25% of top-of-page=10M — "below 25%" excludes
+    # the boundary, so this should fall back to the normal 30% step.
+    rec = _gads_rule_raise_cpc("x", "rn", 2_500_000, 10_000_000, 0.9, MAX_CPC_CAP, STEP_PCT)
+    assert rec["supporting_metrics"]["direct_jump_to_estimate"] is False
+    assert int(rec["proposed_value"]) == 3_250_000  # 2.5M * 1.30
+    assert "[Direct jump]" not in rec["reason"]
+
+
+def test_raise_cpc_direct_jump_supporting_metrics_carry_the_raw_micros_value():
+    # The apply-time guardrail re-check reads this exact field back out of
+    # supporting_metrics, so it must be the raw int, not just the rounded
+    # INR display value.
+    rec = _gads_rule_raise_cpc("x", "rn", 2_000_000, 10_000_000, 0.9, MAX_CPC_CAP, STEP_PCT)
+    assert rec["supporting_metrics"]["top_of_page_bid_high_micros"] == 10_000_000
 
 
 def test_raise_cpc_zero_current_bid_is_not_a_crash():

@@ -8,10 +8,36 @@ on:
 jobs:
   run-optimizer:
     runs-on: ubuntu-latest
+    env:
+      BACKEND_URL: https://ai-ad-backend-zhpj.onrender.com
     steps:
+      - name: Warm up backend (Render cold start)
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -sf --max-time 30 "$BACKEND_URL/version" > /dev/null; then
+              echo "Backend responded on attempt $i — awake."
+              exit 0
+            fi
+            echo "Backend not ready yet (attempt $i/6), waiting 15s..."
+            sleep 15
+          done
+          echo "Warm-up never got a clean response after 6 attempts — proceeding anyway; the main call below retries with its own backoff."
+
       - name: Trigger /google-ads/optimizer/run-all
         run: |
-          curl -X POST https://ai-ad-backend-zhpj.onrender.com/google-ads/optimizer/run-all \
-            --header "X-API-Key: ${{ secrets.BACKEND_API_KEY }}" \
-            --max-time 300 \
-            --fail-with-body
+          attempt=1
+          max_attempts=3
+          delay=20
+          until curl -X POST "$BACKEND_URL/google-ads/optimizer/run-all" \
+              --header "X-API-Key: ${{ secrets.BACKEND_API_KEY }}" \
+              --max-time 300 \
+              --fail-with-body; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "All $max_attempts attempts failed."
+              exit 1
+            fi
+            echo "Attempt $attempt/$max_attempts failed — retrying in ${delay}s..."
+            sleep "$delay"
+            attempt=$((attempt + 1))
+            delay=$((delay * 2))
+          done
